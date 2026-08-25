@@ -1,7 +1,7 @@
 FROM golang:1.26.3-bookworm AS build
 
-ARG COSIGN_REPOSITORY=https://github.com/miyunari/cosign.git
-ARG COSIGN_COMMIT=cae7f0565c02b9c4274e77fc633f9c45e25466c8
+ARG COSIGN_REPOSITORY=https://github.com/mitchdenny/cosign.git
+ARG COSIGN_COMMIT=fc12d520fe12020fa6eaf7b83c390b364a1e1ba0
 
 WORKDIR /src
 

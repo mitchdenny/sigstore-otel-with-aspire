@@ -6,12 +6,12 @@ import {
 const builder = await createBuilder();
 
 await builder
-  .addContainer('sigstore-telemetry', {
+  .addContainer('dotnet-test', {
     image: 'mcr.microsoft.com/dotnet/sdk',
     tag: '10.0',
   })
   .withBindMount(
-    './src/SigstoreTelemetryProbe.cs',
+    './src/dotnet-test/SigstoreTelemetryProbe.cs',
     '/workspace/SigstoreTelemetryProbe.cs',
     { isReadOnly: true },
   )
@@ -26,7 +26,18 @@ await builder
   .withOtlpExporter({ protocol: OtlpProtocol.Grpc });
 
 await builder
-  .addDockerfile('cosign', './src/CosignTelemetryProbe')
+  .addDockerfile('cosign-test', './src/cosign-test')
+  .withOtlpExporter({ protocol: OtlpProtocol.Grpc });
+
+await builder
+  .addDockerfile('python-test', './src/python-test')
+  .withEnvironment('OTEL_TRACES_EXPORTER', 'otlp')
+  .withEnvironment('OTEL_METRICS_EXPORTER', 'none')
+  .withEnvironment('OTEL_LOGS_EXPORTER', 'none')
+  .withEnvironment(
+    'OTEL_EXPORTER_OTLP_CERTIFICATE',
+    '/usr/lib/ssl/aspire/cert.pem',
+  )
   .withOtlpExporter({ protocol: OtlpProtocol.Grpc });
 
 await builder.build().run();

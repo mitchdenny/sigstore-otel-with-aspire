@@ -42,8 +42,7 @@ builder.Services.AddSingleton(_ => new TufTrustRootProvider(
     TufTrustRootProvider.ProductionUrl,
     new TufTrustRootProviderOptions
     {
-        Cache = new FileSystemTufCache(tufCachePath),
-        RefreshInterval = TimeSpan.Zero
+        Cache = new FileSystemTufCache(tufCachePath)
     }));
 builder.Services.AddSingleton(serviceProvider => new SigstoreVerifier(
     serviceProvider.GetRequiredService<TufTrustRootProvider>()));

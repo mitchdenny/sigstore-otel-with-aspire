@@ -1,25 +1,33 @@
 # Sigstore OpenTelemetry with Aspire
 
-This repository runs two Sigstore telemetry probes and sends their
+This repository runs three Sigstore telemetry probes and sends their
 OpenTelemetry data to the local Aspire dashboard. Aspire is the local
 orchestrator: it builds and starts the containers, configures their OTLP
 exporters, and provides the UI for viewing resources, logs, traces, and metrics.
 
-You do not need .NET or Go installed locally. Both toolchains run inside
-containers.
+You do not need .NET, Go, or Python installed locally. All three toolchains run
+inside containers.
 
 ## What gets launched
 
-- `sigstore-telemetry` runs a file-based .NET 10 application using `Sigstore`
+- `dotnet-test` runs a file-based .NET 10 application using `Sigstore`
   `1.1.0-alpha.131.1.fd8696f`. Every 15 seconds it intentionally rejects an
   invalid bundle, producing `sigstore.verify` and TUF telemetry.
-- `cosign` builds and runs the experimental Go tracing implementation from
-  [cosign PR #4948](https://github.com/sigstore/cosign/pull/4948), linked to
-  [cosign issue #4101](https://github.com/sigstore/cosign/issues/4101). Every
-  15 seconds it signs an ephemeral local blob and emits a `sign-blob` trace.
+- `cosign-test` builds the experimental Go tracing implementation from
+  [cosign PR #4948](https://github.com/sigstore/cosign/pull/4948), plus a pinned
+  [span-correlation proof](https://github.com/mitchdenny/cosign/commit/fc12d520fe12020fa6eaf7b83c390b364a1e1ba0)
+  linked to [cosign issue #4101](https://github.com/sigstore/cosign/issues/4101).
+  Every 15 seconds it signs an ephemeral local blob and emits one enclosing
+  `sign-blob` trace.
+- `python-test` runs Python 3.12 with `model-signing[otel]` `1.1.1`, whose
+  OpenTelemetry support was added by
+  [model-transparency PR #503](https://github.com/sigstore/model-transparency/pull/503).
+  Every 15 seconds it verifies a pinned upstream Sigstore test fixture and emits
+  a `Verify` trace plus auto-instrumented HTTP spans.
 
-Both probes are safe to run locally. The cosign key and bundle are temporary,
-and no transparency-log entry is uploaded.
+All probes are safe to run locally. The cosign key and bundle are temporary,
+and no transparency-log entry is uploaded. The Python probe only downloads
+public trust metadata and verifies an existing upstream fixture.
 
 ## Prerequisites
 
@@ -41,9 +49,9 @@ Install these before starting:
    aspire --version
    ```
 
-The first launch also needs internet access to download container images and
-packages and to build the experimental cosign branch. That initial build can
-take several minutes.
+The first launch also needs internet access to download container images,
+packages, the pinned Python verification fixture, and the experimental cosign
+branch. That initial build can take several minutes.
 
 ## Launch
 
@@ -61,24 +69,28 @@ normally opens it in your browser. If it does not open automatically, use the
 printed URL; the configured HTTP dashboard is also available at
 <http://localhost:15096>.
 
-The first run builds the experimental cosign image and restores the .NET
-file-based application. Wait until both `sigstore-telemetry` and `cosign` show
-as **Running** and **Healthy** on the dashboard's **Resources** page.
+The first run builds the experimental cosign and Python images and restores the
+.NET file-based application. Wait until `dotnet-test`, `cosign-test`, and
+`python-test` show as **Running** and **Healthy** on the dashboard's
+**Resources** page.
 
 ## View the telemetry
 
 Open **Traces** in the Aspire dashboard:
 
-- Filter to `sigstore-telemetry` to see `sigstore.verify`,
+- Filter to `dotnet-test` to see `sigstore.verify`,
   `sigstore.trust_root.get`, and TUF spans.
-- Filter to `cosign` to see `sign-blob` and instrumented TUF HTTP spans.
+- Filter to `cosign-test` to see `sign-blob` and instrumented TUF HTTP spans.
+- Filter to `python-test` to see `Verify` and auto-instrumented urllib3 HTTP
+  spans.
 
 The .NET probe stores its TUF cache in the container's writable filesystem,
 without an Aspire-managed volume. A newly created container starts with an
 empty cache and emits `tuf.target.get` with `tuf.target.cache_hit=false`.
-Later probes in the same container emit `tuf.target.cache_hit=true`. Restarting
-the resource recreates the container, so this miss-then-hit sequence starts
-again.
+The provider then reuses that trusted root for its normal 24-hour refresh
+interval, so later probes in the same container do not contact the TUF
+repository. Restarting the resource recreates the container and starts this
+sequence again.
 
 ## Stop
 
