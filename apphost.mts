@@ -1,12 +1,32 @@
-// Aspire TypeScript AppHost
-// For more information, see: https://aspire.dev
-
-import { createBuilder } from './.aspire/modules/aspire.mjs';
+import {
+  createBuilder,
+  OtlpProtocol,
+} from './.aspire/modules/aspire.mjs';
 
 const builder = await createBuilder();
 
-// Add your resources here, for example:
-// const redis = await builder.addContainer("cache", "redis:latest");
-// const postgres = await builder.addPostgres("db");
+await builder
+  .addContainer('sigstore-telemetry', {
+    image: 'mcr.microsoft.com/dotnet/sdk',
+    tag: '10.0',
+  })
+  .withBindMount(
+    './src/SigstoreTelemetryProbe.cs',
+    '/workspace/SigstoreTelemetryProbe.cs',
+    { isReadOnly: true },
+  )
+  .withEntrypoint('dotnet')
+  .withArgs([
+    'run',
+    '--file',
+    '/workspace/SigstoreTelemetryProbe.cs',
+  ])
+  .withEnvironment('DOTNET_CLI_TELEMETRY_OPTOUT', '1')
+  .withEnvironment('SIGSTORE_TUF_CACHE_PATH', '/tmp/sigstore-tuf-cache')
+  .withOtlpExporter({ protocol: OtlpProtocol.Grpc });
+
+await builder
+  .addDockerfile('cosign', './src/CosignTelemetryProbe')
+  .withOtlpExporter({ protocol: OtlpProtocol.Grpc });
 
 await builder.build().run();
