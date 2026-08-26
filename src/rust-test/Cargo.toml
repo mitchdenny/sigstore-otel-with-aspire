@@ -1,0 +1,21 @@
+[package]
+name = "sigstore-rust-telemetry-probe"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+jiff = "=0.2.35"
+opentelemetry = { version = "=0.32.0", features = ["trace"] }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "tls-ring", "tls-roots", "trace"] }
+opentelemetry_sdk = { version = "=0.32.1", features = ["trace"] }
+sigstore-trust-root = { version = "=0.11.0", features = ["tuf"] }
+sigstore-tuf = { version = "=0.11.0", features = ["fetch", "rustls"] }
+sigstore-types = "=0.11.0"
+sigstore-verify = { version = "=0.11.0", features = ["tuf"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tonic = { version = "=0.14.6", default-features = false, features = ["channel", "tls-ring"] }
+tracing = "=0.1.44"
+tracing-opentelemetry = "=0.33.0"
+tracing-subscriber = { version = "=0.3.23", features = ["fmt", "registry"] }

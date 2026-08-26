@@ -40,4 +40,34 @@ await builder
   )
   .withOtlpExporter({ protocol: OtlpProtocol.Grpc });
 
+await builder
+  .addDockerfile('javascript-test', './src/javascript-test')
+  .withEnvironment('OTEL_METRICS_EXPORTER', 'none')
+  .withEnvironment('OTEL_LOGS_EXPORTER', 'none')
+  .withEnvironment(
+    'OTEL_EXPORTER_OTLP_CERTIFICATE',
+    '/usr/lib/ssl/aspire/cert.pem',
+  )
+  .withOtlpExporter({ protocol: OtlpProtocol.Grpc });
+
+await builder
+  .addDockerfile('java-test', './src/java-test')
+  .withEnvironment('OTEL_METRICS_EXPORTER', 'none')
+  .withEnvironment('OTEL_LOGS_EXPORTER', 'none')
+  .withEnvironment(
+    'OTEL_EXPORTER_OTLP_CERTIFICATE',
+    '/usr/lib/ssl/aspire/cert.pem',
+  )
+  .withOtlpExporter({ protocol: OtlpProtocol.Grpc });
+
+await builder
+  .addDockerfile('rust-test', './src/rust-test')
+  .withEnvironment('OTEL_METRICS_EXPORTER', 'none')
+  .withEnvironment('OTEL_LOGS_EXPORTER', 'none')
+  .withEnvironment(
+    'OTEL_EXPORTER_OTLP_CERTIFICATE',
+    '/usr/lib/ssl/aspire/cert.pem',
+  )
+  .withOtlpExporter({ protocol: OtlpProtocol.Grpc });
+
 await builder.build().run();
