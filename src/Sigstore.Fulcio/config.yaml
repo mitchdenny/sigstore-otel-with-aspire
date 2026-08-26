@@ -1,0 +1,7 @@
+oidc-issuers:
+  https://oidc-sigstore.dev.localhost:7443:
+    issuer-url: https://oidc-sigstore.dev.localhost:7443
+    client-id: sigstore
+    type: email
+    contact: demo@sigstore.local
+    description: Local unauthenticated test issuer

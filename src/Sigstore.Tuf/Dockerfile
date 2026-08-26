@@ -1,0 +1,12 @@
+FROM golang:1.26.4@sha256:792443b89f65105abba56b9bd5e97f680a80074ac62fc844a584212f8c8102c3 AS build
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . ./
+RUN CGO_ENABLED=0 go build -trimpath -o /out/tuf-bootstrap .
+
+FROM scratch
+COPY --from=build /out/tuf-bootstrap /tuf-bootstrap
+ENTRYPOINT ["/tuf-bootstrap"]

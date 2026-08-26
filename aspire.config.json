@@ -4,7 +4,7 @@
   },
   "profiles": {
     "https": {
-      "applicationUrl": "https://localhost:17249;http://localhost:15096",
+      "applicationUrl": "https://sigstore.dev.localhost:17249;http://sigstore.dev.localhost:15096",
       "environmentVariables": {
         "ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL": "https://localhost:21129",
         "ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL": "https://localhost:22245"

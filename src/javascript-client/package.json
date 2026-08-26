@@ -1,0 +1,21 @@
+{
+  "name": "sigstore-javascript-client",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/exporter-trace-otlp-grpc": "0.221.0",
+    "@opentelemetry/instrumentation-http": "0.221.0",
+    "@opentelemetry/instrumentation-undici": "0.31.0",
+    "@opentelemetry/sdk-node": "0.221.0",
+    "@sigstore/bundle": "5.0.0",
+    "@sigstore/protobuf-specs": "0.5.2",
+    "@sigstore/sign": "5.0.0",
+    "@sigstore/tuf": "5.0.0",
+    "sigstore": "5.0.0"
+  }
+}
