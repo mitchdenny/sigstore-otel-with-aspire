@@ -149,7 +149,68 @@ Resource readiness must use `aspire wait`; HTTP polling is not a substitute.
 
 ### Baseline evidence
 
-To be completed by the Step 0 child session.
+Captured at `2026-08-26T09:58:36Z` with the file-based AppHost pinned to
+Aspire `13.5.2`.
+
+- `aspire wait` confirmed all 14 long-running resources healthy on both
+  launches: OIDC, Tesseract, Fulcio, timestamp, Rekor server, Rekor nginx,
+  TUF nginx, shady blob store, and the six clients. `sigstore-bootstrap`,
+  `sigstore-state-ready`, `tuf-bootstrap`, and `tuf-state-ready` each
+  completed with exit code `0`.
+- Fixed external endpoints remained OIDC `:7443`, Tesseract `:6962`, Fulcio
+  HTTP/gRPC `:5555`/`:5554`, timestamp `:3004`, Rekor `:3000`, and TUF
+  `:8080`. Aspire-assigned client, OIDC-internal, Rekor-server, and artifact
+  store ports changed across the restart as expected; the final assignments
+  were .NET `64918`, Go `64921`, Python `64915`, JavaScript `64920`, Java
+  `64913`, Rust `64912`, OIDC internal `64911`, Rekor server HTTP/gRPC
+  `64922`/`64919`, and shady blob store `64917`.
+- Bootstrap manifest: schema `4`, created
+  `2026-08-26T09:53:45.742288+00:00`, CT state
+  `9258495e-a2bf-4c7a-8eea-fdf4f10418f9`, Rekor state
+  `9529346a-6f4f-4698-96cf-b421ebb7ea0f`, OIDC key ID
+  `BY5rH2SVqPacTnJqMsdSu1wRMgByxL5cQNjoHiBpBM4`.
+- Public SHA-256 fingerprints: Fulcio root
+  `5f51795e45052429865b002870f417ccd2527f721cc3ed8db77d3c10412307db`,
+  CT log key
+  `8c486ad3f35d0de773347b4e0beb530d750afd713e70c3f63959e002556a1180`,
+  Rekor key
+  `25b3bb4612b1b777eba57e05958e2a8392f9e6b9abe91958bcc8d947716b0c43`,
+  TSA root
+  `ec0a336a772f64975c5d607b8884fc94282460fc3e9ddb41ec9576e55327f2b9`,
+  and TSA leaf
+  `d8037cf6eeff363413a401160ff82bca8b0050904807f0022ad7a9b9a3dede43`.
+- TUF manifest: schema `3`, source fingerprint
+  `d2b1e54514653a308bfe1a237fa8dac13b8fd0e8032842db605e1c7b73cef867`.
+  Target hashes were TrustedRoot
+  `f83f2754502d6024dd518e8cd7be8f0920e6843686d49662cc89cf2113486f2a`,
+  SigningConfig
+  `7b9177fd18d33bf247e6b9209d66307327aa1e08b020ace4eb26f03906c3adbe`,
+  and ClientTrustConfig
+  `0bfcdb2efe549b3fea7b3b967532ba89eb4266e2c53d1085509f93da39233666`.
+  Root/targets versions remained `1`/`1`; the normal restart refresh advanced
+  snapshot/timestamp from `1`/`1` to `2`/`2`.
+- The sealed artifact head advanced `54 -> 78`. The clean stop left sealed
+  head `85` on disk; after restart the served head was already `103` and then
+  advanced to `110`, proving the persisted stream resumed.
+- Successful `artifact.produce` traces were observed for .NET, Go, Python,
+  JavaScript, Java, and Rust. Successful `artifact.validate` traces were
+  observed for every client except Python. The local-only telemetry export
+  `step0-initial-telemetry.zip` was captured with SHA-256
+  `d996039f0352299fa62134f72189826b6d8955aad99edc916e5486e965797540`
+  and was not committed.
+- Restart persistence passed: bootstrap identifiers and every public
+  fingerprint above were unchanged, all resources returned to their expected
+  state, and artifact production and validation resumed for the same five
+  validating clients.
+
+**Validation gate status: failed.** Go produced artifact `1` at Rekor log
+index `0`. Its JSON bundle omits zero/empty `logIndex`,
+`inclusionProof.logIndex`, and `inclusionProof.hashes` fields, and
+sigstore-python `4.5.0` rejects the bundle during Pydantic parsing. The Python
+validator remains stuck retrying artifact `1`, emits error
+`artifact.validate` spans, and reports no successful validation spans even
+though its resource health check stays healthy. No workaround or application
+change was made in Step 0.
 
 ## Step 1: Extract `AddSigstore`
 
