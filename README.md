@@ -5,8 +5,9 @@ OpenTelemetry data to the local Aspire dashboard. Aspire is the local
 orchestrator: it builds and starts the containers, configures their OTLP
 exporters, and provides the UI for viewing resources, logs, traces, and metrics.
 
-You do not need .NET, Go, Python, Node.js, Java, or Rust installed locally. All
-six toolchains run inside containers.
+Only the .NET 10 SDK is required locally for the file-based C# AppHost. The six
+client toolchains run inside containers, so Go, Python, Node.js, Java, and Rust
+do not need to be installed locally.
 
 ## What gets launched
 
@@ -48,12 +49,12 @@ Install these before starting:
 
 1. [Docker Desktop](https://www.docker.com/products/docker-desktop/) or another
    Docker-compatible container runtime with BuildKit, with the daemon running.
-2. [Node.js](https://nodejs.org/) 20.19+, 22.13+, or 24+, with npm.
+2. The [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 3. The [Aspire CLI](https://aspire.dev/get-started/install-cli/). The
-   cross-platform npm installation is:
+   .NET global tool installation is:
 
    ```bash
-   npm install -g @microsoft/aspire-cli
+   dotnet tool install --global Aspire.Cli
    ```
 
    Confirm that it is available:
@@ -70,12 +71,11 @@ client dependencies from source. That initial build can take several minutes.
 
 ## Launch
 
-Clone the repository, install the AppHost dependencies, and run Aspire:
+Clone the repository and run Aspire:
 
 ```bash
 git clone https://github.com/mitchdenny/sigstore-otel-with-aspire.git
 cd sigstore-otel-with-aspire
-npm ci
 aspire run
 ```
 
