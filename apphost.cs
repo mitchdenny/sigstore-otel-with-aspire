@@ -57,6 +57,8 @@ var shadyBlobStore = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc);
 
+sigstore.WithRequiredResource(shadyBlobStore);
+
 shadyBlobStore
     .WithEnvironment(
         "SHADY_BLOB_STORE_BASE_URL",
@@ -95,6 +97,8 @@ var dotnetClient = builder
         sigstore,
         new SigstoreClientOptions
         {
+            Language = "dotnet",
+            TrustStatusEndpointName = "http",
             AddCanonicalHostMappings = false,
             IncludeDirectServiceEndpointVariables = true
         });
@@ -123,7 +127,13 @@ var goClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithReference(sigstore);
+    .WithReference(
+        sigstore,
+        new SigstoreClientOptions
+        {
+            Language = "go",
+            TrustStatusEndpointName = "http"
+        });
 
 goClient.WithUrlForEndpoint(
     "http",
@@ -152,7 +162,13 @@ var pythonClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithReference(sigstore);
+    .WithReference(
+        sigstore,
+        new SigstoreClientOptions
+        {
+            Language = "python",
+            TrustStatusEndpointName = "http"
+        });
 
 pythonClient.WithUrlForEndpoint(
     "http",
@@ -184,7 +200,13 @@ var javascriptClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithReference(sigstore);
+    .WithReference(
+        sigstore,
+        new SigstoreClientOptions
+        {
+            Language = "javascript",
+            TrustStatusEndpointName = "http"
+        });
 
 javascriptClient.WithUrlForEndpoint(
     "http",
@@ -213,7 +235,13 @@ var javaClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithReference(sigstore);
+    .WithReference(
+        sigstore,
+        new SigstoreClientOptions
+        {
+            Language = "java",
+            TrustStatusEndpointName = "http"
+        });
 
 javaClient.WithUrlForEndpoint(
     "http",
@@ -241,7 +269,13 @@ var rustClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithReference(sigstore);
+    .WithReference(
+        sigstore,
+        new SigstoreClientOptions
+        {
+            Language = "rust",
+            TrustStatusEndpointName = "http"
+        });
 
 rustClient.WithUrlForEndpoint(
     "http",

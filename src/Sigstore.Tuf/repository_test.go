@@ -58,6 +58,45 @@ func TestInitialCreationUsesStableLayoutAndVersionOneBootstrap(t *testing.T) {
 	if version := readMetadataVersion(t, layout.bootstrapRoot); version != 1 {
 		t.Fatalf("bootstrap root version = %d, want 1", version)
 	}
+	activePath := committedPath(layout, state.Active.ID)
+	statusBytes := readTestFile(
+		t,
+		filepath.Join(activePath, "targets", trustStatusTargetName),
+	)
+	var status trustStatusTarget
+	if err := json.Unmarshal(statusBytes, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.SchemaVersion != trustStatusSchemaVersion ||
+		status.TrustDomainID == "" ||
+		status.Generation != initialGeneration ||
+		status.GenerationID != initialGenerationID {
+		t.Fatalf("unexpected trust status target: %+v", status)
+	}
+	if status.TUFRootVersion != readMetadataVersion(
+		t,
+		filepath.Join(activePath, "repository", "root.json"),
+	) {
+		t.Fatalf("status root version = %d", status.TUFRootVersion)
+	}
+	if status.TUFTargetsVersion != readMetadataVersion(
+		t,
+		filepath.Join(activePath, "repository", "targets.json"),
+	) {
+		t.Fatalf("status targets version = %d", status.TUFTargetsVersion)
+	}
+	if status.TrustedRootSHA256 != testHash(readTestFile(
+		t,
+		filepath.Join(activePath, "targets", "trusted_root.json"),
+	)) {
+		t.Fatal("trust status target has the wrong trusted-root hash")
+	}
+	if status.SigningConfigSHA256 != testHash(readTestFile(
+		t,
+		filepath.Join(activePath, "targets", "signing_config.v0.2.json"),
+	)) {
+		t.Fatal("trust status target has the wrong signing-config hash")
+	}
 	info, err := os.Stat(layout.bootstrapRoot)
 	if err != nil {
 		t.Fatal(err)

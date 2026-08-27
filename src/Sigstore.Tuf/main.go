@@ -25,6 +25,9 @@ import (
 
 const (
 	tufSchemaVersion           = 3
+	trustStatusSchemaVersion   = 1
+	initialTUFMetadataVersion  = 1
+	trustStatusTargetName      = "trust_status.v1.json"
 	trustedRootMediaType       = "application/vnd.dev.sigstore.trustedroot+json;version=0.1"
 	signingConfigMediaType     = "application/vnd.dev.sigstore.signingconfig.v0.2+json"
 	clientTrustConfigMediaType = "application/vnd.dev.sigstore.clienttrustconfig.v0.1+json"
@@ -41,14 +44,18 @@ var protoJSON = protojson.MarshalOptions{
 }
 
 type bootstrapManifest struct {
-	SchemaVersion        int       `json:"schemaVersion"`
-	CreatedAtUTC         time.Time `json:"createdAtUtc"`
-	FulcioRootSHA256     string    `json:"fulcioRootSha256"`
-	CtLogPublicKeySHA256 string    `json:"ctLogPublicKeySha256"`
-	RekorPublicKeySHA256 string    `json:"rekorPublicKeySha256"`
-	TsaRootSHA256        string    `json:"tsaRootSha256"`
-	TsaLeafSHA256        string    `json:"tsaLeafSha256"`
-	OIDCKeyID            string    `json:"oidcKeyId"`
+	SchemaVersion            int       `json:"schemaVersion"`
+	CreatedAtUTC             time.Time `json:"createdAtUtc"`
+	FulcioRootSHA256         string    `json:"fulcioRootSha256"`
+	CtLogPublicKeySHA256     string    `json:"ctLogPublicKeySha256"`
+	RekorPublicKeySHA256     string    `json:"rekorPublicKeySha256"`
+	TsaRootSHA256            string    `json:"tsaRootSha256"`
+	TsaLeafSHA256            string    `json:"tsaLeafSha256"`
+	OIDCKeyID                string    `json:"oidcKeyId"`
+	TrustDomainID            string    `json:"-"`
+	Generation               int       `json:"-"`
+	GenerationID             string    `json:"-"`
+	GenerationManifestSHA256 string    `json:"-"`
 }
 
 type tufManifest struct {
@@ -76,6 +83,18 @@ type tufTarget struct {
 	name   string
 	data   []byte
 	custom []byte
+}
+
+type trustStatusTarget struct {
+	SchemaVersion            int    `json:"schemaVersion"`
+	TrustDomainID            string `json:"trustDomainId"`
+	Generation               int    `json:"generation"`
+	GenerationID             string `json:"generationId"`
+	GenerationManifestSHA256 string `json:"generationManifestSha256"`
+	TUFRootVersion           int    `json:"tufRootVersion"`
+	TUFTargetsVersion        int    `json:"tufTargetsVersion"`
+	TrustedRootSHA256        string `json:"trustedRootSha256"`
+	SigningConfigSHA256      string `json:"signingConfigSha256"`
 }
 
 func main() {
@@ -179,6 +198,28 @@ func buildSigstoreTargets(statePath string, bootstrap bootstrapManifest) ([]tufT
 	if err != nil {
 		return nil, fmt.Errorf("marshal ClientTrustConfig: %w", err)
 	}
+	trustedRootBytes := append(append([]byte(nil), trustedRootJSON...), '\n')
+	signingConfigBytes := append(append([]byte(nil), signingConfigJSON...), '\n')
+	clientConfigBytes := append(append([]byte(nil), clientConfigJSON...), '\n')
+	statusJSON, err := json.MarshalIndent(
+		trustStatusTarget{
+			SchemaVersion:            trustStatusSchemaVersion,
+			TrustDomainID:            bootstrap.TrustDomainID,
+			Generation:               bootstrap.Generation,
+			GenerationID:             bootstrap.GenerationID,
+			GenerationManifestSHA256: bootstrap.GenerationManifestSHA256,
+			TUFRootVersion:           initialTUFMetadataVersion,
+			TUFTargetsVersion:        initialTUFMetadataVersion,
+			TrustedRootSHA256:        hashBytes(trustedRootBytes),
+			SigningConfigSHA256:      hashBytes(signingConfigBytes),
+		},
+		"",
+		"  ",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("marshal trust status: %w", err)
+	}
+	statusBytes := append(statusJSON, '\n')
 
 	return []tufTarget{
 		{
@@ -219,9 +260,10 @@ func buildSigstoreTargets(statePath string, bootstrap bootstrapManifest) ([]tufT
 				}),
 			custom: targetMetadata("TSA", tsaURL),
 		},
-		{name: "trusted_root.json", data: append(trustedRootJSON, '\n')},
-		{name: "signing_config.v0.2.json", data: append(signingConfigJSON, '\n')},
-		{name: "client_trust_config.json", data: append(clientConfigJSON, '\n')},
+		{name: "trusted_root.json", data: trustedRootBytes},
+		{name: "signing_config.v0.2.json", data: signingConfigBytes},
+		{name: "client_trust_config.json", data: clientConfigBytes},
+		{name: trustStatusTargetName, data: statusBytes},
 	}, nil
 }
 

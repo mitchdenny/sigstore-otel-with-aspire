@@ -1,12 +1,13 @@
 package example;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.google.protobuf.ByteString;
 import com.sun.net.httpserver.HttpServer;
 import dev.sigstore.AlgorithmRegistry;
 import dev.sigstore.KeylessVerifier;
-import dev.sigstore.SigningConfigProvider;
-import dev.sigstore.TrustedRootProvider;
 import dev.sigstore.VerificationOptions;
 import dev.sigstore.bundle.Bundle;
 import dev.sigstore.bundle.ImmutableBundle;
@@ -49,10 +50,13 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -68,8 +72,12 @@ public final class SigstoreClient {
   private static final Duration POLL_INTERVAL = Duration.ofSeconds(2);
   private static final Duration PRODUCE_INTERVAL = Duration.ofSeconds(10);
   private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(30);
+  private static final int TRUST_STATUS_SCHEMA_VERSION = 1;
+  private static final String TRUST_STATUS_TARGET_NAME = "trust_status.v1.json";
 
   private static final Gson GSON = new Gson();
+  private static final Gson STATUS_GSON =
+      new GsonBuilder().serializeNulls().create();
   private static final Logger LOGGER = Logger.getLogger(SigstoreClient.class.getName());
   private static final SecureRandom RANDOM = new SecureRandom();
 
@@ -100,7 +108,8 @@ public final class SigstoreClient {
     var stopped = new CountDownLatch(1);
     var workerPool = Executors.newFixedThreadPool(2);
     var healthServer =
-        startHealthServer(config.port(), running, workersHealthy);
+        startHealthServer(
+            config.port(), running, workersHealthy, trust.status());
 
     Runtime.getRuntime()
         .addShutdownHook(
@@ -131,21 +140,47 @@ public final class SigstoreClient {
 
   private static TrustMaterial initializeTrust(Config config, Tracer tracer)
       throws Exception {
-    Span span = tracer.spanBuilder("sigstore.trust.initialize").startSpan();
+    Span span =
+        tracer
+            .spanBuilder("sigstore.trust.initialize")
+            .setAttribute("client.language", "java")
+            .setAttribute("client.resource.name", "java-client")
+            .startSpan();
     try (Scope ignored = span.makeCurrent()) {
-      var tufBuilder =
+      Path cachePath = Path.of("/tmp/sigstore-java-tuf-cache");
+      SigstoreTufClient tufClient =
           SigstoreTufClient.builder()
               .tufMirror(
                   config.tufUrl(),
                   RootProvider.fromFile(config.tufRootPath()))
-              .tufCacheLocation(Path.of("/tmp/sigstore-java-tuf-cache"));
-      SigstoreTrustedRoot trustedRoot =
-          TrustedRootProvider.from(tufBuilder).get();
+              .tufCacheLocation(cachePath)
+              .build();
+      tufClient.update();
+      SigstoreTrustedRoot trustedRoot = tufClient.getSigstoreTrustedRoot();
       SigstoreSigningConfig signingConfig =
-          SigningConfigProvider.from(tufBuilder).get();
-      span.setAttribute("client.language", "java");
+          tufClient.getSigstoreSigningConfig();
+      byte[] trustedRootBytes =
+          readVerifiedCachedTarget(
+              cachePath, "trusted_root.json");
+      byte[] signingConfigBytes =
+          readVerifiedCachedTarget(
+              cachePath, "signing_config.v0.2.json");
+      byte[] publishedStatusBytes =
+          readVerifiedMountedTarget(
+              cachePath,
+              config.tufTrustStatusPath(),
+              TRUST_STATUS_TARGET_NAME);
+      ClientTrustStatus status =
+          createClientTrustStatus(
+              publishedStatusBytes,
+              trustedRootBytes,
+              signingConfigBytes,
+              readMetadataVersion(cachePath.resolve("root.json")),
+              readMetadataVersion(cachePath.resolve("targets.json")),
+              Instant.now().toString());
+      setTrustSpanAttributes(span, status);
       span.setStatus(StatusCode.OK);
-      return new TrustMaterial(trustedRoot, signingConfig);
+      return new TrustMaterial(trustedRoot, signingConfig, status);
     } catch (Exception exception) {
       recordError(span, exception);
       throw exception;
@@ -435,7 +470,8 @@ public final class SigstoreClient {
   private static HttpServer startHealthServer(
       int port,
       AtomicBoolean running,
-      AtomicBoolean workersHealthy)
+      AtomicBoolean workersHealthy,
+      ClientTrustStatus trustStatus)
       throws Exception {
     HttpServer server =
         HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
@@ -448,6 +484,23 @@ public final class SigstoreClient {
                       ? "{\"status\":\"SERVING\"}"
                       : "{\"status\":\"NOT_SERVING\"}")
                   .getBytes(StandardCharsets.UTF_8);
+          exchange
+              .getResponseHeaders()
+              .set("Content-Type", "application/json");
+          exchange.sendResponseHeaders(healthy ? 200 : 503, body.length);
+          exchange.getResponseBody().write(body);
+          exchange.close();
+        });
+    server.createContext(
+        "/trust/status",
+        exchange -> {
+          boolean healthy = running.get() && workersHealthy.get();
+          ClientTrustStatus current =
+              trustStatus.withAvailability(
+                  healthy,
+                  healthy ? null : "client is stopping");
+          byte[] body =
+              STATUS_GSON.toJson(current).getBytes(StandardCharsets.UTF_8);
           exchange
               .getResponseHeaders()
               .set("Content-Type", "application/json");
@@ -482,6 +535,7 @@ public final class SigstoreClient {
       URI artifactStoreUrl,
       URI tufUrl,
       Path tufRootPath,
+      Path tufTrustStatusPath,
       URI oidcUrl,
       String expectedIdentity,
       String expectedIssuer,
@@ -491,6 +545,7 @@ public final class SigstoreClient {
           requiredUri("SHADY_BLOB_STORE_URL"),
           requiredUri("SIGSTORE_TUF_URL"),
           Path.of(required("SIGSTORE_TUF_ROOT_PATH")),
+          Path.of(required("SIGSTORE_TUF_TRUST_STATUS_PATH")),
           requiredUri("SIGSTORE_OIDC_URL"),
           required("SIGSTORE_EXPECTED_IDENTITY"),
           required("SIGSTORE_EXPECTED_ISSUER"),
@@ -501,7 +556,233 @@ public final class SigstoreClient {
 
   private record TrustMaterial(
       SigstoreTrustedRoot trustedRoot,
-      SigstoreSigningConfig signingConfig) {}
+      SigstoreSigningConfig signingConfig,
+      ClientTrustStatus status) {}
+
+  record PublishedTrustStatus(
+      int schemaVersion,
+      String trustDomainId,
+      long generation,
+      String generationId,
+      String generationManifestSha256,
+      long tufRootVersion,
+      long tufTargetsVersion,
+      String trustedRootSha256,
+      String signingConfigSha256) {}
+
+  record ClientTrustStatus(
+      int schemaVersion,
+      String resource,
+      String language,
+      boolean ready,
+      String lastError,
+      String trustDomainId,
+      long generation,
+      String generationId,
+      String generationManifestSha256,
+      long tufRootVersion,
+      long tufTargetsVersion,
+      String trustedRootSha256,
+      String signingConfigSha256,
+      String initializedAtUtc) {
+    ClientTrustStatus withAvailability(
+        boolean currentReady,
+        String currentLastError) {
+      return new ClientTrustStatus(
+          schemaVersion,
+          resource,
+          language,
+          currentReady,
+          currentLastError,
+          trustDomainId,
+          generation,
+          generationId,
+          generationManifestSha256,
+          tufRootVersion,
+          tufTargetsVersion,
+          trustedRootSha256,
+          signingConfigSha256,
+          initializedAtUtc);
+    }
+  }
+
+  private static byte[] readVerifiedCachedTarget(
+      Path cachePath,
+      String targetName)
+      throws Exception {
+    return verifyTarget(
+        cachePath,
+        targetName,
+        Files.readAllBytes(
+            cachePath.resolve("targets").resolve(targetName)));
+  }
+
+  private static byte[] readVerifiedMountedTarget(
+      Path cachePath,
+      Path targetPath,
+      String targetName)
+      throws Exception {
+    return verifyTarget(
+        cachePath,
+        targetName,
+        Files.readAllBytes(targetPath));
+  }
+
+  private static byte[] verifyTarget(
+      Path cachePath,
+      String targetName,
+      byte[] bytes)
+      throws Exception {
+    JsonObject targets =
+        JsonParser.parseString(
+                Files.readString(
+                    cachePath.resolve("targets.json"),
+                    StandardCharsets.UTF_8))
+            .getAsJsonObject()
+            .getAsJsonObject("signed")
+            .getAsJsonObject("targets");
+    JsonObject target = targets.getAsJsonObject(targetName);
+    if (target == null) {
+      throw new IllegalStateException(
+          "Verified TUF metadata does not contain " + targetName + ".");
+    }
+    long expectedLength = target.get("length").getAsLong();
+    JsonObject hashes = target.getAsJsonObject("hashes");
+    boolean hashPresent = false;
+    boolean hashVerified = true;
+    if (hashes.has("sha256")) {
+      hashPresent = true;
+      hashVerified &=
+          hashes.get("sha256").getAsString().equals(
+              digest("SHA-256", bytes));
+    }
+    if (hashes.has("sha512")) {
+      hashPresent = true;
+      hashVerified &=
+          hashes.get("sha512").getAsString().equals(
+              digest("SHA-512", bytes));
+    }
+    if (expectedLength != bytes.length
+        || !hashPresent
+        || !hashVerified) {
+      throw new IllegalStateException(
+          "TUF target " + targetName + " failed verified hash validation.");
+    }
+    return bytes;
+  }
+
+  private static int readMetadataVersion(Path path)
+      throws Exception {
+    int version =
+        JsonParser.parseString(
+                Files.readString(path, StandardCharsets.UTF_8))
+            .getAsJsonObject()
+            .getAsJsonObject("signed")
+            .get("version")
+            .getAsInt();
+    if (version <= 0) {
+      throw new IllegalStateException(
+          "TUF metadata " + path.getFileName()
+              + " has invalid version " + version + ".");
+    }
+    return version;
+  }
+
+  static ClientTrustStatus createClientTrustStatus(
+      byte[] publishedStatusBytes,
+      byte[] trustedRootBytes,
+      byte[] signingConfigBytes,
+      int rootVersion,
+      int targetsVersion,
+      String initializedAtUtc) {
+    PublishedTrustStatus published =
+        STATUS_GSON.fromJson(
+            new String(publishedStatusBytes, StandardCharsets.UTF_8),
+            PublishedTrustStatus.class);
+    String trustedRootHash = sha256(trustedRootBytes);
+    String signingConfigHash = sha256(signingConfigBytes);
+    if (published == null
+        || published.schemaVersion() != TRUST_STATUS_SCHEMA_VERSION
+        || published.trustDomainId() == null
+        || published.trustDomainId().isBlank()
+        || published.generation() <= 0
+        || published.generationId() == null
+        || published.generationId().isBlank()
+        || !isLowerHexSha256(published.generationManifestSha256())
+        || published.tufRootVersion() != rootVersion
+        || published.tufTargetsVersion() != targetsVersion
+        || !trustedRootHash.equals(published.trustedRootSha256())
+        || !signingConfigHash.equals(published.signingConfigSha256())) {
+      throw new IllegalStateException(
+          "Published trust status does not match verified TUF material.");
+    }
+
+    return new ClientTrustStatus(
+        TRUST_STATUS_SCHEMA_VERSION,
+        "java-client",
+        "java",
+        true,
+        null,
+        published.trustDomainId(),
+        published.generation(),
+        published.generationId(),
+        published.generationManifestSha256(),
+        rootVersion,
+        targetsVersion,
+        trustedRootHash,
+        signingConfigHash,
+        initializedAtUtc);
+  }
+
+  private static void setTrustSpanAttributes(
+      Span span,
+      ClientTrustStatus status) {
+    span.setAttribute(
+        "sigstore.trust.domain.id", status.trustDomainId());
+    span.setAttribute(
+        "sigstore.trust.generation", status.generation());
+    span.setAttribute(
+        "sigstore.trust.generation.id", status.generationId());
+    span.setAttribute(
+        "sigstore.trust.generation.manifest.sha256",
+        status.generationManifestSha256());
+    span.setAttribute(
+        "sigstore.trust.tuf.root.version",
+        status.tufRootVersion());
+    span.setAttribute(
+        "sigstore.trust.tuf.targets.version",
+        status.tufTargetsVersion());
+    span.setAttribute(
+        "sigstore.trust.trusted_root.sha256",
+        status.trustedRootSha256());
+    span.setAttribute(
+        "sigstore.trust.signing_config.sha256",
+        status.signingConfigSha256());
+    span.setAttribute(
+        "sigstore.trust.initialized_at",
+        status.initializedAtUtc());
+  }
+
+  private static String sha256(byte[] value) {
+    return digest("SHA-256", value);
+  }
+
+  private static String digest(
+      String algorithm,
+      byte[] value) {
+    try {
+      return HexFormat.of()
+          .formatHex(
+              MessageDigest.getInstance(algorithm).digest(value));
+    } catch (Exception exception) {
+      throw new IllegalStateException(
+          algorithm + " is unavailable.", exception);
+    }
+  }
+
+  private static boolean isLowerHexSha256(String value) {
+    return value != null && value.matches("[0-9a-f]{64}");
+  }
 
   private static final class LocalKeylessSigner {
     private static final AlgorithmRegistry.SigningAlgorithm SIGNING_ALGORITHM =

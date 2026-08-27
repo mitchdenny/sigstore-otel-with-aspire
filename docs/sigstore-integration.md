@@ -587,6 +587,73 @@ index-zero Python interoperability exception.**
 - Restarting the child returns the parent to healthy.
 - No mutating command is added in this step.
 
+### Implementation evidence
+
+Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
+
+- All six clients expose `GET /trust/status` on their existing local health
+  servers. Schema 1 reports the resource and language, readiness and last error,
+  trust-domain ID, integer generation and TUF root/targets versions,
+  generation ID and manifest SHA-256, exact trusted-root and signing-config
+  SHA-256 values, and RFC 3339 UTC initialization time. Hashes are lowercase
+  hexadecimal SHA-256 over the exact verified target bytes.
+- `trust_status.v1.json` is a signed TUF target that binds the active schema-5
+  generation to root/targets versions and target hashes. Clients retrieve it
+  through their native verified TUF path, except Java, which validates the
+  mounted target bytes against its verified targets metadata. The status path
+  does not weaken or replace native trust validation.
+- Every `sigstore.trust.initialize` span has `client.language`,
+  `client.resource.name`, `sigstore.trust.domain.id`,
+  `sigstore.trust.generation`, `sigstore.trust.generation.id`,
+  `sigstore.trust.generation.manifest.sha256`,
+  `sigstore.trust.tuf.root.version`,
+  `sigstore.trust.tuf.targets.version`,
+  `sigstore.trust.trusted_root.sha256`,
+  `sigstore.trust.signing_config.sha256`, and
+  `sigstore.trust.initialized_at`. The generation and metadata versions are
+  integer attributes; the remaining trust attributes are strings.
+- The typed parent `status` command returns JSON on stdout and never mutates
+  resources or files. It validates the complete generation manifest and file
+  set, transition journal and trust-domain identity, committed TUF publication
+  state/layout/manifests, served metadata and target bytes, all client
+  contracts, and current resource health. Explicit structured errors and a
+  failed command result replace success-shaped fallbacks.
+- The parent watches Aspire resource notifications for the seven long-running
+  Sigstore services, `shady-blob-store`, and six clients. All 14 healthy
+  resources produce parent state `Healthy`. Stopping `rust-client` produced
+  `Degraded`, reason `rust-client is Exited (health Unknown)`, and `13/14`;
+  the status command failed with exit code `16`. Starting it and waiting for
+  health restored `Healthy`, `14/14`, and a successful status command. A
+  byte-for-byte trust/TUF snapshot was unchanged across the transition.
+- The final non-isolated AppHost completed all four one-shots with exit code
+  `0` and made all 14 long-running resources healthy. Disk, served TUF, all six
+  clients, and seven initialization spans (including the restarted Rust client)
+  agreed on trust domain
+  `sha256-962071e3bf592cf52a4cb72543e198dd2246ceeb2f091f6895206b002bc7ea75`,
+  generation `1`, root/targets versions `1`/`1`, generation-manifest SHA-256
+  `2916f706eb0898caf091344044afc23688b882f698a70a4d742cd7350d5a50c2`,
+  trusted-root SHA-256
+  `494724872e5d07a3f3fa93ab0d0946f8b2defa28cb16ffa37d14df01664c695e`,
+  and signing-config SHA-256
+  `c72af3c3de5ff1446f480d27fe3793e91a7e830843108098cb02cd5bd4d430fc`.
+  All seven spans contained every required attribute.
+- A replacement AppHost removed sentinels from both run-scoped trees, changed
+  the trust-domain ID, bootstrap-root hash, and artifact `1`, and reset the
+  artifact head from `64` to a new stream. In the final run the head advanced
+  from `38` to `44`; all six clients produced and validated with no error spans.
+  Python validated artifact `1`, so the known index-zero exception did not occur
+  in this run. No public Sigstore fallback appeared.
+- Focused validation passed 6 hosting status/aggregation tests, 21 schema-5
+  bootstrap tests, 10 TUF publication tests, and per-language status tests for
+  Go, JavaScript, Python, Java, and Rust. The AppHost, hosting library, and .NET
+  client built successfully; all changed client container images built; and
+  `git diff --check` passed.
+- The final AppHost remains running at
+  `https://sigstore.dev.localhost:17249` (fixed HTTP dashboard route
+  `http://sigstore.dev.localhost:15096`).
+
+**Validation gate status: passed.**
+
 ## Step 6: Add the first dashboard operations
 
 ### Scope

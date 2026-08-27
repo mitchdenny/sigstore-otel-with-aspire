@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import random
@@ -8,6 +10,7 @@ import signal
 import sys
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,6 +38,7 @@ from opentelemetry.trace import SpanKind
 from sigstore._internal.fulcio.client import FulcioClientError
 from sigstore._internal.rekor import RekorClientError
 from sigstore._internal.timestamp import TimestampError
+from sigstore._internal.tuf import TrustUpdater
 from sigstore.errors import Error as SigstoreError
 from sigstore.models import Bundle, ClientTrustConfig
 from sigstore.oidc import IdentityToken
@@ -43,6 +47,8 @@ from sigstore.verify import Verifier
 from sigstore.verify.policy import Identity
 
 REQUEST_TIMEOUT_SECONDS = 30
+TRUST_STATUS_SCHEMA_VERSION = 1
+TRUST_STATUS_TARGET_NAME = "trust_status.v1.json"
 
 
 class ArtifactProtocolError(RuntimeError):
@@ -607,8 +613,38 @@ class ArtifactValidator:
 class HealthHandler(BaseHTTPRequestHandler):
     stop_event: threading.Event
     workers: list[threading.Thread]
+    trust_status: dict[str, object]
+    last_error: str | None = None
 
     def do_GET(self) -> None:
+        if self.path == "/trust/status":
+            ready = (
+                not self.stop_event.is_set()
+                and all(worker.is_alive() for worker in self.workers)
+            )
+            status_payload = dict(self.trust_status)
+            status_payload["ready"] = ready
+            status_payload["lastError"] = (
+                None
+                if ready
+                else self.last_error or "client is stopping"
+            )
+            body = json.dumps(
+                status_payload,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            self.send_response(
+                HTTPStatus.OK
+                if ready
+                else HTTPStatus.SERVICE_UNAVAILABLE
+            )
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         healthy = (
             self.path == "/healthz"
             and not self.stop_event.is_set()
@@ -664,6 +700,172 @@ def _retry_after_seconds(response: requests.Response) -> float:
     return min(max(delay, 0.1), 30)
 
 
+def _initialize_trust(
+    config: Config,
+) -> tuple[ClientTrustConfig, dict[str, object]]:
+    updater = TrustUpdater(
+        config.tuf_url,
+        bootstrap_root=config.tuf_root_path,
+    )
+    trusted_root_path = Path(updater.get_trusted_root_path())
+    signing_config_path = Path(updater.get_signing_config_path())
+    status_path = _get_verified_target_path(
+        updater,
+        TRUST_STATUS_TARGET_NAME,
+    )
+    trusted_root_bytes = trusted_root_path.read_bytes()
+    signing_config_bytes = signing_config_path.read_bytes()
+    root_version = _metadata_version(
+        updater._metadata_dir / "root.json",
+    )
+    targets_version = _metadata_version(
+        updater._metadata_dir / "targets.json",
+    )
+    initialized_at_utc = (
+        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    )
+    status = _new_client_trust_status(
+        json.loads(status_path.read_text(encoding="utf-8")),
+        trusted_root_bytes,
+        signing_config_bytes,
+        root_version,
+        targets_version,
+        initialized_at_utc,
+    )
+    combined = {
+        "mediaType": (
+            "application/vnd.dev.sigstore.clienttrustconfig.v0.1+json"
+        ),
+        "trustedRoot": json.loads(trusted_root_bytes),
+        "signingConfig": json.loads(signing_config_bytes),
+    }
+    return (
+        ClientTrustConfig.from_json(
+            json.dumps(combined, separators=(",", ":"))
+        ),
+        status,
+    )
+
+
+def _get_verified_target_path(
+    updater: TrustUpdater,
+    target_name: str,
+) -> Path:
+    tuf_updater = updater._updater
+    if tuf_updater is None:
+        raise RuntimeError("TUF updater is unavailable in online mode.")
+    target_info = tuf_updater.get_targetinfo(target_name)
+    if target_info is None:
+        raise RuntimeError(f"TUF target {target_name} is missing.")
+    cached = tuf_updater.find_cached_target(target_info)
+    if cached is not None:
+        return Path(cached)
+    return Path(tuf_updater.download_target(target_info))
+
+
+def _metadata_version(path: Path) -> int:
+    try:
+        version = json.loads(path.read_bytes())["signed"]["version"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"TUF metadata {path.name} is malformed.") from error
+    if not isinstance(version, int) or isinstance(version, bool) or version <= 0:
+        raise RuntimeError(
+            f"TUF metadata {path.name} has invalid version {version!r}."
+        )
+    return version
+
+
+def _new_client_trust_status(
+    published: dict[str, object],
+    trusted_root_bytes: bytes,
+    signing_config_bytes: bytes,
+    root_version: int,
+    targets_version: int,
+    initialized_at_utc: str,
+) -> dict[str, object]:
+    trusted_root_sha256 = hashlib.sha256(trusted_root_bytes).hexdigest()
+    signing_config_sha256 = hashlib.sha256(
+        signing_config_bytes
+    ).hexdigest()
+    if (
+        published.get("schemaVersion") != TRUST_STATUS_SCHEMA_VERSION
+        or not isinstance(published.get("trustDomainId"), str)
+        or not published["trustDomainId"]
+        or not isinstance(published.get("generation"), int)
+        or isinstance(published.get("generation"), bool)
+        or published["generation"] <= 0
+        or not isinstance(published.get("generationId"), str)
+        or not published["generationId"]
+        or not _is_lower_hex_sha256(
+            published.get("generationManifestSha256")
+        )
+        or published.get("tufRootVersion") != root_version
+        or published.get("tufTargetsVersion") != targets_version
+        or published.get("trustedRootSha256") != trusted_root_sha256
+        or published.get("signingConfigSha256")
+        != signing_config_sha256
+    ):
+        raise RuntimeError(
+            "Published trust status does not match verified TUF material."
+        )
+
+    return {
+        "schemaVersion": TRUST_STATUS_SCHEMA_VERSION,
+        "resource": "python-client",
+        "language": "python",
+        "ready": True,
+        "lastError": None,
+        "trustDomainId": published["trustDomainId"],
+        "generation": published["generation"],
+        "generationId": published["generationId"],
+        "generationManifestSha256": published[
+            "generationManifestSha256"
+        ],
+        "tufRootVersion": root_version,
+        "tufTargetsVersion": targets_version,
+        "trustedRootSha256": trusted_root_sha256,
+        "signingConfigSha256": signing_config_sha256,
+        "initializedAtUtc": initialized_at_utc,
+    }
+
+
+def _is_lower_hex_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _set_trust_span_attributes(
+    span: trace.Span,
+    status: dict[str, object],
+) -> None:
+    attributes = {
+        "client.language": status["language"],
+        "client.resource.name": status["resource"],
+        "sigstore.trust.domain.id": status["trustDomainId"],
+        "sigstore.trust.generation": status["generation"],
+        "sigstore.trust.generation.id": status["generationId"],
+        "sigstore.trust.generation.manifest.sha256": status[
+            "generationManifestSha256"
+        ],
+        "sigstore.trust.tuf.root.version": status["tufRootVersion"],
+        "sigstore.trust.tuf.targets.version": status[
+            "tufTargetsVersion"
+        ],
+        "sigstore.trust.trusted_root.sha256": status[
+            "trustedRootSha256"
+        ],
+        "sigstore.trust.signing_config.sha256": status[
+            "signingConfigSha256"
+        ],
+        "sigstore.trust.initialized_at": status["initializedAtUtc"],
+    }
+    for name, value in attributes.items():
+        span.set_attribute(name, value)
+
+
 def main() -> int:
     config = Config.from_environment()
     telemetry = Telemetry()
@@ -680,11 +882,13 @@ def main() -> int:
     try:
         with telemetry.tracer.start_as_current_span(
             "sigstore.trust.initialize"
-        ):
-            trust_config = ClientTrustConfig.from_tuf(
-                config.tuf_url,
-                bootstrap_root=config.tuf_root_path,
+        ) as span:
+            span.set_attribute("client.language", "python")
+            span.set_attribute(
+                "client.resource.name",
+                "python-client",
             )
+            trust_config, trust_status = _initialize_trust(config)
             trust_config.force_tlog_version = 2
             signing_context = SigningContext.from_trust_config(
                 trust_config
@@ -692,6 +896,7 @@ def main() -> int:
             verifier = Verifier(
                 trusted_root=trust_config.trusted_root
             )
+            _set_trust_span_attributes(span, trust_status)
 
         producer = ArtifactProducer(
             config,
@@ -721,6 +926,7 @@ def main() -> int:
 
         HealthHandler.stop_event = stop_event
         HealthHandler.workers = workers
+        HealthHandler.trust_status = trust_status
         health_server = ThreadingHTTPServer(
             ("0.0.0.0", config.port),
             HealthHandler,
@@ -750,6 +956,9 @@ def main() -> int:
         while not stop_event.wait(1):
             if not all(worker.is_alive() for worker in workers):
                 logger.critical("A background worker stopped unexpectedly.")
+                HealthHandler.last_error = (
+                    "a background worker stopped unexpectedly"
+                )
                 exit_code = 1
                 stop_event.set()
 

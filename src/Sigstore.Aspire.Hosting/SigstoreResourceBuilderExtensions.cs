@@ -42,10 +42,37 @@ public static class SigstoreResourceBuilderExtensions
             {
                 ResourceType = "Sigstore",
                 CreationTimeStamp = DateTime.UtcNow,
-                State = KnownResourceStates.Active,
-                Properties = []
+                State = new ResourceStateSnapshot(
+                    "Starting",
+                    KnownResourceStateStyles.Info),
+                Properties =
+                [
+                    new(
+                        "Health reason",
+                        "Waiting for required resources.")
+                ]
             })
             .ExcludeFromManifest();
+
+        parent
+            .WithCommand(
+               name: "status",
+               displayName: "Trust Status",
+               executeCommand: context =>
+                   SigstoreStatusCommand.ExecuteAsync(
+                       parent.Resource,
+                       context))
+            .OnInitializeResource(
+               (resource, context, cancellationToken) =>
+               {
+                   _ = Task.Run(
+                       () => SigstoreParentHealthMonitor.RunAsync(
+                           resource,
+                           context.Notifications,
+                           cancellationToken),
+                       cancellationToken);
+                   return Task.CompletedTask;
+               });
 
         var bootstrap = builder
             .AddProject(
@@ -376,6 +403,7 @@ public static class SigstoreResourceBuilderExtensions
                 "test -f /var/lib/sigstore/tuf/active/repository/root.json && " +
                 "test -f /var/lib/sigstore/tuf/active/targets/trusted_root.json && " +
                 "test -f /var/lib/sigstore/tuf/active/targets/signing_config.v0.2.json && " +
+                "test -f /var/lib/sigstore/tuf/active/targets/trust_status.v1.json && " +
                 "test -f /var/lib/sigstore/tuf/publication/state.json")
             .WaitForCompletion(tufBootstrap)
             .WithParentRelationship(parent.Resource);
@@ -411,21 +439,35 @@ public static class SigstoreResourceBuilderExtensions
             "http",
             url => url.DisplayText = "Sigstore TUF repository");
 
-        parent.Resource.SetComponents(new SigstoreComponents(
-            parent,
-            bootstrap,
-            stateReady,
-            oidc,
-            tesseract,
-            fulcio,
-            timestamp,
-            rekorServer,
-            rekor,
-            tufBootstrap,
-            tufStateReady,
-            tuf));
+        parent.Resource.SetComponents(
+            new SigstoreComponents(
+                parent,
+                bootstrap,
+                stateReady,
+                oidc,
+                tesseract,
+                fulcio,
+                timestamp,
+                rekorServer,
+                rekor,
+                tufBootstrap,
+                tufStateReady,
+                tuf),
+            tuf.GetEndpoint("http"));
 
         return parent;
+    }
+
+    public static IResourceBuilder<SigstoreResource> WithRequiredResource<T>(
+        this IResourceBuilder<SigstoreResource> sigstore,
+        IResourceBuilder<T> requiredResource)
+        where T : IResource
+    {
+        ArgumentNullException.ThrowIfNull(sigstore);
+        ArgumentNullException.ThrowIfNull(requiredResource);
+
+        sigstore.Resource.RegisterRequiredResource(requiredResource.Resource);
+        return sigstore;
     }
 
     private static string ResolveDirectoryPath(
