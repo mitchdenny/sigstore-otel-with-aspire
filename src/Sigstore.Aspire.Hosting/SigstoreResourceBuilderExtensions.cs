@@ -16,12 +16,8 @@ public static class SigstoreResourceBuilderExtensions
         var appHostDirectory = Path.GetFullPath(builder.AppHostDirectory);
         var statePath = ResolveDirectoryPath(
             appHostDirectory,
-            options.StatePath,
-            nameof(options.StatePath));
-        EnsureDescendantPath(
-            appHostDirectory,
-            statePath,
-            nameof(options.StatePath));
+            SigstoreOptions.StateDirectoryName,
+            "Sigstore state");
         var sourcePath = ResolveDirectoryPath(
             appHostDirectory,
             options.SourcePath,
@@ -437,35 +433,4 @@ public static class SigstoreResourceBuilderExtensions
 
         return Path.TrimEndingDirectorySeparator(resolvedPath);
     }
-
-    private static void EnsureDescendantPath(
-        string parentPath,
-        string descendantPath,
-        string optionName)
-    {
-        var relativePath = Path.GetRelativePath(
-            parentPath,
-            descendantPath);
-        if (relativePath == "."
-            || Path.IsPathFullyQualified(relativePath)
-            || relativePath == ".."
-            || relativePath.StartsWith(
-                $"..{Path.DirectorySeparatorChar}",
-                GetPathComparison())
-            || relativePath.StartsWith(
-                $"..{Path.AltDirectorySeparatorChar}",
-                GetPathComparison()))
-        {
-            throw new ArgumentException(
-                $"{optionName} directory '{descendantPath}' must be a " +
-                $"descendant of the AppHost directory '{parentPath}'.",
-                optionName);
-        }
-    }
-
-    private static StringComparison GetPathComparison() =>
-        OperatingSystem.IsWindows()
-            || OperatingSystem.IsMacOS()
-                ? StringComparison.OrdinalIgnoreCase
-                : StringComparison.Ordinal;
 }

@@ -55,8 +55,8 @@ from masking regressions in an earlier step.
 - AppHost process startup is the intentional destructive reset boundary. It
   recreates both state directories before bootstrap; child resource restarts
   must not reset them.
-- A `SIGSTORE_STATE_PATH` override is valid only when it resolves to a safe
-  descendant of the AppHost directory.
+- The Sigstore state root is always the AppHost-relative `.sigstore/`
+  directory and is not configurable.
 - Within one run, committed trust state must be validated rather than silently
   regenerated, and artifact history requires historical verification keys to
   remain trusted during normal additive rotations.
@@ -238,10 +238,9 @@ new trust/log identities and restarts artifact numbering at 1.
 ### Scope
 
 - Reset both gitignored state directories once per AppHost process.
-- Require every reset path to be a non-root descendant of the AppHost
-  directory.
-- Reject unsafe `SIGSTORE_STATE_PATH` overrides, overlapping state roots,
-  non-directory entries, and symbolic links or reparse points.
+- Keep both reset roots as non-root descendants of the AppHost directory.
+- Reject overlapping state roots, non-directory entries, and symbolic links
+  or reparse points.
 - Keep child resource restart behavior unchanged.
 - Replace cross-AppHost persistence expectations throughout this plan with
   in-run child-restart durability.
@@ -288,7 +287,8 @@ Captured on `2026-08-27` with two serialized, non-isolated AppHost launches.
   to the first run and again from the first run to the second. Both launches
   reached 14 healthy long-running resources, and all four bootstrap/readiness
   resources exited with code `0`.
-- An outside `SIGSTORE_STATE_PATH` override failed before deletion and left the
+- Before Step 1 fixed the state root to AppHost-relative `.sigstore/`, an
+  outside `SIGSTORE_STATE_PATH` override failed before deletion and left the
   prior manifest and artifact `1` unchanged.
 - Python produced and validated artifact `1` on both launches. In the final
   run, Rust produced Rekor index-zero artifact `2` with explicit zero fields,
@@ -322,7 +322,8 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 - Added `src/Sigstore.Aspire.Hosting` with `SigstoreResource`,
   `SigstoreOptions`, `SigstoreComponents`, and `AddSigstore(...)`. The
   non-compute `sigstore` parent starts in `Active`, is excluded from deployment
-  manifests, and groups all 11 Sigstore infrastructure resources.
+  manifests, and groups all 11 Sigstore infrastructure resources. The
+  integration always resolves its state under AppHost-relative `.sigstore/`.
 - The file-based AppHost references the hosting project through `#:project`;
   targeted `IsAspireProjectResource="false"` metadata keeps the class library a
   compile-time reference rather than an executable resource.

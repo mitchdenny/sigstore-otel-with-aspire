@@ -2,7 +2,7 @@ namespace Aspire.Hosting;
 
 public sealed class SigstoreOptions
 {
-    public required string StatePath { get; init; }
+    public const string StateDirectoryName = ".sigstore";
 
     public required string SourcePath { get; init; }
 }

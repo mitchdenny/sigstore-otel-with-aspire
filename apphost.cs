@@ -10,12 +10,10 @@ var builder = DistributedApplication.CreateBuilder(args);
 
 var appHostDirectory = Path.GetFullPath(
     builder.AppHostDirectory);
-var sigstoreStatePath =
-    Environment.GetEnvironmentVariable("SIGSTORE_STATE_PATH")
-    ?? Path.Combine(appHostDirectory, ".sigstore");
-sigstoreStatePath = Path.GetFullPath(
-    sigstoreStatePath,
-    appHostDirectory);
+var sigstoreStatePath = Path.GetFullPath(
+    Path.Combine(
+        appHostDirectory,
+        SigstoreOptions.StateDirectoryName));
 var shadyBlobStoreStatePath = Path.GetFullPath(
     Path.Combine(
         appHostDirectory,
@@ -34,7 +32,6 @@ var sigstore = builder.AddSigstore(
     "sigstore",
     new SigstoreOptions
     {
-        StatePath = sigstoreStatePath,
         SourcePath = Path.Combine(appHostDirectory, "src")
     });
 
