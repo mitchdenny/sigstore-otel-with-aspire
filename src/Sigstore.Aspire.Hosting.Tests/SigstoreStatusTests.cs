@@ -177,6 +177,65 @@ public sealed class SigstoreStatusTests
     }
 
     [Fact]
+    public void TufSnapshotReportsAllRolesAndTrustFingerprints()
+    {
+        using var fixture = new TrustStatusFixture();
+
+        var snapshot = SigstoreStatusCommand.ReadTufStateSnapshot(
+            fixture.Path);
+        var trustFingerprint =
+            SigstoreStatusCommand.ReadTrustStateFingerprint(
+                fixture.Path);
+        var materialFingerprint =
+            SigstoreStatusCommand.ReadTrustMaterialFingerprint(
+                fixture.Path);
+
+        Assert.Equal(2, snapshot.Metadata.Root.Version);
+        Assert.Equal(3, snapshot.Metadata.Targets.Version);
+        Assert.Equal(4, snapshot.Metadata.Snapshot.Version);
+        Assert.Equal(5, snapshot.Metadata.Timestamp.Version);
+        Assert.Equal(
+            fixture.TrustedRootSha256,
+            snapshot.Metadata.TrustedRootSha256);
+        Assert.Equal(
+            fixture.SigningConfigSha256,
+            snapshot.Metadata.SigningConfigSha256);
+        Assert.Equal(64, snapshot.StableContentSha256.Length);
+        Assert.Equal(64, trustFingerprint.Length);
+        Assert.Equal(64, materialFingerprint.Length);
+        Assert.NotEqual(trustFingerprint, materialFingerprint);
+    }
+
+    [Fact]
+    public void RefreshableMetadataPathsExcludeOnlyRepositoryRoles()
+    {
+        Assert.True(
+            SigstoreStatusCommand.IsRefreshableMetadataPath(
+                "repository/snapshot.json"));
+        Assert.True(
+            SigstoreStatusCommand.IsRefreshableMetadataPath(
+                "repository/2.snapshot.json"));
+        Assert.True(
+            SigstoreStatusCommand.IsRefreshableMetadataPath(
+                "repository/timestamp.json"));
+        Assert.True(
+            SigstoreStatusCommand.IsRefreshableMetadataPath(
+                "repository/2.timestamp.json"));
+        Assert.False(
+            SigstoreStatusCommand.IsRefreshableMetadataPath(
+                "keys/snapshot.json"));
+        Assert.False(
+            SigstoreStatusCommand.IsRefreshableMetadataPath(
+                "keys/timestamp.json"));
+        Assert.False(
+            SigstoreStatusCommand.IsRefreshableMetadataPath(
+                "targets/snapshot.json"));
+        Assert.False(
+            SigstoreStatusCommand.IsRefreshableMetadataPath(
+                "repository/nested/2.snapshot.json"));
+    }
+
+    [Fact]
     public void CommandResultPreservesStructuredFailurePayload()
     {
         var status = new SigstoreAggregateTrustStatus(
@@ -224,7 +283,7 @@ public sealed class SigstoreStatusTests
             new string('d', 64),
             DateTimeOffset.Parse("2026-08-27T00:00:00Z"));
 
-    private sealed class TrustStatusFixture : IDisposable
+    internal sealed class TrustStatusFixture : IDisposable
     {
         public TrustStatusFixture()
         {
@@ -333,6 +392,10 @@ public sealed class SigstoreStatusTests
                 System.IO.Path.Combine(
                     Path,
                     "transition"));
+            Directory.CreateDirectory(
+                System.IO.Path.Combine(
+                    Path,
+                    "migration"));
             File.WriteAllBytes(
                 System.IO.Path.Combine(
                     Path,
@@ -370,28 +433,87 @@ public sealed class SigstoreStatusTests
                 "targets");
             Directory.CreateDirectory(repositoryPath);
             Directory.CreateDirectory(targetsPath);
+            var rootMetadata = Serialize(
+                new
+                {
+                    signed = new
+                    {
+                        _type = "root",
+                        version = 2,
+                        expires = "2030-08-27T00:00:00Z"
+                    }
+                });
+            var targetsMetadata = Serialize(
+                new
+                {
+                    signed = new
+                    {
+                        _type = "targets",
+                        version = 3,
+                        expires = "2030-08-27T00:00:00Z"
+                    }
+                });
             File.WriteAllBytes(
                 System.IO.Path.Combine(
                     repositoryPath,
                     "root.json"),
-                Serialize(
-                    new
-                    {
-                        signed = new
-                        {
-                            version = 2
-                        }
-                    }));
+                rootMetadata);
             File.WriteAllBytes(
                 System.IO.Path.Combine(
                     repositoryPath,
                     "targets.json"),
+                targetsMetadata);
+            var snapshotMetadata = Serialize(
+                new
+                {
+                    signed = new
+                    {
+                        _type = "snapshot",
+                        version = 4,
+                        expires = "2030-08-27T00:00:00Z",
+                        meta = new Dictionary<string, object>
+                        {
+                            ["targets.json"] = new
+                            {
+                                version = 3,
+                                length = targetsMetadata.Length,
+                                hashes = new
+                                {
+                                    sha512 = HashSha512(targetsMetadata)
+                                }
+                            }
+                        }
+                    }
+                });
+            File.WriteAllBytes(
+                System.IO.Path.Combine(
+                    repositoryPath,
+                    "snapshot.json"),
+                snapshotMetadata);
+            File.WriteAllBytes(
+                System.IO.Path.Combine(
+                    repositoryPath,
+                    "timestamp.json"),
                 Serialize(
                     new
                     {
                         signed = new
                         {
-                            version = 3
+                            _type = "timestamp",
+                            version = 5,
+                            expires = "2030-08-27T00:00:00Z",
+                            meta = new Dictionary<string, object>
+                            {
+                                ["snapshot.json"] = new
+                                {
+                                    version = 4,
+                                    length = snapshotMetadata.Length,
+                                    hashes = new
+                                    {
+                                        sha512 = HashSha512(snapshotMetadata)
+                                    }
+                                }
+                            }
                         }
                     }));
             var trustedRoot = Serialize(
@@ -563,6 +685,10 @@ public sealed class SigstoreStatusTests
 
         private static string Hash(ReadOnlySpan<byte> value) =>
             Convert.ToHexString(SHA256.HashData(value))
+                .ToLowerInvariant();
+
+        private static string HashSha512(ReadOnlySpan<byte> value) =>
+            Convert.ToHexString(SHA512.HashData(value))
                 .ToLowerInvariant();
     }
 }

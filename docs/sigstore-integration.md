@@ -674,6 +674,100 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 - Concurrent commands are rejected clearly.
 - Worker failure produces a failed command and preserves committed state.
 
+### Implementation evidence
+
+Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
+
+- The typed `sigstore` parent now has exactly three commands: the preserved
+  read-only `status`, plus mutating `refresh-tuf` and `restart-clients`.
+  Both mutations have dashboard descriptions, explicit confirmation text,
+  non-cancelable progress dialogs, structured JSON success/failure results, and
+  dynamic command state. While an operation runs, the parent reports its command,
+  phase, ordinal progress, and underlying `14`-resource health; afterward it
+  returns to the latest aggregate `Healthy` or `Degraded` state.
+- The implementation uses only public Aspire command and notification surfaces.
+  Installed `13.5.2` symbols and source confirmed that
+  `ResourceCommandService` can start a terminal one-shot and restart a running
+  container, but returns before completion or application health. The parent
+  therefore requires a changed container identity/start time and waits for a
+  terminal worker exit or `Running`/`Healthy` client state before validating
+  postconditions.
+- Both commands take an atomic in-process operation gate and the schema-5 shared
+  `state.lock`. `restart-clients` holds the OS lock for the complete operation.
+  `refresh-tuf` captures preconditions under the lock, starts the worker while
+  still holding it, releases after Aspire creates the new worker instance, lets
+  the worker acquire the same lock for its transaction, then reacquires it for
+  postconditions. This parent-to-worker-to-parent handoff avoids nested-lock
+  deadlock and closes the preflight/start race.
+- A live `refresh-tuf` replaced worker container
+  `b6eb610b2e20f2f9aa2b62bdb731289ad5fcaf3d802afc93695857d1279a035a`
+  with
+  `d4d4a26b8e32b61614667e3210bbbf1780880cddba5cdaa4c239ad64e8950695`,
+  which exited `0`. Snapshot advanced from version `1`, SHA-256
+  `8eb52086e1877111bc0909ae8db4b0e5161d31d4379ad6121310aabb89c543ca`,
+  to version `2`, SHA-256
+  `4f510f57b0f0714ab896aeb5cb707b6b0527a28587758020d3b761ed5bddbc1a`.
+  Timestamp advanced from version `1`, SHA-256
+  `6a9dcd123a618499b7efe62a20a956f4104a5c99667ea0bcb6f84d1f1114d906`,
+  to version `2`, SHA-256
+  `4db7d5c28dbe85553b3b24e4d21e7bdb701fa27f5abd9d2b3eac8738653b3c97`.
+- Root remained version `1` at SHA-256
+  `078f0df42b95c2326380142bd2a083d45b1d410647fd1f7f5b7715c63ace4d86`;
+  targets remained version `1` at SHA-256
+  `086f19efc2e0f854792e3424b052fa83236b12930f19b98ea87fb4f93325a12e`.
+  TrustedRoot and SigningConfig stayed at
+  `a3218adce7c47a930ed323419bd1220e69324ee78f6e89c293b62e3fcae1be99`
+  and
+  `54e5a25d36f164840b68c550c60081d1495afb9d1debf98dadc42460dc49a2c9`.
+  The stable-content and trust-material fingerprints were unchanged.
+- TUF nginx remained container
+  `3154d4a3e31ac936ac590884a5a1ec60e21f6b6276add4bf965947cab40906f8`
+  with the same start timestamp. The immutable bootstrap root retained inode
+  `57546872` and SHA-256
+  `078f0df42b95c2326380142bd2a083d45b1d410647fd1f7f5b7715c63ace4d86`.
+  Active publication
+  `sha256-60af2e4a912ffebb031e0565052b8f9145ea1bb96e97c7981a4b6ad367e914e6`
+  advanced to
+  `sha256-264fb2dcb06a20975e22dc3cbdf00f1d391791f7de41b06874cabda535479d3f`;
+  the prior manifest moved unchanged to `history/previous`, and disk and served
+  role bytes matched exactly.
+- A live `restart-clients` replaced every client container in sorted order:
+  .NET `6b0e6c905b01...` to `203dedd4deee...`, Go `4ef50458c36f...`
+  to `d2705506b24d...`, Java `d23ddd663520...` to `50277e3dc336...`,
+  JavaScript `e6249891e985...` to `a691d9dae585...`, Python
+  `5fde55918741...` to `b4d9cbd90a33...`, and Rust
+  `98106e8dad56...` to `c117678e044c...`. All six reached
+  `Running`/`Healthy`, returned valid current status, and agreed with disk and
+  served trust. An independent trust/TUF file manifest was byte-identical before
+  and after at SHA-256
+  `d86bb31b3c04f876f1c129df6b08bc6e0e6205ca7b080eaea1f0742360206738`.
+- During another live client restart, the parent showed
+  `Restarting Clients`, phase `restart-client`, progress `3/9`, and underlying
+  health `13/14`. Mutation actions were unavailable while `status` remained
+  enabled. A simultaneous `refresh-tuf` failed immediately with phase
+  `contention` and identified `restart-clients` as the active operation; the
+  parent returned to `Healthy`, `14/14`, with both mutations enabled afterward.
+- Seventeen focused hosting tests cover registration/confirmation/progress,
+  operation-state recovery, gate and OS-lock contention, locked lifecycle
+  sequencing, new-instance waits, worker exit failure with preserved committed
+  state, nginx identity, metadata postcondition failures, deterministic
+  all-client health/status waits, structured results, and trust immutability.
+  The 21 schema-5 bootstrap tests and 10 Go publication tests also passed,
+  including injected pre-commit rollback and shared-lock recovery.
+- Both operations and the preserved `status` command succeeded through
+  `aspire resource`. All four startup one-shots exited `0`; all 14 long-running
+  resources became healthy. Artifact head advanced from `35` before refresh to
+  `54` afterward and beyond `197` after restarts. Every language emitted
+  successful production, validation, and trust-initialization spans with the
+  complete Step 5 attribute set. The known Python index-zero exception did not
+  occur, and no public Sigstore fallback appeared in client logs.
+- A replacement AppHost still resets both run-scoped state trees. The final
+  non-isolated AppHost remains available at
+  `https://sigstore.dev.localhost:17249` (fixed HTTP dashboard route
+  `http://sigstore.dev.localhost:15096`).
+
+**Validation gate status: passed.**
+
 ## Step 7: Implement TUF root rotation
 
 ### Scope
