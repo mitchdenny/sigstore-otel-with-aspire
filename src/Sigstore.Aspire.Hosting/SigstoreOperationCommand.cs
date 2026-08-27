@@ -757,7 +757,7 @@ internal sealed class SigstoreOperationExecutor(
             resource.StatePath,
             "dashboard-restart-clients");
         requestCancellationToken.ThrowIfCancellationRequested();
-        if (!await ValidatePreconditionsAsync(
+        if (!await ValidateRestartPreconditionsAsync(
                 execution,
                 requestCancellationToken))
         {
@@ -994,6 +994,77 @@ internal sealed class SigstoreOperationExecutor(
             status.Ready,
             "ready=true with no status errors",
             status.Reason ?? "ready",
+            "preflight",
+            resource.Name);
+    }
+
+    /// <summary>
+    /// Validates preconditions for restart-clients. Accepts stale
+    /// tufRootVersion/tufTargetsVersion on clients (valid after root
+    /// rotation - clients will catch up on restart). Rejects all other
+    /// trust mismatches (domain, generation, trusted-root, signing-config).
+    /// </summary>
+    private async Task<bool> ValidateRestartPreconditionsAsync(
+        OperationExecution execution,
+        CancellationToken cancellationToken)
+    {
+        var health = resource.GetRuntimeHealth();
+        var healthy = execution.Check(
+            "parent-runtime-healthy",
+            health.State == "Healthy",
+            "Healthy",
+            health.Reason ?? health.State,
+            "preflight",
+            resource.Name);
+        if (!healthy)
+        {
+            return false;
+        }
+
+        var status = await runtime.CollectStatusAsync(cancellationToken);
+        if (status.Ready)
+        {
+            return execution.Check(
+                "trust-status-ready",
+                true,
+                "ready=true with no status errors",
+                "ready",
+                "preflight",
+                resource.Name);
+        }
+
+        // After root rotation, clients may report stale tufRootVersion
+        // and/or tufTargetsVersion until restarted. This is the valid
+        // state that restart-clients is designed to resolve. Reject any
+        // errors about domain, generation, trusted-root, or signing-config.
+        var unsafeErrors = status.Errors
+            .Where(error =>
+                !error.Message.StartsWith(
+                    "tufRootVersion",
+                    StringComparison.Ordinal)
+                && !error.Message.StartsWith(
+                    "tufTargetsVersion",
+                    StringComparison.Ordinal))
+            .ToArray();
+
+        if (unsafeErrors.Length != 0)
+        {
+            return execution.Check(
+                "trust-status-ready",
+                false,
+                "only stale root/targets version errors (post-rotation)",
+                $"{unsafeErrors[0].Source}: {unsafeErrors[0].Message}",
+                "preflight",
+                resource.Name);
+        }
+
+        // All errors are stale root/targets versions - acceptable for
+        // restart-clients as it will resolve them.
+        return execution.Check(
+            "trust-status-stale-root-acceptable",
+            true,
+            "clients have stale root/targets version (will converge on restart)",
+            status.Reason ?? "stale root version",
             "preflight",
             resource.Name);
     }

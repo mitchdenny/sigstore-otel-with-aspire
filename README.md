@@ -148,8 +148,8 @@ Interrupted pre-commit initialization or schema-4 migration completes forward
 because there is no prior generation, while an interruption after that switch
 also finalizes forward. A known operation failure is recorded as `failed` and
 recovered by the next bootstrap. Step 4 creates or imports generation 1 only;
-it does not expose a rotation command or mutate generations during live
-operation.
+it does not mutate generations during live operation. Root key rotation is
+provided by the `rotate-tuf-root` command (Step 7).
 
 Bootstrap and TUF publication both serialize through `state.lock`. The lock is
 an operating-system advisory lock, so an interrupted owner cannot leave a
@@ -327,12 +327,13 @@ the parent to **Healthy** without changing trust state.
 
 ## Dashboard operations
 
-The parent also exposes two confirmed, progress-reporting operations in the
+The parent also exposes three confirmed, progress-reporting operations in the
 dashboard and through the Aspire CLI:
 
 ```bash
 aspire resource sigstore refresh-tuf | jq
 aspire resource sigstore restart-clients | jq
+aspire resource sigstore rotate-tuf-root | jq
 ```
 
 `refresh-tuf` starts a new instance of the existing `tuf-bootstrap` one-shot
@@ -350,13 +351,25 @@ containers in deterministic resource-name order. It waits for every replacement
 container to become **Running** and **Healthy**, then requires a valid current
 `/trust/status` response that agrees with disk and served trust state. Sigstore
 services are not restarted, and the complete committed trust/TUF state must be
-byte-identical before and after.
+byte-identical before and after. After a root rotation, `restart-clients` accepts
+clients whose root/targets version is behind disk along a valid retained root
+chain, then verifies convergence to the current version after restart.
+
+`rotate-tuf-root` generates a new root-role key, revokes the old key, and
+publishes root version `N+1` signed by both old and new keys (satisfying both
+thresholds). It uses a dedicated one-shot worker with the signal-file mechanism
+(`rotate-root.request`). Postconditions verify root version advance,
+snapshot/timestamp advance, unchanged bootstrap root/trust generation/trust
+material, and publication journal integrity. After rotation, clients report stale
+root until restarted via `restart-clients`. The immutable `bootstrap/root.json`
+always remains at version 1; fresh clients follow the versioned root chain
+(`1.root.json`, `2.root.json`, ...) to reach the active root.
 
 Only one parent operation can run at a time. A competing command fails
-immediately with the active command and phase. Both operations use the shared
-`state.lock`: client restart holds it throughout, while TUF refresh hands
-ownership from the parent preflight to the worker and back to the parent
-postcondition phase without nesting the lock.
+immediately with the active command and phase. All operations use the shared
+`state.lock`: client restart holds it throughout, while TUF refresh and root
+rotation hand ownership from the parent preflight to the worker and back to the
+parent postcondition phase without nesting the lock.
 
 Every `sigstore.trust.initialize` span contains these attributes:
 
@@ -375,8 +388,8 @@ Every `sigstore.trust.initialize` span contains these attributes:
 | `sigstore.trust.initialized_at` | RFC 3339 UTC string |
 
 The status routes and `status` command remain local and read-only. These
-operations do not add root rotation, trusted-root rollout, OIDC rotation, or any
-later-step mutation.
+operations do not add trusted-root rollout, OIDC rotation, or any later-step
+mutation.
 
 ## Stop
 
