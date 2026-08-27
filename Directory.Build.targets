@@ -1,0 +1,8 @@
+<Project>
+  <!-- File-based AppHosts cannot attach this metadata to a #:project directive. -->
+  <ItemGroup>
+    <ProjectReference
+        Update="**/Sigstore.Aspire.Hosting.csproj"
+        IsAspireProjectResource="false" />
+  </ItemGroup>
+</Project>

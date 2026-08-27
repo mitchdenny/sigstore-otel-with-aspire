@@ -315,6 +315,35 @@ Captured on `2026-08-27` with two serialized, non-isolated AppHost launches.
 - The complete Step 0 traffic and telemetry baseline, plus the Step 0a reset
   boundary, still passes.
 
+### Implementation evidence
+
+Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
+
+- Added `src/Sigstore.Aspire.Hosting` with `SigstoreResource`,
+  `SigstoreOptions`, `SigstoreComponents`, and `AddSigstore(...)`. The
+  non-compute `sigstore` parent starts in `Active`, is excluded from deployment
+  manifests, and groups all 11 Sigstore infrastructure resources.
+- The file-based AppHost references the hosting project through `#:project`;
+  targeted `IsAspireProjectResource="false"` metadata keeps the class library a
+  compile-time reference rather than an executable resource.
+- Normalized `aspire describe --include-hidden --format Json` output for every
+  pre-existing resource was identical before and after extraction. External
+  image identities and all fixed canonical endpoints also matched; the only
+  model additions were the parent and its grouping relationships.
+- `aspire wait` confirmed the four one-shot resources completed and all 14
+  long-running resources became healthy. The custom parent remained `Active`,
+  Aspire's state for a resource without a runtime lifetime.
+- AppHost startup changed all nine recorded trust-domain identity fields and
+  recreated the artifact range from `1`. Restarting only OIDC preserved the
+  bootstrap, TUF, log-state, and artifact-1 hashes while the artifact head
+  advanced from `215` to `224`.
+- All six clients emitted successful `artifact.produce` and
+  `artifact.validate` spans. Python produced and validated the Rekor index-zero
+  artifact, so the known Go/sigstore-python omitted-default edge case did not
+  occur.
+
+**Validation gate status: passed.**
+
 ## Step 2: Centralize client wiring
 
 ### Scope
