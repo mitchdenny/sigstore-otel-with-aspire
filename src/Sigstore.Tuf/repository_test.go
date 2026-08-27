@@ -637,6 +637,13 @@ func TestSecondRootRotationProducesVersionThree(t *testing.T) {
 		t.Fatalf("trust status root version = %d, want 3", status.TUFRootVersion)
 	}
 
+	// Key store must contain exactly 1 root private key after each rotation
+	// (pruning prevents unbounded accumulation).
+	keyStoreCount := countRootKeyStoreEntries(t, active2)
+	if keyStoreCount != 1 {
+		t.Fatalf("root key store after v1→v2→v3 has %d keys, want 1", keyStoreCount)
+	}
+
 	assertCommittedLayout(t, statePath)
 }
 
@@ -1221,4 +1228,19 @@ func writeTestFile(t *testing.T, path string, data []byte) {
 func testHash(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func countRootKeyStoreEntries(t *testing.T, repoPath string) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(repoPath, "keys", "root.json"))
+	if err != nil {
+		t.Fatalf("read root key store: %v", err)
+	}
+	var store struct {
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &store); err != nil {
+		t.Fatalf("parse root key store: %v", err)
+	}
+	return len(store.Data)
 }

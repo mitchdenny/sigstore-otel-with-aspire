@@ -548,7 +548,85 @@ func rotateTUFRoot(tufPath string, statePath string) error {
 	if err := repository.Commit(); err != nil {
 		return fmt.Errorf("commit rotated TUF root: %w", err)
 	}
+
+	// Prune retired root private keys from the local store. After Commit()
+	// the old key has fulfilled its purpose (dual-signing root N+1) and must
+	// not accumulate across rotations. Only the current root role key is
+	// retained so the active store stays bounded at one root private key.
+	if err := pruneRetiredRootKeys(tufPath); err != nil {
+		return fmt.Errorf("prune retired root keys: %w", err)
+	}
 	return nil
+}
+
+// pruneRetiredRootKeys removes private keys from the local key store that are
+// no longer listed in the current root role. This bounds the active key store
+// to only keys needed for the current metadata, preventing unbounded growth
+// across repeated rotations.
+func pruneRetiredRootKeys(tufPath string) error {
+	repository, err := tuf.NewRepoIndent(tuf.FileSystemStore(tufPath, nil), "", "  ")
+	if err != nil {
+		return fmt.Errorf("open repository for key pruning: %w", err)
+	}
+	currentKeys, err := repository.RootKeys()
+	if err != nil {
+		return fmt.Errorf("read current root keys for pruning: %w", err)
+	}
+	activePublicKeys := map[string]bool{}
+	for _, key := range currentKeys {
+		// Extract "public" from the key's Value (json.RawMessage).
+		var kv struct {
+			Public string `json:"public"`
+		}
+		if err := json.Unmarshal(key.Value, &kv); err == nil {
+			activePublicKeys[kv.Public] = true
+		}
+	}
+
+	keyStorePath := filepath.Join(tufPath, "keys", "root.json")
+	raw, err := os.ReadFile(keyStorePath)
+	if err != nil {
+		return fmt.Errorf("read root key store: %w", err)
+	}
+
+	var store struct {
+		Encrypted bool              `json:"encrypted"`
+		Data      []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &store); err != nil {
+		return fmt.Errorf("parse root key store: %w", err)
+	}
+
+	var retained []json.RawMessage
+	for _, entry := range store.Data {
+		var key struct {
+			KeyVal struct {
+				Public string `json:"public"`
+			} `json:"keyval"`
+		}
+		if err := json.Unmarshal(entry, &key); err != nil {
+			// Keep entries we can't parse to avoid data loss.
+			retained = append(retained, entry)
+			continue
+		}
+		if activePublicKeys[key.KeyVal.Public] {
+			retained = append(retained, entry)
+		}
+	}
+
+	if len(retained) == 0 {
+		return errors.New("pruning would remove all root keys — aborting")
+	}
+
+	pruned := struct {
+		Encrypted bool              `json:"encrypted"`
+		Data      []json.RawMessage `json:"data"`
+	}{Encrypted: store.Encrypted, Data: retained}
+	out, err := json.MarshalIndent(pruned, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal pruned key store: %w", err)
+	}
+	return os.WriteFile(keyStorePath, append(out, '\n'), 0o600)
 }
 
 func fingerprintSource(bootstrap bootstrapManifest) (string, error) {

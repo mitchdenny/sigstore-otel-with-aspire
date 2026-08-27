@@ -1,4 +1,6 @@
 import { randomBytes, randomInt } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
@@ -476,6 +478,18 @@ artifactStore = new ArtifactStore(config.artifactStoreURL);
   },
   async (span) => {
     const cachePath = '/tmp/sigstore-javascript-tuf-cache';
+    // Pre-seed the TUF cache with the bootstrap root as a writable file.
+    // The bind-mounted rootPath is read-only; tuf-js copies it preserving
+    // permissions, which prevents overwriting during root rotation traversal.
+    const mirrorCacheDir = join(cachePath, encodeURIComponent(
+      new URL(config.tufURL).host));
+    const cachedRoot = join(mirrorCacheDir, 'root.json');
+    if (!existsSync(cachedRoot)) {
+      mkdirSync(mirrorCacheDir, { recursive: true, mode: 0o755 });
+      writeFileSync(cachedRoot, readFileSync(config.tufRootPath), {
+        mode: 0o644,
+      });
+    }
     const tufOptions = {
       cachePath,
       mirrorURL: config.tufURL,
