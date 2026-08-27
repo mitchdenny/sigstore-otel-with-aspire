@@ -1,0 +1,1553 @@
+using System.Globalization;
+using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Logging;
+using Sigstore.Bootstrap;
+
+namespace Aspire.Hosting.ApplicationModel;
+
+internal static class SigstoreOperationCommand
+{
+    public const string RefreshTufCommand = "refresh-tuf";
+    public const string RestartClientsCommand = "restart-clients";
+
+    private static readonly JsonSerializerOptions JsonOptions =
+        new(JsonSerializerDefaults.Web)
+        {
+            WriteIndented = true
+        };
+
+    public static CommandOptions CreateRefreshTufOptions(
+        SigstoreResource resource) =>
+        new()
+        {
+            Description =
+                "Refresh only signed TUF snapshot and timestamp metadata while " +
+                "the current trust generation and TUF server remain unchanged.",
+            ConfirmationMessage =
+                "Refresh TUF snapshot and timestamp metadata? Root, targets, " +
+                "trusted-root content, signing configuration, and the running " +
+                "TUF server must remain unchanged.",
+            IconName = "ArrowSync",
+            IconVariant = IconVariant.Regular,
+            UpdateState = _ => GetMutationCommandState(resource),
+            Progress = new CommandProgressOptions
+            {
+                Title = "Refresh TUF metadata",
+                Message =
+                    "Refreshing and validating the signed TUF repository.",
+                HideCancelButton = true
+            }
+        };
+
+    public static CommandOptions CreateRestartClientsOptions(
+        SigstoreResource resource) =>
+        new()
+        {
+            Description =
+                "Restart all six language clients in deterministic order and " +
+                "wait for healthy, current trust status from every client.",
+            ConfirmationMessage =
+                "Restart all six Sigstore client containers? Sigstore services " +
+                "and committed trust state will not be restarted or changed.",
+            IconName = "ArrowCounterclockwise",
+            IconVariant = IconVariant.Regular,
+            UpdateState = _ => GetMutationCommandState(resource),
+            Progress = new CommandProgressOptions
+            {
+                Title = "Restart Sigstore clients",
+                Message =
+                    "Restarting clients and waiting for verified trust status.",
+                HideCancelButton = true
+            }
+        };
+
+    public static Task<ExecuteCommandResult> ExecuteRefreshTufAsync(
+        SigstoreResource resource,
+        ExecuteCommandContext context)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        ArgumentNullException.ThrowIfNull(context);
+
+        var runtime = new AspireSigstoreOperationRuntime(
+            resource,
+            context.Services);
+        return new SigstoreOperationExecutor(
+                resource,
+                runtime,
+                new SigstoreFileStateInspector(),
+                context.Logger)
+            .ExecuteRefreshTufAsync(context.CancellationToken);
+    }
+
+    public static Task<ExecuteCommandResult> ExecuteRestartClientsAsync(
+        SigstoreResource resource,
+        ExecuteCommandContext context)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        ArgumentNullException.ThrowIfNull(context);
+
+        var runtime = new AspireSigstoreOperationRuntime(
+            resource,
+            context.Services);
+        return new SigstoreOperationExecutor(
+                resource,
+                runtime,
+                new SigstoreFileStateInspector(),
+                context.Logger)
+            .ExecuteRestartClientsAsync(context.CancellationToken);
+    }
+
+    internal static ResourceCommandState GetMutationCommandState(
+        SigstoreResource resource)
+    {
+        var presentation = resource.GetPresentation();
+        return presentation.Operation is null
+            && presentation.RuntimeHealth.State == "Healthy"
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
+    internal static ExecuteCommandResult CreateResult(
+        SigstoreOperationResult result)
+    {
+        var json = JsonSerializer.Serialize(result, JsonOptions);
+        return new ExecuteCommandResult
+        {
+            Success = result.Success,
+            Message = result.Message,
+            Data = new CommandResultData
+            {
+                Value = json,
+                Format = CommandResultFormat.Json,
+                DisplayImmediately = true
+            }
+        };
+    }
+}
+
+internal sealed class SigstoreOperationExecutor(
+    SigstoreResource resource,
+    ISigstoreOperationRuntime runtime,
+    ISigstoreStateInspector stateInspector,
+    ILogger logger)
+{
+    private static readonly TimeSpan WorkerTimeout =
+        TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan ClientTimeout =
+        TimeSpan.FromMinutes(3);
+    private static readonly TimeSpan AggregateTimeout =
+        TimeSpan.FromMinutes(2);
+
+    public async Task<ExecuteCommandResult> ExecuteRefreshTufAsync(
+        CancellationToken requestCancellationToken)
+    {
+        requestCancellationToken.ThrowIfCancellationRequested();
+        if (!resource.TryBeginOperation(
+                SigstoreOperationCommand.RefreshTufCommand,
+                "Refreshing TUF",
+                out var lease,
+                out var active))
+        {
+            return CreateContentionResult(
+                SigstoreOperationCommand.RefreshTufCommand,
+                active!);
+        }
+
+        var execution = new OperationExecution(
+            resource,
+            runtime,
+            logger,
+            lease!,
+            total: 6);
+        try
+        {
+            return await ExecuteRefreshTufCoreAsync(
+                execution,
+                requestCancellationToken);
+        }
+        catch (Exception exception)
+            when (IsExpectedOperationFailure(exception))
+        {
+            execution.AddError(
+                execution.Phase,
+                resource.Name,
+                null,
+                exception.Message);
+            return execution.Failure(
+                $"{SigstoreOperationCommand.RefreshTufCommand} failed during " +
+                $"{execution.Phase}.");
+        }
+        finally
+        {
+            lease!.Dispose();
+            await runtime.PublishParentStateAsync(resource);
+        }
+    }
+
+    public async Task<ExecuteCommandResult> ExecuteRestartClientsAsync(
+        CancellationToken requestCancellationToken)
+    {
+        requestCancellationToken.ThrowIfCancellationRequested();
+        if (!resource.TryBeginOperation(
+                SigstoreOperationCommand.RestartClientsCommand,
+                "Restarting Clients",
+                out var lease,
+                out var active))
+        {
+            return CreateContentionResult(
+                SigstoreOperationCommand.RestartClientsCommand,
+                active!);
+        }
+
+        var execution = new OperationExecution(
+            resource,
+            runtime,
+            logger,
+            lease!,
+            total: 9);
+        try
+        {
+            return await ExecuteRestartClientsCoreAsync(
+                execution,
+                requestCancellationToken);
+        }
+        catch (Exception exception)
+            when (IsExpectedOperationFailure(exception))
+        {
+            execution.AddError(
+                execution.Phase,
+                resource.Name,
+                null,
+                exception.Message);
+            return execution.Failure(
+                $"{SigstoreOperationCommand.RestartClientsCommand} failed " +
+                $"during {execution.Phase}.");
+        }
+        finally
+        {
+            lease!.Dispose();
+            await runtime.PublishParentStateAsync(resource);
+        }
+    }
+
+    private async Task<ExecuteCommandResult> ExecuteRefreshTufCoreAsync(
+        OperationExecution execution,
+        CancellationToken requestCancellationToken)
+    {
+        await execution.ReportAsync(
+            "preflight",
+            0,
+            "Validating current trust, TUF, and resource state.");
+
+        SigstoreOperationSnapshot before;
+        SigstoreResourceInstanceSnapshot workerBefore;
+        ExecuteCommandResult workerStart;
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-refresh-tuf-preflight"))
+        {
+            requestCancellationToken.ThrowIfCancellationRequested();
+            if (!await ValidatePreconditionsAsync(
+                    execution,
+                    requestCancellationToken))
+            {
+                return execution.Failure(
+                    "TUF refresh preconditions are not satisfied.");
+            }
+
+            before = await CaptureAsync(requestCancellationToken);
+            execution.Before = before;
+            if (!ValidateCapture(
+                    execution,
+                    "preflight",
+                    before))
+            {
+                return execution.Failure(
+                    "The current TUF repository is not internally consistent.");
+            }
+
+            workerBefore = runtime.GetRequiredSnapshot(
+                resource.Components.TufBootstrap.Resource);
+            if (!execution.Check(
+                    "worker-ready",
+                    IsSuccessfulTerminal(workerBefore),
+                    "a completed one-shot with exit code 0",
+                    Describe(workerBefore),
+                    "preflight",
+                    workerBefore.Resource))
+            {
+                return execution.Failure(
+                    "The TUF worker is not ready for a new one-shot run.");
+            }
+            if (!execution.Check(
+                    "worker-baseline-identity",
+                    HasContainerIdentity(workerBefore),
+                    "a non-empty container identity",
+                    workerBefore.ContainerId ?? "missing",
+                    "preflight",
+                    workerBefore.Resource))
+            {
+                return execution.Failure(
+                    "The completed TUF worker has no observable container identity.");
+            }
+
+            await execution.ReportAsync(
+                "start-worker",
+                1,
+                "Starting a new TUF one-shot while handing off state.lock.");
+
+            using var critical = new CancellationTokenSource(WorkerTimeout);
+            workerStart = await runtime.ExecuteCommandAsync(
+                resource.Components.TufBootstrap.Resource,
+                KnownResourceCommands.StartCommand,
+                critical.Token);
+        }
+
+        if (!workerStart.Success)
+        {
+            execution.AddError(
+                "start-worker",
+                resource.Components.TufBootstrap.Resource.Name,
+                null,
+                workerStart.Message
+                    ?? "Aspire rejected the TUF worker start command.");
+            return await CompleteWorkerFailureAsync(
+                execution,
+                before,
+                "The TUF worker could not be started.");
+        }
+
+        await execution.ReportAsync(
+            "wait-worker",
+            2,
+            "Waiting for the new TUF worker instance to complete.");
+
+        SigstoreResourceInstanceSnapshot workerAfter;
+        using (var critical = new CancellationTokenSource(WorkerTimeout))
+        {
+            try
+            {
+                workerAfter = await runtime.WaitForSnapshotAsync(
+                    resource.Components.TufBootstrap.Resource,
+                    snapshot => IsNewInstance(workerBefore, snapshot)
+                        && IsTerminal(snapshot),
+                    WorkerTimeout,
+                    critical.Token);
+            }
+            catch (OperationCanceledException exception)
+            {
+                execution.AddError(
+                    "wait-worker",
+                    resource.Components.TufBootstrap.Resource.Name,
+                    null,
+                    exception.Message);
+                return await CompleteWorkerFailureAsync(
+                    execution,
+                    before,
+                    "The TUF worker did not complete within the operation timeout.");
+            }
+        }
+
+        execution.Resources.Add(
+            CreateLifecycleResult(
+                resource.Components.TufBootstrap.Resource.Name,
+                KnownResourceCommands.StartCommand,
+                workerBefore,
+                workerAfter,
+                null));
+        if (!IsSuccessfulTerminal(workerAfter))
+        {
+            execution.AddError(
+                "wait-worker",
+                workerAfter.Resource,
+                null,
+                $"Worker completed as {Describe(workerAfter)}.");
+            return await CompleteWorkerFailureAsync(
+                execution,
+                before,
+                "The TUF worker failed.");
+        }
+
+        await execution.ReportAsync(
+            "postconditions",
+            3,
+            "Validating committed metadata, history, and the running TUF server.");
+
+        using var postconditionToken = new CancellationTokenSource(
+            WorkerTimeout);
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-refresh-tuf-postconditions"))
+        {
+            var after = await CaptureAsync(postconditionToken.Token);
+            execution.After = after;
+            ValidateRefreshPostconditions(
+                execution,
+                before,
+                after,
+                workerBefore,
+                workerAfter);
+
+            await execution.ReportAsync(
+                "aggregate-status",
+                4,
+                "Validating served metadata and all six client trust contracts.");
+            var aggregate = await runtime.CollectStatusAsync(
+                postconditionToken.Token);
+            execution.Check(
+                "aggregate-status-ready",
+                aggregate.Ready,
+                "ready=true with no status errors",
+                aggregate.Reason ?? "ready",
+                "aggregate-status",
+                resource.Name);
+
+            await execution.ReportAsync(
+                "final-verification",
+                5,
+                "Rechecking the TUF server identity before reporting success.");
+            var finalServer = runtime.GetRequiredSnapshot(
+                resource.Components.Tuf.Resource);
+            execution.Check(
+                "tuf-server-final-identity",
+                SameInstance(after.TufServer, finalServer)
+                    && IsRunningHealthy(finalServer),
+                Describe(after.TufServer),
+                Describe(finalServer),
+                "aggregate-status",
+                finalServer.Resource);
+        }
+
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "TUF metadata refreshed, but one or more postconditions failed.");
+        }
+
+        await execution.ReportAsync(
+            "complete",
+            6,
+            "TUF snapshot and timestamp metadata refreshed successfully.");
+        return execution.Success(
+            "TUF snapshot and timestamp metadata refreshed and verified.");
+    }
+
+    private async Task<ExecuteCommandResult> ExecuteRestartClientsCoreAsync(
+        OperationExecution execution,
+        CancellationToken requestCancellationToken)
+    {
+        await execution.ReportAsync(
+            "preflight",
+            0,
+            "Validating current trust and all registered clients.");
+
+        using var stateLock = stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-restart-clients");
+        requestCancellationToken.ThrowIfCancellationRequested();
+        if (!await ValidatePreconditionsAsync(
+                execution,
+                requestCancellationToken))
+        {
+            return execution.Failure(
+                "Client restart preconditions are not satisfied.");
+        }
+
+        var clients = resource
+            .GetRegistrations()
+            .Clients
+            .OrderBy(client => client.Resource.Name, StringComparer.Ordinal)
+            .ToArray();
+        if (!execution.Check(
+                "six-clients-registered",
+                clients.Length == 6,
+                "6",
+                clients.Length.ToString(CultureInfo.InvariantCulture),
+                "preflight",
+                resource.Name))
+        {
+            return execution.Failure(
+                "The Sigstore parent does not have exactly six clients.");
+        }
+
+        var before = await CaptureAsync(requestCancellationToken);
+        execution.Before = before;
+        if (!ValidateCapture(execution, "preflight", before))
+        {
+            return execution.Failure(
+                "The current trust state is not internally consistent.");
+        }
+
+        using var critical = new CancellationTokenSource(
+            TimeSpan.FromMinutes(20));
+        var completed = 1;
+        var restarted = new Dictionary<
+            string,
+            SigstoreResourceInstanceSnapshot>(
+            StringComparer.Ordinal);
+        foreach (var client in clients)
+        {
+            var clientBefore = runtime.GetRequiredSnapshot(client.Resource);
+            if (!execution.Check(
+                    $"{client.Resource.Name}-ready",
+                    IsRunningHealthy(clientBefore)
+                        && HasContainerIdentity(clientBefore),
+                    "Running/Healthy with a container identity",
+                    Describe(clientBefore),
+                    "restart-client",
+                    client.Resource.Name))
+            {
+                return CompleteRestartFailure(
+                    execution,
+                    before,
+                    $"{client.Resource.Name} is not ready to restart.");
+            }
+
+            await execution.ReportAsync(
+                "restart-client",
+                completed,
+                $"Restarting {client.Resource.Name}.");
+            var restart = await runtime.ExecuteCommandAsync(
+                client.Resource,
+                KnownResourceCommands.RestartCommand,
+                critical.Token);
+            if (!restart.Success)
+            {
+                execution.AddError(
+                    "restart-client",
+                    client.Resource.Name,
+                    null,
+                    restart.Message
+                        ?? "Aspire rejected the client restart command.");
+                return CompleteRestartFailure(
+                    execution,
+                    before,
+                    $"{client.Resource.Name} could not be restarted.");
+            }
+
+            SigstoreResourceInstanceSnapshot clientAfter;
+            try
+            {
+                clientAfter = await runtime.WaitForSnapshotAsync(
+                    client.Resource,
+                    snapshot => IsNewInstance(clientBefore, snapshot)
+                        && IsRunningHealthy(snapshot),
+                    ClientTimeout,
+                    critical.Token);
+            }
+            catch (OperationCanceledException exception)
+            {
+                execution.AddError(
+                    "wait-client",
+                    client.Resource.Name,
+                    null,
+                    exception.Message);
+                return CompleteRestartFailure(
+                    execution,
+                    before,
+                    $"{client.Resource.Name} did not become healthy.");
+            }
+
+            var trustStatus = await runtime.ReadClientStatusAsync(
+                client,
+                critical.Token);
+            if (!execution.Check(
+                    $"{client.Resource.Name}-trust-status",
+                    MatchesDisk(before.Tuf.Trust, trustStatus),
+                    DescribeTrust(before.Tuf.Trust),
+                    DescribeTrust(trustStatus),
+                    "wait-client",
+                    client.Resource.Name))
+            {
+                return CompleteRestartFailure(
+                    execution,
+                    before,
+                    $"{client.Resource.Name} reported inconsistent trust.");
+            }
+
+            execution.Resources.Add(
+                CreateLifecycleResult(
+                    client.Resource.Name,
+                    KnownResourceCommands.RestartCommand,
+                    clientBefore,
+                    clientAfter,
+                    trustStatus));
+            restarted.Add(client.Resource.Name, clientAfter);
+            completed++;
+        }
+
+        await execution.ReportAsync(
+            "aggregate-status",
+            7,
+            "Waiting for aggregate health and all client status contracts.");
+        await runtime.WaitForAggregateHealthyAsync(
+            AggregateTimeout,
+            critical.Token);
+        var aggregate = await runtime.CollectStatusAsync(critical.Token);
+        execution.Check(
+            "aggregate-status-ready",
+            aggregate.Ready
+                && aggregate.Clients.Count == clients.Length,
+            $"ready=true and {clients.Length} clients",
+            aggregate.Reason
+                ?? $"ready={aggregate.Ready}, clients={aggregate.Clients.Count}",
+            "aggregate-status",
+            resource.Name);
+
+        await execution.ReportAsync(
+            "postconditions",
+            8,
+            "Proving trust state stayed byte-identical and clients stayed healthy.");
+        var after = await CaptureAsync(critical.Token);
+        execution.After = after;
+        execution.Check(
+            "trust-state-unchanged",
+            after.TrustStateSha256 == before.TrustStateSha256,
+            before.TrustStateSha256,
+            after.TrustStateSha256,
+            "postconditions",
+            resource.Name);
+        execution.Check(
+            "tuf-disk-state-unchanged",
+            after.Tuf == before.Tuf,
+            Describe(before.Tuf),
+            Describe(after.Tuf),
+            "postconditions",
+            resource.Name);
+        execution.Check(
+            "tuf-served-state-unchanged",
+            after.Served == before.Served,
+            Describe(before.Served),
+            Describe(after.Served),
+            "postconditions",
+            resource.Components.Tuf.Resource.Name);
+        execution.Check(
+            "tuf-server-unchanged",
+            SameInstance(before.TufServer, after.TufServer)
+                && IsRunningHealthy(after.TufServer),
+            Describe(before.TufServer),
+            Describe(after.TufServer),
+            "postconditions",
+            resource.Components.Tuf.Resource.Name);
+
+        foreach (var client in clients)
+        {
+            var final = runtime.GetRequiredSnapshot(client.Resource);
+            var expected = restarted[client.Resource.Name];
+            execution.Check(
+                $"{client.Resource.Name}-final-state",
+                SameInstance(expected, final)
+                    && IsRunningHealthy(final),
+                Describe(expected),
+                Describe(final),
+                "postconditions",
+                client.Resource.Name);
+        }
+
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "All client lifecycle commands completed, but one or more " +
+                "postconditions failed.");
+        }
+
+        await execution.ReportAsync(
+            "complete",
+            9,
+            "All six clients restarted with current verified trust status.");
+        return execution.Success(
+            "All six Sigstore clients restarted and became healthy.");
+    }
+
+    private async Task<bool> ValidatePreconditionsAsync(
+        OperationExecution execution,
+        CancellationToken cancellationToken)
+    {
+        var health = resource.GetRuntimeHealth();
+        var healthy = execution.Check(
+            "parent-runtime-healthy",
+            health.State == "Healthy",
+            "Healthy",
+            health.Reason ?? health.State,
+            "preflight",
+            resource.Name);
+        if (!healthy)
+        {
+            return false;
+        }
+
+        var status = await runtime.CollectStatusAsync(cancellationToken);
+        return execution.Check(
+            "trust-status-ready",
+            status.Ready,
+            "ready=true with no status errors",
+            status.Reason ?? "ready",
+            "preflight",
+            resource.Name);
+    }
+
+    private async Task<SigstoreOperationSnapshot> CaptureAsync(
+        CancellationToken cancellationToken)
+    {
+        var tuf = stateInspector.ReadTufState(resource.StatePath);
+        var trustStateSha256 = stateInspector.ReadTrustStateFingerprint(
+            resource.StatePath);
+        var trustMaterialSha256 =
+            stateInspector.ReadTrustMaterialFingerprint(
+                resource.StatePath);
+        var served = await runtime.ReadServedTufStateAsync(
+            cancellationToken);
+        var tufServer = runtime.GetRequiredSnapshot(
+            resource.Components.Tuf.Resource);
+        return new SigstoreOperationSnapshot(
+            tuf,
+            served,
+            trustStateSha256,
+            trustMaterialSha256,
+            tufServer);
+    }
+
+    private static bool ValidateCapture(
+        OperationExecution execution,
+        string phase,
+        SigstoreOperationSnapshot snapshot)
+    {
+        var consistent = execution.Check(
+            $"{phase}-disk-served",
+            MatchesServed(snapshot.Tuf, snapshot.Served),
+            Describe(snapshot.Tuf),
+            Describe(snapshot.Served),
+            phase,
+            snapshot.TufServer.Resource);
+        var serverHealthy = execution.Check(
+            $"{phase}-tuf-server",
+            IsRunningHealthy(snapshot.TufServer)
+                && HasContainerIdentity(snapshot.TufServer),
+            "Running/Healthy with a container identity",
+            Describe(snapshot.TufServer),
+            phase,
+            snapshot.TufServer.Resource);
+        var metadataCurrent = execution.Check(
+            $"{phase}-metadata-current",
+            snapshot.Tuf.Metadata.Root.ExpiresAtUtc > DateTimeOffset.UtcNow
+                && snapshot.Tuf.Metadata.Targets.ExpiresAtUtc
+                    > DateTimeOffset.UtcNow
+                && snapshot.Tuf.Metadata.Snapshot.ExpiresAtUtc
+                    > DateTimeOffset.UtcNow
+                && snapshot.Tuf.Metadata.Timestamp.ExpiresAtUtc
+                    > DateTimeOffset.UtcNow,
+            "all four metadata roles unexpired",
+            Describe(snapshot.Tuf.Metadata),
+            phase,
+            snapshot.TufServer.Resource);
+        return consistent && serverHealthy && metadataCurrent;
+    }
+
+    private static void ValidateRefreshPostconditions(
+        OperationExecution execution,
+        SigstoreOperationSnapshot before,
+        SigstoreOperationSnapshot after,
+        SigstoreResourceInstanceSnapshot workerBefore,
+        SigstoreResourceInstanceSnapshot workerAfter)
+    {
+        CheckEqual(
+            execution,
+            "root-unchanged",
+            before.Tuf.Metadata.Root,
+            after.Tuf.Metadata.Root);
+        CheckEqual(
+            execution,
+            "targets-unchanged",
+            before.Tuf.Metadata.Targets,
+            after.Tuf.Metadata.Targets);
+        CheckEqual(
+            execution,
+            "trusted-root-unchanged",
+            before.Tuf.Metadata.TrustedRootSha256,
+            after.Tuf.Metadata.TrustedRootSha256);
+        CheckEqual(
+            execution,
+            "signing-config-unchanged",
+            before.Tuf.Metadata.SigningConfigSha256,
+            after.Tuf.Metadata.SigningConfigSha256);
+        CheckEqual(
+            execution,
+            "trust-domain-unchanged",
+            before.Tuf.Trust.TrustDomainId,
+            after.Tuf.Trust.TrustDomainId);
+        CheckEqual(
+            execution,
+            "generation-unchanged",
+            DescribeGeneration(before.Tuf.Trust),
+            DescribeGeneration(after.Tuf.Trust));
+        CheckEqual(
+            execution,
+            "bootstrap-root-unchanged",
+            before.Tuf.BootstrapRootSha256,
+            after.Tuf.BootstrapRootSha256);
+        CheckEqual(
+            execution,
+            "source-fingerprint-unchanged",
+            before.Tuf.SourceFingerprint,
+            after.Tuf.SourceFingerprint);
+        CheckEqual(
+            execution,
+            "trust-material-unchanged",
+            before.TrustMaterialSha256,
+            after.TrustMaterialSha256);
+        CheckEqual(
+            execution,
+            "tuf-keys-and-target-content-unchanged",
+            before.Tuf.StableContentSha256,
+            after.Tuf.StableContentSha256);
+
+        CheckAdvanced(
+            execution,
+            "snapshot-advanced",
+            before.Tuf.Metadata.Snapshot,
+            after.Tuf.Metadata.Snapshot);
+        CheckAdvanced(
+            execution,
+            "timestamp-advanced",
+            before.Tuf.Metadata.Timestamp,
+            after.Tuf.Metadata.Timestamp);
+        execution.Check(
+            "publication-advanced",
+            before.Tuf.Trust.PublicationId
+                    != after.Tuf.Trust.PublicationId
+                && before.Tuf.Trust.PublicationManifestSha256
+                    != after.Tuf.Trust.PublicationManifestSha256,
+            DescribePublication(before.Tuf.Trust),
+            DescribePublication(after.Tuf.Trust),
+            "postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "history-retains-prior-active",
+            after.Tuf.PreviousPublicationId
+                    == before.Tuf.Trust.PublicationId
+                && after.Tuf.PreviousPublicationManifestSha256
+                    == before.Tuf.Trust.PublicationManifestSha256,
+            DescribePublication(before.Tuf.Trust),
+            $"{after.Tuf.PreviousPublicationId}/" +
+                after.Tuf.PreviousPublicationManifestSha256,
+            "postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "trust-state-changed-only-by-publication",
+            before.TrustStateSha256 != after.TrustStateSha256,
+            "a changed trust-state fingerprint",
+            after.TrustStateSha256,
+            "postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "disk-served-after-refresh",
+            MatchesServed(after.Tuf, after.Served),
+            Describe(after.Tuf),
+            Describe(after.Served),
+            "postconditions",
+            after.TufServer.Resource);
+        execution.Check(
+            "tuf-server-not-restarted",
+            SameInstance(before.TufServer, after.TufServer)
+                && IsRunningHealthy(after.TufServer),
+            Describe(before.TufServer),
+            Describe(after.TufServer),
+            "postconditions",
+            after.TufServer.Resource);
+        execution.Check(
+            "worker-ran-once",
+            IsNewInstance(workerBefore, workerAfter)
+                && IsSuccessfulTerminal(workerAfter),
+            Describe(workerBefore),
+            Describe(workerAfter),
+            "postconditions",
+            workerAfter.Resource);
+    }
+
+    private async Task<ExecuteCommandResult> CompleteWorkerFailureAsync(
+        OperationExecution execution,
+        SigstoreOperationSnapshot before,
+        string message)
+    {
+        await execution.ReportAsync(
+            "rollback-validation",
+            3,
+            "Verifying that the previously committed repository remains served.");
+        try
+        {
+            using var validationToken = new CancellationTokenSource(
+                AggregateTimeout);
+            using var stateLock = stateInspector.AcquireLock(
+                resource.StatePath,
+                "dashboard-refresh-tuf-failure-validation");
+            var after = await CaptureAsync(validationToken.Token);
+            execution.After = after;
+            var status = await runtime.CollectStatusAsync(
+                validationToken.Token);
+            var preserved = execution.Check(
+                    "failed-worker-preserved-trust-state",
+                    before.TrustStateSha256 == after.TrustStateSha256,
+                    before.TrustStateSha256,
+                    after.TrustStateSha256,
+                    "rollback-validation",
+                    "tuf-bootstrap")
+                & execution.Check(
+                    "failed-worker-preserved-disk-publication",
+                    before.Tuf == after.Tuf,
+                    Describe(before.Tuf),
+                    Describe(after.Tuf),
+                    "rollback-validation",
+                    "tuf-bootstrap")
+                & execution.Check(
+                    "failed-worker-preserved-served-publication",
+                    before.Served == after.Served,
+                    Describe(before.Served),
+                    Describe(after.Served),
+                    "rollback-validation",
+                    resource.Components.Tuf.Resource.Name)
+                & execution.Check(
+                    "failed-worker-preserved-tuf-server",
+                    SameInstance(before.TufServer, after.TufServer)
+                        && IsRunningHealthy(after.TufServer),
+                    Describe(before.TufServer),
+                    Describe(after.TufServer),
+                    "rollback-validation",
+                    resource.Components.Tuf.Resource.Name)
+                & execution.Check(
+                    "failed-worker-status-ready",
+                    status.Ready,
+                    "ready=true",
+                    status.Reason ?? "ready",
+                    "rollback-validation",
+                    resource.Name);
+            execution.CommittedStatePreserved = preserved;
+        }
+        catch (Exception exception)
+            when (IsExpectedOperationFailure(exception))
+        {
+            execution.CommittedStatePreserved = false;
+            execution.AddError(
+                "rollback-validation",
+                "tuf-bootstrap",
+                "previous-publication-preserved",
+                exception.Message);
+        }
+
+        return execution.Failure(message);
+    }
+
+    private ExecuteCommandResult CompleteRestartFailure(
+        OperationExecution execution,
+        SigstoreOperationSnapshot before,
+        string message)
+    {
+        var currentFingerprint = stateInspector.ReadTrustStateFingerprint(
+            resource.StatePath);
+        execution.CommittedStatePreserved = execution.Check(
+            "failed-restart-preserved-trust-state",
+            currentFingerprint == before.TrustStateSha256,
+            before.TrustStateSha256,
+            currentFingerprint,
+            "failure-validation",
+            resource.Name);
+        return execution.Failure(message);
+    }
+
+    private static void CheckEqual<T>(
+        OperationExecution execution,
+        string name,
+        T expected,
+        T actual)
+        where T : notnull =>
+        execution.Check(
+            name,
+            EqualityComparer<T>.Default.Equals(expected, actual),
+            FormatValue(expected),
+            FormatValue(actual),
+            "postconditions",
+            "tuf-bootstrap");
+
+    private static string FormatValue<T>(T value)
+        where T : notnull =>
+        value switch
+        {
+            SigstoreTufMetadataRoleStatus role =>
+                $"version {role.Version}, sha256 {role.Sha256}, expires " +
+                $"{role.ExpiresAtUtc:O}",
+            IFormattable formattable => formattable.ToString(
+                    null,
+                    CultureInfo.InvariantCulture)
+                ?? typeof(T).Name,
+            _ => value.ToString() ?? typeof(T).Name
+        };
+
+    private static void CheckAdvanced(
+        OperationExecution execution,
+        string name,
+        SigstoreTufMetadataRoleStatus before,
+        SigstoreTufMetadataRoleStatus after) =>
+        execution.Check(
+            name,
+            after.Version == before.Version + 1
+                && after.Sha256 != before.Sha256
+                && after.ExpiresAtUtc > before.ExpiresAtUtc
+                && after.ExpiresAtUtc > DateTimeOffset.UtcNow,
+            $"version {before.Version + 1}, changed hash, later expiration",
+            $"version {after.Version}, sha256 {after.Sha256}, expires " +
+                $"{after.ExpiresAtUtc:O}",
+            "postconditions",
+            "tuf-bootstrap");
+
+    private static bool MatchesServed(
+        SigstoreTufStateSnapshot disk,
+        SigstoreServedTufSnapshot served) =>
+        disk.Metadata == served.Metadata
+        && disk.Trust.TrustDomainId == served.Trust.TrustDomainId
+        && disk.Trust.Generation == served.Trust.Generation
+        && disk.Trust.GenerationId == served.Trust.GenerationId
+        && disk.Trust.GenerationManifestSha256
+            == served.Trust.GenerationManifestSha256
+        && disk.Trust.TufRootVersion == served.Trust.TufRootVersion
+        && disk.Trust.TufTargetsVersion == served.Trust.TufTargetsVersion
+        && disk.Trust.TrustedRootSha256
+            == served.Trust.TrustedRootSha256
+        && disk.Trust.SigningConfigSha256
+            == served.Trust.SigningConfigSha256;
+
+    private static bool MatchesDisk(
+        SigstoreDiskTrustStatus disk,
+        SigstoreClientTrustStatus client) =>
+        disk.TrustDomainId == client.TrustDomainId
+        && disk.Generation == client.Generation
+        && disk.GenerationId == client.GenerationId
+        && disk.GenerationManifestSha256
+            == client.GenerationManifestSha256
+        && disk.TufRootVersion == client.TufRootVersion
+        && disk.TufTargetsVersion == client.TufTargetsVersion
+        && disk.TrustedRootSha256 == client.TrustedRootSha256
+        && disk.SigningConfigSha256 == client.SigningConfigSha256;
+
+    private static bool HasContainerIdentity(
+        SigstoreResourceInstanceSnapshot snapshot) =>
+        !string.IsNullOrWhiteSpace(snapshot.ContainerId);
+
+    private static bool IsNewInstance(
+        SigstoreResourceInstanceSnapshot before,
+        SigstoreResourceInstanceSnapshot after) =>
+        HasContainerIdentity(before)
+        && HasContainerIdentity(after)
+        && before.ContainerId != after.ContainerId
+        && (before.StartTimeUtc is null
+            || after.StartTimeUtc > before.StartTimeUtc);
+
+    private static bool SameInstance(
+        SigstoreResourceInstanceSnapshot first,
+        SigstoreResourceInstanceSnapshot second) =>
+        HasContainerIdentity(first)
+        && first.ContainerId == second.ContainerId
+        && first.StartTimeUtc == second.StartTimeUtc;
+
+    private static bool IsTerminal(
+        SigstoreResourceInstanceSnapshot snapshot) =>
+        KnownResourceStates.TerminalStates.Contains(snapshot.State);
+
+    private static bool IsSuccessfulTerminal(
+        SigstoreResourceInstanceSnapshot snapshot) =>
+        IsTerminal(snapshot) && snapshot.ExitCode == 0;
+
+    private static bool IsRunningHealthy(
+        SigstoreResourceInstanceSnapshot snapshot) =>
+        snapshot.State == KnownResourceStates.Running
+        && snapshot.Health == nameof(HealthStatus.Healthy);
+
+    private static SigstoreResourceLifecycleResult CreateLifecycleResult(
+        string resourceName,
+        string command,
+        SigstoreResourceInstanceSnapshot before,
+        SigstoreResourceInstanceSnapshot after,
+        SigstoreClientTrustStatus? trustStatus) =>
+        new(
+            resourceName,
+            command,
+            before.ContainerId!,
+            after.ContainerId!,
+            before.StartTimeUtc,
+            after.StartTimeUtc,
+            after.State,
+            after.Health,
+            after.ExitCode,
+            trustStatus);
+
+    private static ExecuteCommandResult CreateContentionResult(
+        string command,
+        SigstoreOperationState active)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return SigstoreOperationCommand.CreateResult(
+            new SigstoreOperationResult(
+                1,
+                command,
+                false,
+                "contention",
+                $"Cannot run {command} because {active.Command} is already " +
+                    $"active in phase {active.Phase}.",
+                now,
+                now,
+                [],
+                null,
+                null,
+                [],
+                [],
+                null,
+                [
+                    new(
+                        "contention",
+                        "sigstore",
+                        "operation-exclusive",
+                        $"{active.Command} has held the operation gate since " +
+                            $"{active.StartedAtUtc:O}.")
+                ]));
+    }
+
+    private static bool IsExpectedOperationFailure(Exception exception) =>
+        exception is SigstoreStatusException
+            or IOException
+            or UnauthorizedAccessException
+            or HttpRequestException
+            or InvalidOperationException
+            or JsonException
+            or UriFormatException
+            or OperationCanceledException;
+
+    private static string Describe(
+        SigstoreResourceInstanceSnapshot snapshot) =>
+        $"{snapshot.State}/{snapshot.Health}, container " +
+        $"{snapshot.ContainerId ?? "missing"}, start " +
+        $"{snapshot.StartTimeUtc?.ToString("O") ?? "missing"}, exit " +
+        $"{snapshot.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "none"}";
+
+    private static string Describe(SigstoreTufStateSnapshot snapshot) =>
+        $"{DescribePublication(snapshot.Trust)}, root " +
+        $"{snapshot.Metadata.Root.Version}/{snapshot.Metadata.Root.Sha256}, " +
+        $"targets {snapshot.Metadata.Targets.Version}/" +
+        $"{snapshot.Metadata.Targets.Sha256}, snapshot " +
+        $"{snapshot.Metadata.Snapshot.Version}/" +
+        $"{snapshot.Metadata.Snapshot.Sha256}, timestamp " +
+        $"{snapshot.Metadata.Timestamp.Version}/" +
+        $"{snapshot.Metadata.Timestamp.Sha256}";
+
+    private static string Describe(SigstoreServedTufSnapshot snapshot) =>
+        $"root {snapshot.Metadata.Root.Version}/" +
+        $"{snapshot.Metadata.Root.Sha256}, targets " +
+        $"{snapshot.Metadata.Targets.Version}/" +
+        $"{snapshot.Metadata.Targets.Sha256}, snapshot " +
+        $"{snapshot.Metadata.Snapshot.Version}/" +
+        $"{snapshot.Metadata.Snapshot.Sha256}, timestamp " +
+        $"{snapshot.Metadata.Timestamp.Version}/" +
+        $"{snapshot.Metadata.Timestamp.Sha256}";
+
+    private static string Describe(SigstoreTufMetadataStatus metadata) =>
+        $"root expires {metadata.Root.ExpiresAtUtc:O}, targets expires " +
+        $"{metadata.Targets.ExpiresAtUtc:O}, snapshot expires " +
+        $"{metadata.Snapshot.ExpiresAtUtc:O}, timestamp expires " +
+        $"{metadata.Timestamp.ExpiresAtUtc:O}";
+
+    private static string DescribePublication(
+        SigstoreDiskTrustStatus trust) =>
+        $"{trust.PublicationId}/{trust.PublicationManifestSha256}";
+
+    private static string DescribeGeneration(
+        SigstoreDiskTrustStatus trust) =>
+        $"{trust.TrustDomainId}/{trust.Generation}/{trust.GenerationId}/" +
+        trust.GenerationManifestSha256;
+
+    private static string DescribeTrust(
+        SigstoreDiskTrustStatus trust) =>
+        $"{DescribeGeneration(trust)}/{trust.TufRootVersion}/" +
+        $"{trust.TufTargetsVersion}/{trust.TrustedRootSha256}/" +
+        trust.SigningConfigSha256;
+
+    private static string DescribeTrust(
+        SigstoreClientTrustStatus trust) =>
+        $"{trust.TrustDomainId}/{trust.Generation}/{trust.GenerationId}/" +
+        $"{trust.GenerationManifestSha256}/{trust.TufRootVersion}/" +
+        $"{trust.TufTargetsVersion}/{trust.TrustedRootSha256}/" +
+        trust.SigningConfigSha256;
+
+    private sealed class OperationExecution(
+        SigstoreResource resource,
+        ISigstoreOperationRuntime runtime,
+        ILogger logger,
+        SigstoreResource.SigstoreOperationLease lease,
+        int total)
+    {
+        public List<SigstoreOperationProgress> Progress { get; } = [];
+
+        public List<SigstoreResourceLifecycleResult> Resources { get; } = [];
+
+        public List<SigstoreOperationCheck> Checks { get; } = [];
+
+        public List<SigstoreOperationError> Errors { get; } = [];
+
+        public string Phase { get; private set; } = "starting";
+
+        public SigstoreOperationSnapshot? Before { get; set; }
+
+        public SigstoreOperationSnapshot? After { get; set; }
+
+        public bool? CommittedStatePreserved { get; set; }
+
+        public bool HasFailures => Errors.Count != 0;
+
+        public async Task ReportAsync(
+            string phase,
+            int completed,
+            string message)
+        {
+            Phase = phase;
+            var progress = new SigstoreOperationProgress(
+                phase,
+                completed,
+                total,
+                message,
+                DateTimeOffset.UtcNow);
+            Progress.Add(progress);
+            lease.Report(
+                phase,
+                completed,
+                total,
+                message);
+            logger.LogInformation(
+                "Sigstore operation {Command} phase {Phase} " +
+                "({Completed}/{Total}): {Message}",
+                lease.Operation.Command,
+                phase,
+                completed,
+                total,
+                message);
+            await runtime.PublishParentStateAsync(resource);
+        }
+
+        public bool Check(
+            string name,
+            bool passed,
+            string expected,
+            string actual,
+            string phase,
+            string resourceName)
+        {
+            Checks.Add(
+                new SigstoreOperationCheck(
+                    name,
+                    passed,
+                    expected,
+                    actual));
+            if (!passed)
+            {
+                AddError(
+                    phase,
+                    resourceName,
+                    name,
+                    $"Expected {expected}; observed {actual}.");
+            }
+            return passed;
+        }
+
+        public void AddError(
+            string phase,
+            string resourceName,
+            string? postcondition,
+            string message) =>
+            Errors.Add(
+                new SigstoreOperationError(
+                    phase,
+                    resourceName,
+                    postcondition,
+                    message));
+
+        public ExecuteCommandResult Success(string message) =>
+            CreateResult(true, message);
+
+        public ExecuteCommandResult Failure(string message) =>
+            CreateResult(false, message);
+
+        private ExecuteCommandResult CreateResult(
+            bool success,
+            string message) =>
+            SigstoreOperationCommand.CreateResult(
+                new SigstoreOperationResult(
+                    1,
+                    lease.Operation.Command,
+                    success,
+                    Phase,
+                    message,
+                    lease.Operation.StartedAtUtc,
+                    DateTimeOffset.UtcNow,
+                    Progress,
+                    Before,
+                    After,
+                    Resources,
+                    Checks,
+                    CommittedStatePreserved,
+                    Errors));
+    }
+}
+
+internal interface ISigstoreOperationRuntime
+{
+    SigstoreResourceInstanceSnapshot GetRequiredSnapshot(IResource resource);
+
+    Task<ExecuteCommandResult> ExecuteCommandAsync(
+        IResource resource,
+        string command,
+        CancellationToken cancellationToken);
+
+    Task<SigstoreResourceInstanceSnapshot> WaitForSnapshotAsync(
+        IResource resource,
+        Func<SigstoreResourceInstanceSnapshot, bool> predicate,
+        TimeSpan timeout,
+        CancellationToken cancellationToken);
+
+    Task WaitForAggregateHealthyAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken);
+
+    Task<SigstoreAggregateTrustStatus> CollectStatusAsync(
+        CancellationToken cancellationToken);
+
+    Task<SigstoreServedTufSnapshot> ReadServedTufStateAsync(
+        CancellationToken cancellationToken);
+
+    Task<SigstoreClientTrustStatus> ReadClientStatusAsync(
+        SigstoreClientRegistration client,
+        CancellationToken cancellationToken);
+
+    Task PublishParentStateAsync(SigstoreResource resource);
+}
+
+internal sealed class AspireSigstoreOperationRuntime
+    : ISigstoreOperationRuntime
+{
+    private const string ContainerIdProperty = "container.id";
+
+    private readonly SigstoreResource _resource;
+    private readonly ResourceCommandService _commands;
+    private readonly ResourceNotificationService _notifications;
+
+    public AspireSigstoreOperationRuntime(
+        SigstoreResource resource,
+        IServiceProvider services)
+    {
+        _resource = resource;
+        _commands = services.GetRequiredService<ResourceCommandService>();
+        _notifications =
+            services.GetRequiredService<ResourceNotificationService>();
+    }
+
+    public SigstoreResourceInstanceSnapshot GetRequiredSnapshot(
+        IResource resource)
+    {
+        if (!_notifications.TryGetCurrentState(
+                resource.Name,
+                out var resourceEvent))
+        {
+            throw new InvalidOperationException(
+                $"Resource state for '{resource.Name}' is unavailable.");
+        }
+        return Convert(resourceEvent);
+    }
+
+    public Task<ExecuteCommandResult> ExecuteCommandAsync(
+        IResource resource,
+        string command,
+        CancellationToken cancellationToken) =>
+        _commands.ExecuteCommandAsync(
+            resource,
+            command,
+            cancellationToken);
+
+    public async Task<SigstoreResourceInstanceSnapshot> WaitForSnapshotAsync(
+        IResource resource,
+        Func<SigstoreResourceInstanceSnapshot, bool> predicate,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        using var timeoutSource =
+            CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken);
+        timeoutSource.CancelAfter(timeout);
+        var resourceEvent = await _notifications.WaitForResourceAsync(
+            resource.Name,
+            item => predicate(Convert(item)),
+            timeoutSource.Token);
+        return Convert(resourceEvent);
+    }
+
+    public async Task WaitForAggregateHealthyAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        using var timeoutSource =
+            CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken);
+        timeoutSource.CancelAfter(timeout);
+        _ = await _notifications.WaitForResourceAsync(
+            _resource.Name,
+            _ => _resource.GetRuntimeHealth().State == "Healthy",
+            timeoutSource.Token);
+    }
+
+    public Task<SigstoreAggregateTrustStatus> CollectStatusAsync(
+        CancellationToken cancellationToken) =>
+        SigstoreStatusCommand.CollectAsync(
+            _resource,
+            cancellationToken);
+
+    public async Task<SigstoreServedTufSnapshot> ReadServedTufStateAsync(
+        CancellationToken cancellationToken)
+    {
+        var endpoint = await _resource.TufEndpoint.GetValueAsync(
+            cancellationToken)
+            ?? throw new SigstoreStatusException(
+                "The TUF endpoint is not allocated.");
+        return await SigstoreStatusCommand.ReadServedTufSnapshotAsync(
+            new Uri(endpoint, UriKind.Absolute),
+            cancellationToken);
+    }
+
+    public Task<SigstoreClientTrustStatus> ReadClientStatusAsync(
+        SigstoreClientRegistration client,
+        CancellationToken cancellationToken) =>
+        SigstoreStatusCommand.ReadRequiredClientStatusAsync(
+            client,
+            cancellationToken);
+
+    public Task PublishParentStateAsync(SigstoreResource resource) =>
+        _notifications.PublishUpdateAsync(
+            resource,
+            snapshot => SigstoreParentHealthMonitor.CreateParentSnapshot(
+                resource,
+                snapshot));
+
+    private static SigstoreResourceInstanceSnapshot Convert(
+        ResourceEvent resourceEvent)
+    {
+        var snapshot = resourceEvent.Snapshot;
+        var containerId = snapshot.Properties
+            .FirstOrDefault(
+                property => string.Equals(
+                    property.Name,
+                    ContainerIdProperty,
+                    StringComparison.Ordinal))
+            ?.Value?
+            .ToString();
+        return new SigstoreResourceInstanceSnapshot(
+            resourceEvent.Resource.Name,
+            resourceEvent.ResourceId,
+            snapshot.State?.Text ?? "Unavailable",
+            snapshot.HealthStatus?.ToString() ?? "Unknown",
+            snapshot.ExitCode,
+            snapshot.CreationTimeStamp,
+            snapshot.StartTimeStamp,
+            snapshot.StopTimeStamp,
+            containerId);
+    }
+}
+
+internal interface ISigstoreStateInspector
+{
+    IDisposable AcquireLock(string statePath, string operation);
+
+    SigstoreTufStateSnapshot ReadTufState(string statePath);
+
+    string ReadTrustStateFingerprint(string statePath);
+
+    string ReadTrustMaterialFingerprint(string statePath);
+}
+
+internal sealed class SigstoreFileStateInspector : ISigstoreStateInspector
+{
+    public IDisposable AcquireLock(
+        string statePath,
+        string operation) =>
+        StateFileLock.Acquire(
+            statePath,
+            TimeSpan.Zero,
+            operation);
+
+    public SigstoreTufStateSnapshot ReadTufState(string statePath) =>
+        SigstoreStatusCommand.ReadTufStateSnapshot(statePath);
+
+    public string ReadTrustStateFingerprint(string statePath) =>
+        SigstoreStatusCommand.ReadTrustStateFingerprint(statePath);
+
+    public string ReadTrustMaterialFingerprint(string statePath) =>
+        SigstoreStatusCommand.ReadTrustMaterialFingerprint(statePath);
+}
+
+internal sealed record SigstoreResourceInstanceSnapshot(
+    string Resource,
+    string ResourceId,
+    string State,
+    string Health,
+    int? ExitCode,
+    DateTime? CreationTimeUtc,
+    DateTime? StartTimeUtc,
+    DateTime? StopTimeUtc,
+    string? ContainerId);
+
+internal sealed record SigstoreOperationSnapshot(
+    SigstoreTufStateSnapshot Tuf,
+    SigstoreServedTufSnapshot Served,
+    string TrustStateSha256,
+    string TrustMaterialSha256,
+    SigstoreResourceInstanceSnapshot TufServer);
+
+internal sealed record SigstoreOperationProgress(
+    string Phase,
+    int Completed,
+    int Total,
+    string Message,
+    DateTimeOffset ObservedAtUtc);
+
+internal sealed record SigstoreResourceLifecycleResult(
+    string Resource,
+    string Command,
+    string BeforeContainerId,
+    string AfterContainerId,
+    DateTime? BeforeStartTimeUtc,
+    DateTime? AfterStartTimeUtc,
+    string State,
+    string Health,
+    int? ExitCode,
+    SigstoreClientTrustStatus? TrustStatus);
+
+internal sealed record SigstoreOperationCheck(
+    string Name,
+    bool Passed,
+    string Expected,
+    string Actual);
+
+internal sealed record SigstoreOperationError(
+    string Phase,
+    string Resource,
+    string? Postcondition,
+    string Message);
+
+internal sealed record SigstoreOperationResult(
+    int SchemaVersion,
+    string Command,
+    bool Success,
+    string Phase,
+    string Message,
+    DateTimeOffset StartedAtUtc,
+    DateTimeOffset CompletedAtUtc,
+    IReadOnlyList<SigstoreOperationProgress> Progress,
+    SigstoreOperationSnapshot? Before,
+    SigstoreOperationSnapshot? After,
+    IReadOnlyList<SigstoreResourceLifecycleResult> Resources,
+    IReadOnlyList<SigstoreOperationCheck> Postconditions,
+    bool? CommittedStatePreserved,
+    IReadOnlyList<SigstoreOperationError> Errors);

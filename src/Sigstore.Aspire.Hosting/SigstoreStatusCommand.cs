@@ -1,5 +1,6 @@
 using System.Net;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 
 namespace Aspire.Hosting.ApplicationModel;
@@ -41,6 +42,32 @@ public sealed record SigstoreServedTrustStatus(
     int TufTargetsVersion,
     string TrustedRootSha256,
     string SigningConfigSha256);
+
+public sealed record SigstoreTufMetadataRoleStatus(
+    int Version,
+    string Sha256,
+    DateTimeOffset ExpiresAtUtc);
+
+public sealed record SigstoreTufMetadataStatus(
+    SigstoreTufMetadataRoleStatus Root,
+    SigstoreTufMetadataRoleStatus Targets,
+    SigstoreTufMetadataRoleStatus Snapshot,
+    SigstoreTufMetadataRoleStatus Timestamp,
+    string TrustedRootSha256,
+    string SigningConfigSha256);
+
+public sealed record SigstoreTufStateSnapshot(
+    SigstoreDiskTrustStatus Trust,
+    SigstoreTufMetadataStatus Metadata,
+    string BootstrapRootSha256,
+    string SourceFingerprint,
+    string StableContentSha256,
+    string? PreviousPublicationId,
+    string? PreviousPublicationManifestSha256);
+
+public sealed record SigstoreServedTufSnapshot(
+    SigstoreServedTrustStatus Trust,
+    SigstoreTufMetadataStatus Metadata);
 
 public sealed record SigstoreStatusError(
     string Source,
@@ -572,6 +599,120 @@ internal static class SigstoreStatusCommand
             publication.Active.ManifestSha256);
     }
 
+    internal static SigstoreTufStateSnapshot ReadTufStateSnapshot(
+        string statePath)
+    {
+        var trust = ReadDiskStatus(statePath);
+        var tufPath = Path.Combine(statePath, "tuf");
+        var publication = DeserializeRequired<PublicationStateStatus>(
+            ReadRequiredBytes(
+                Path.Combine(
+                    tufPath,
+                    "publication",
+                    "state.json")),
+            "TUF publication state");
+        var activePath = Path.Combine(
+            tufPath,
+            "committed",
+            trust.PublicationId);
+        var manifest = DeserializeRequired<TufManifestStatus>(
+            ReadRequiredBytes(
+                Path.Combine(activePath, "manifest.json")),
+            "TUF manifest");
+
+        return new SigstoreTufStateSnapshot(
+            trust,
+            ReadTufMetadataStatus(
+                ReadRequiredBytes(
+                    Path.Combine(
+                        activePath,
+                        "repository",
+                        "root.json")),
+                ReadRequiredBytes(
+                    Path.Combine(
+                        activePath,
+                        "repository",
+                        "targets.json")),
+                ReadRequiredBytes(
+                    Path.Combine(
+                        activePath,
+                        "repository",
+                        "snapshot.json")),
+                ReadRequiredBytes(
+                    Path.Combine(
+                        activePath,
+                        "repository",
+                        "timestamp.json")),
+                ReadRequiredBytes(
+                    Path.Combine(
+                        activePath,
+                        "targets",
+                        "trusted_root.json")),
+                ReadRequiredBytes(
+                    Path.Combine(
+                        activePath,
+                        "targets",
+                        "signing_config.v0.2.json"))),
+            Hash(
+                ReadRequiredBytes(
+                    Path.Combine(
+                        tufPath,
+                        "bootstrap",
+                        "root.json"))),
+            manifest.SourceFingerprint,
+            HashNamedValues(
+                manifest.Files.Where(
+                    pair => !IsRefreshableMetadataPath(pair.Key))),
+            publication.Previous?.Id,
+            publication.Previous?.ManifestSha256);
+    }
+
+    internal static string ReadTrustStateFingerprint(string statePath)
+    {
+        var entries = ReadTrustStateEntries(
+            statePath,
+            includeTuf: true);
+        return HashNamedValues(entries);
+    }
+
+    internal static string ReadTrustMaterialFingerprint(string statePath)
+    {
+        var entries = ReadTrustStateEntries(
+            statePath,
+            includeTuf: false);
+        return HashNamedValues(entries);
+    }
+
+    private static SortedDictionary<string, string> ReadTrustStateEntries(
+        string statePath,
+        bool includeTuf)
+    {
+        _ = ReadDiskStatus(statePath);
+        var entries = new SortedDictionary<string, string>(
+            StringComparer.Ordinal);
+        var relativePaths = new List<string>
+        {
+            "trust-domain.json",
+            "active-generation",
+            "generations",
+            "transition",
+            "migration"
+        };
+        if (includeTuf)
+        {
+            relativePaths.Add("tuf");
+        }
+        foreach (var relativePath in relativePaths)
+        {
+            CollectFingerprintEntry(
+                statePath,
+                Path.Combine(statePath, relativePath),
+                entries);
+        }
+
+        return entries;
+    }
+
     internal static SigstoreClientTrustStatus ParseClientStatus(
         ReadOnlySpan<byte> payload,
         SigstoreClientRegistration registration)
@@ -626,7 +767,8 @@ internal static class SigstoreStatusCommand
         return status;
     }
 
-    private static async Task<SigstoreServedTrustStatus> ReadServedStatusAsync(
+    internal static async Task<SigstoreServedTufSnapshot>
+        ReadServedTufSnapshotAsync(
         Uri endpoint,
         CancellationToken cancellationToken)
     {
@@ -641,6 +783,14 @@ internal static class SigstoreStatusCommand
         var targets = await ReadHttpBytesAsync(
             client,
             new Uri(EnsureTrailingSlash(endpoint), "targets.json"),
+            cancellationToken);
+        var snapshot = await ReadHttpBytesAsync(
+            client,
+            new Uri(EnsureTrailingSlash(endpoint), "snapshot.json"),
+            cancellationToken);
+        var timestamp = await ReadHttpBytesAsync(
+            client,
+            new Uri(EnsureTrailingSlash(endpoint), "timestamp.json"),
             cancellationToken);
         var trustedRoot = await ReadHttpBytesAsync(
             client,
@@ -659,6 +809,68 @@ internal static class SigstoreStatusCommand
                 TrustStatusTargetName),
             cancellationToken);
 
+        return new SigstoreServedTufSnapshot(
+            CreateServedTrustStatus(
+                root,
+                targets,
+                trustedRoot,
+                signingConfig,
+                publishedBytes),
+            ReadTufMetadataStatus(
+                root,
+                targets,
+                snapshot,
+                timestamp,
+                trustedRoot,
+                signingConfig));
+    }
+
+    private static async Task<SigstoreServedTrustStatus>
+        ReadServedStatusAsync(
+        Uri endpoint,
+        CancellationToken cancellationToken)
+    {
+        using var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(10)
+        };
+        var baseUri = EnsureTrailingSlash(endpoint);
+        var root = await ReadHttpBytesAsync(
+            client,
+            new Uri(baseUri, "root.json"),
+            cancellationToken);
+        var targets = await ReadHttpBytesAsync(
+            client,
+            new Uri(baseUri, "targets.json"),
+            cancellationToken);
+        var trustedRoot = await ReadHttpBytesAsync(
+            client,
+            new Uri(baseUri, "trusted_root.json"),
+            cancellationToken);
+        var signingConfig = await ReadHttpBytesAsync(
+            client,
+            new Uri(baseUri, "signing_config.v0.2.json"),
+            cancellationToken);
+        var published = await ReadHttpBytesAsync(
+            client,
+            new Uri(baseUri, TrustStatusTargetName),
+            cancellationToken);
+
+        return CreateServedTrustStatus(
+            root,
+            targets,
+            trustedRoot,
+            signingConfig,
+            published);
+    }
+
+    private static SigstoreServedTrustStatus CreateServedTrustStatus(
+        byte[] root,
+        byte[] targets,
+        byte[] trustedRoot,
+        byte[] signingConfig,
+        byte[] publishedBytes)
+    {
         var rootVersion = ReadMetadataVersion(root, "served root");
         var targetsVersion = ReadMetadataVersion(
             targets,
@@ -696,24 +908,11 @@ internal static class SigstoreStatusCommand
     {
         try
         {
-            var endpoint = await registration.Endpoint.GetValueAsync(
-                cancellationToken)
-                ?? throw new SigstoreStatusException(
-                    $"{registration.Resource.Name} endpoint is not allocated.");
-            using var client = new HttpClient
-            {
-                Timeout = TimeSpan.FromSeconds(10)
-            };
-            var payload = await ReadHttpBytesAsync(
-                client,
-                new Uri(
-                    EnsureTrailingSlash(
-                        new Uri(endpoint, UriKind.Absolute)),
-                    "trust/status"),
-                cancellationToken);
             return new ClientStatusResult(
                 registration.Resource.Name,
-                ParseClientStatus(payload, registration),
+                await ReadRequiredClientStatusAsync(
+                    registration,
+                    cancellationToken),
                 null);
         }
         catch (Exception exception)
@@ -726,6 +925,29 @@ internal static class SigstoreStatusCommand
                     registration.Resource.Name,
                     exception.Message));
         }
+    }
+
+    internal static async Task<SigstoreClientTrustStatus>
+        ReadRequiredClientStatusAsync(
+            SigstoreClientRegistration registration,
+            CancellationToken cancellationToken)
+    {
+        var endpoint = await registration.Endpoint.GetValueAsync(
+            cancellationToken)
+            ?? throw new SigstoreStatusException(
+                $"{registration.Resource.Name} endpoint is not allocated.");
+        using var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(10)
+        };
+        var payload = await ReadHttpBytesAsync(
+            client,
+            new Uri(
+                EnsureTrailingSlash(
+                    new Uri(endpoint, UriKind.Absolute)),
+                "trust/status"),
+            cancellationToken);
+        return ParseClientStatus(payload, registration);
     }
 
     private static async Task<byte[]> ReadHttpBytesAsync(
@@ -1233,6 +1455,247 @@ internal static class SigstoreStatusCommand
         }
     }
 
+    private static SigstoreTufMetadataStatus ReadTufMetadataStatus(
+        byte[] root,
+        byte[] targets,
+        byte[] snapshot,
+        byte[] timestamp,
+        byte[] trustedRoot,
+        byte[] signingConfig)
+    {
+        var rootStatus = ReadMetadataRoleStatus(root, "root");
+        var targetsStatus = ReadMetadataRoleStatus(targets, "targets");
+        var snapshotStatus = ReadMetadataRoleStatus(snapshot, "snapshot");
+        var timestampStatus = ReadMetadataRoleStatus(timestamp, "timestamp");
+        ValidateMetadataReference(
+            timestamp,
+            "timestamp",
+            "snapshot.json",
+            snapshot,
+            snapshotStatus);
+        ValidateMetadataReference(
+            snapshot,
+            "snapshot",
+            "targets.json",
+            targets,
+            targetsStatus);
+
+        return new SigstoreTufMetadataStatus(
+            rootStatus,
+            targetsStatus,
+            snapshotStatus,
+            timestampStatus,
+            Hash(trustedRoot),
+            Hash(signingConfig));
+    }
+
+    private static SigstoreTufMetadataRoleStatus ReadMetadataRoleStatus(
+        ReadOnlySpan<byte> payload,
+        string role)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(payload.ToArray());
+            var signed = document.RootElement.GetProperty("signed");
+            var version = signed.GetProperty("version").GetInt32();
+            var expires = signed
+                .GetProperty("expires")
+                .GetDateTimeOffset();
+            if (version <= 0 || expires == default)
+            {
+                throw new SigstoreStatusException(
+                    $"{role} metadata has an invalid version or expiration.");
+            }
+
+            return new SigstoreTufMetadataRoleStatus(
+                version,
+                Hash(payload),
+                expires);
+        }
+        catch (Exception exception)
+            when (exception is JsonException
+                or InvalidOperationException
+                or KeyNotFoundException
+                or FormatException)
+        {
+            throw new SigstoreStatusException(
+                $"{role} metadata is malformed: {exception.Message}");
+        }
+    }
+
+    private static void ValidateMetadataReference(
+        ReadOnlySpan<byte> parentPayload,
+        string parentRole,
+        string childName,
+        ReadOnlySpan<byte> childPayload,
+        SigstoreTufMetadataRoleStatus child)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(
+                parentPayload.ToArray());
+            var reference = document.RootElement
+                .GetProperty("signed")
+                .GetProperty("meta")
+                .GetProperty(childName);
+            var expectedVersion = reference
+                .GetProperty("version")
+                .GetInt32();
+            var expectedLength = reference
+                .GetProperty("length")
+                .GetInt64();
+            if (expectedVersion != child.Version
+                || expectedLength != childPayload.Length)
+            {
+                throw new SigstoreStatusException(
+                    $"{parentRole} metadata does not bind the current " +
+                    $"{childName} bytes.");
+            }
+
+            var supportedHashCount = 0;
+            foreach (var hash in reference
+                .GetProperty("hashes")
+                .EnumerateObject())
+            {
+                var actual = hash.Name switch
+                {
+                    "sha256" => Hash(childPayload),
+                    "sha512" => HashSha512(childPayload),
+                    _ => null
+                };
+                if (actual is null)
+                {
+                    continue;
+                }
+
+                supportedHashCount++;
+                if (hash.Value.GetString() != actual)
+                {
+                    throw new SigstoreStatusException(
+                        $"{parentRole} metadata has an invalid {hash.Name} " +
+                        $"hash for {childName}.");
+                }
+            }
+            if (supportedHashCount == 0)
+            {
+                throw new SigstoreStatusException(
+                    $"{parentRole} metadata has no supported hash for " +
+                    $"{childName}.");
+            }
+        }
+        catch (Exception exception)
+            when (exception is JsonException
+                or InvalidOperationException
+                or KeyNotFoundException)
+        {
+            throw new SigstoreStatusException(
+                $"{parentRole} metadata reference for {childName} is " +
+                $"malformed: {exception.Message}");
+        }
+    }
+
+    private static void CollectFingerprintEntry(
+        string rootPath,
+        string path,
+        IDictionary<string, string> entries)
+    {
+        var directory = new DirectoryInfo(path);
+        if (directory.LinkTarget is not null)
+        {
+            entries.Add(
+                NormalizeRelativePath(rootPath, path),
+                $"link:{directory.LinkTarget}");
+            return;
+        }
+        if (directory.Exists)
+        {
+            entries.Add(
+                NormalizeRelativePath(rootPath, path) + "/",
+                "directory");
+            foreach (var child in Directory
+                .EnumerateFileSystemEntries(path)
+                .Order(StringComparer.Ordinal))
+            {
+                CollectFingerprintEntry(rootPath, child, entries);
+            }
+            return;
+        }
+
+        var file = new FileInfo(path);
+        if (file.LinkTarget is not null)
+        {
+            entries.Add(
+                NormalizeRelativePath(rootPath, path),
+                $"link:{file.LinkTarget}");
+            return;
+        }
+        if (!file.Exists)
+        {
+            throw new FileNotFoundException(
+                $"Required trust-state entry '{path}' does not exist.",
+                path);
+        }
+
+        entries.Add(
+            NormalizeRelativePath(rootPath, path),
+            $"file:{Hash(ReadRequiredBytes(path))}");
+    }
+
+    private static string NormalizeRelativePath(
+        string rootPath,
+        string path) =>
+        Path.GetRelativePath(rootPath, path)
+            .Replace(Path.DirectorySeparatorChar, '/');
+
+    private static string HashNamedValues(
+        IEnumerable<KeyValuePair<string, string>> values)
+    {
+        var contents = string.Concat(
+            values
+                .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                .Select(
+                    pair => $"{pair.Key}\t{pair.Value}\n"));
+        return Hash(Encoding.UTF8.GetBytes(contents));
+    }
+
+    internal static bool IsRefreshableMetadataPath(string path)
+    {
+        const string repositoryPrefix = "repository/";
+        if (!path.StartsWith(
+                repositoryPrefix,
+                StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var fileName = path[repositoryPrefix.Length..];
+        if (fileName.Contains('/', StringComparison.Ordinal))
+        {
+            return false;
+        }
+        return fileName.Equals(
+                "snapshot.json",
+                StringComparison.Ordinal)
+            || fileName.Equals(
+                "timestamp.json",
+                StringComparison.Ordinal)
+            || IsVersionedRole(fileName, ".snapshot.json")
+            || IsVersionedRole(fileName, ".timestamp.json");
+
+        static bool IsVersionedRole(
+            string fileName,
+            string suffix)
+        {
+            if (!fileName.EndsWith(suffix, StringComparison.Ordinal))
+            {
+                return false;
+            }
+            var version = fileName[..^suffix.Length];
+            return version.Length > 0
+                && version.All(char.IsAsciiDigit);
+        }
+    }
+
     private static string ReadRequiredLink(string path)
     {
         var directory = new DirectoryInfo(path);
@@ -1266,6 +1729,10 @@ internal static class SigstoreStatusCommand
 
     private static string Hash(ReadOnlySpan<byte> payload) =>
         Convert.ToHexString(SHA256.HashData(payload))
+            .ToLowerInvariant();
+
+    private static string HashSha512(ReadOnlySpan<byte> payload) =>
+        Convert.ToHexString(SHA512.HashData(payload))
             .ToLowerInvariant();
 
     private static Uri EnsureTrailingSlash(Uri uri) =>

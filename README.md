@@ -305,7 +305,7 @@ against the already verified targets metadata; the other clients retrieve the
 status target through their TUF updater. No client derives trust hashes from
 unverified host configuration.
 
-The typed `sigstore` parent has one read-only command:
+The typed `sigstore` parent retains a read-only status command:
 
 ```bash
 aspire resource sigstore status | jq
@@ -325,6 +325,39 @@ readiness is pending, and **Degraded** with the first definitive reason when a
 required resource stops or becomes unhealthy. Starting a stopped child restores
 the parent to **Healthy** without changing trust state.
 
+## Dashboard operations
+
+The parent also exposes two confirmed, progress-reporting operations in the
+dashboard and through the Aspire CLI:
+
+```bash
+aspire resource sigstore refresh-tuf | jq
+aspire resource sigstore restart-clients | jq
+```
+
+`refresh-tuf` starts a new instance of the existing `tuf-bootstrap` one-shot
+through Aspire's `ResourceCommandService`. It refreshes only signed snapshot and
+timestamp metadata, waits for the worker to exit successfully, and validates the
+publication journal, active manifest, one-entry history, served bytes, all client
+status contracts, and the unchanged TUF nginx container before succeeding. Its
+JSON result includes exact before/after versions and SHA-256 values for root,
+targets, snapshot, and timestamp metadata, plus publication and manifest IDs.
+Root, targets, TUF keys, public trust targets, the active trust generation, and
+the immutable bootstrap root must remain unchanged.
+
+`restart-clients` uses `ResourceCommandService` to restart the six client
+containers in deterministic resource-name order. It waits for every replacement
+container to become **Running** and **Healthy**, then requires a valid current
+`/trust/status` response that agrees with disk and served trust state. Sigstore
+services are not restarted, and the complete committed trust/TUF state must be
+byte-identical before and after.
+
+Only one parent operation can run at a time. A competing command fails
+immediately with the active command and phase. Both operations use the shared
+`state.lock`: client restart holds it throughout, while TUF refresh hands
+ownership from the parent preflight to the worker and back to the parent
+postcondition phase without nesting the lock.
+
 Every `sigstore.trust.initialize` span contains these attributes:
 
 | Attribute | Type |
@@ -341,8 +374,9 @@ Every `sigstore.trust.initialize` span contains these attributes:
 | `sigstore.trust.signing_config.sha256` | string |
 | `sigstore.trust.initialized_at` | RFC 3339 UTC string |
 
-The status routes and command are local and read-only. This step adds no refresh,
-restart, or rotation command.
+The status routes and `status` command remain local and read-only. These
+operations do not add root rotation, trusted-root rollout, OIDC rotation, or any
+later-step mutation.
 
 ## Stop
 

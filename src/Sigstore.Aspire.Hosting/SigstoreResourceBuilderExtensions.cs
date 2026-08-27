@@ -62,6 +62,26 @@ public static class SigstoreResourceBuilderExtensions
                    SigstoreStatusCommand.ExecuteAsync(
                        parent.Resource,
                        context))
+            .WithCommand(
+                name: SigstoreOperationCommand.RefreshTufCommand,
+                displayName: "Refresh TUF Metadata",
+                executeCommand: context =>
+                    SigstoreOperationCommand.ExecuteRefreshTufAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreOperationCommand.CreateRefreshTufOptions(
+                        parent.Resource))
+            .WithCommand(
+                name: SigstoreOperationCommand.RestartClientsCommand,
+                displayName: "Restart Clients",
+                executeCommand: context =>
+                    SigstoreOperationCommand.ExecuteRestartClientsAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreOperationCommand.CreateRestartClientsOptions(
+                        parent.Resource))
             .OnInitializeResource(
                (resource, context, cancellationToken) =>
                {

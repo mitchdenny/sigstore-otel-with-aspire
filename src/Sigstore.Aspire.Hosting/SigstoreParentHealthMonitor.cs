@@ -96,27 +96,53 @@ internal static class SigstoreParentHealthMonitor
             resource.SetRuntimeHealth(current);
             await notifications.PublishUpdateAsync(
                 resource,
-                snapshot => snapshot with
-                {
-                    State = new ResourceStateSnapshot(
-                        current.State,
-                        current.State switch
-                        {
-                            "Healthy" => KnownResourceStateStyles.Success,
-                            "Degraded" => KnownResourceStateStyles.Warn,
-                            _ => KnownResourceStateStyles.Info
-                        }),
-                    Properties =
-                    [
-                        new(
-                            "Health reason",
-                            current.Reason ?? "All required resources are healthy."),
-                        new(
-                            "Healthy resources",
-                            $"{current.HealthyCount}/{current.RequiredCount}")
-                    ]
-                });
+                snapshot => CreateParentSnapshot(resource, snapshot));
         }
+    }
+
+    internal static CustomResourceSnapshot CreateParentSnapshot(
+        SigstoreResource resource,
+        CustomResourceSnapshot snapshot)
+    {
+        var presentation = resource.GetPresentation();
+        var health = presentation.RuntimeHealth;
+        var operation = presentation.Operation;
+        var state = operation?.DisplayState ?? health.State;
+        var properties = new List<ResourcePropertySnapshot>
+        {
+            new(
+                "Health reason",
+                health.Reason ?? "All required resources are healthy."),
+            new(
+                "Healthy resources",
+                $"{health.HealthyCount}/{health.RequiredCount}")
+        };
+
+        if (operation is not null)
+        {
+            properties.Add(new("Operation", operation.Command));
+            properties.Add(new("Operation phase", operation.Phase));
+            properties.Add(
+                new(
+                    "Operation progress",
+                    $"{operation.Completed}/{operation.Total}: " +
+                    operation.Message));
+        }
+
+        return snapshot with
+        {
+            State = new ResourceStateSnapshot(
+                state,
+                operation is not null
+                    ? KnownResourceStateStyles.Info
+                    : health.State switch
+                    {
+                        "Healthy" => KnownResourceStateStyles.Success,
+                        "Degraded" => KnownResourceStateStyles.Warn,
+                        _ => KnownResourceStateStyles.Info
+                    }),
+            Properties = [.. properties]
+        };
     }
 
     internal static SigstoreRuntimeHealthSnapshot Evaluate(

@@ -13,6 +13,7 @@ public sealed class SigstoreResource(
     private EndpointReference? _tufEndpoint;
     private SigstoreRuntimeHealthSnapshot _runtimeHealth =
         SigstoreRuntimeHealthSnapshot.Starting([]);
+    private SigstoreOperationState? _operation;
 
     public string StatePath { get; } = statePath;
 
@@ -127,6 +128,132 @@ public sealed class SigstoreResource(
             return _runtimeHealth;
         }
     }
+
+    internal bool TryBeginOperation(
+        string command,
+        string displayState,
+        out SigstoreOperationLease? lease,
+        out SigstoreOperationState? activeOperation)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(command);
+        ArgumentException.ThrowIfNullOrWhiteSpace(displayState);
+
+        lock (_sync)
+        {
+            activeOperation = _operation;
+            if (activeOperation is not null)
+            {
+                lease = null;
+                return false;
+            }
+
+            var operation = new SigstoreOperationState(
+                Guid.NewGuid(),
+                command,
+                displayState,
+                "Starting",
+                0,
+                1,
+                "Preparing the operation.",
+                DateTimeOffset.UtcNow);
+            _operation = operation;
+            lease = new SigstoreOperationLease(this, operation);
+            return true;
+        }
+    }
+
+    internal void UpdateOperation(
+        Guid operationId,
+        string phase,
+        int completed,
+        int total,
+        string message)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(phase);
+        ArgumentException.ThrowIfNullOrWhiteSpace(message);
+        if (completed < 0 || total <= 0 || completed > total)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(completed),
+                "Operation progress must be within its declared total.");
+        }
+
+        lock (_sync)
+        {
+            if (_operation is null || _operation.Id != operationId)
+            {
+                throw new InvalidOperationException(
+                    "The Sigstore operation is no longer active.");
+            }
+
+            _operation = _operation with
+            {
+                Phase = phase,
+                Completed = completed,
+                Total = total,
+                Message = message
+            };
+        }
+    }
+
+    internal SigstoreParentPresentationSnapshot GetPresentation()
+    {
+        lock (_sync)
+        {
+            return new SigstoreParentPresentationSnapshot(
+                _runtimeHealth,
+                _operation);
+        }
+    }
+
+    private void EndOperation(Guid operationId)
+    {
+        lock (_sync)
+        {
+            if (_operation is not null && _operation.Id == operationId)
+            {
+                _operation = null;
+            }
+        }
+    }
+
+    internal sealed class SigstoreOperationLease : IDisposable
+    {
+        private SigstoreResource? _resource;
+
+        internal SigstoreOperationLease(
+            SigstoreResource resource,
+            SigstoreOperationState operation)
+        {
+            _resource = resource;
+            Operation = operation;
+        }
+
+        public SigstoreOperationState Operation { get; }
+
+        public void Report(
+            string phase,
+            int completed,
+            int total,
+            string message)
+        {
+            var resource = _resource
+                ?? throw new ObjectDisposedException(
+                    nameof(SigstoreOperationLease));
+            resource.UpdateOperation(
+                Operation.Id,
+                phase,
+                completed,
+                total,
+                message);
+        }
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _resource, null)
+                ?.EndOperation(Operation.Id);
+        }
+    }
 }
 
 internal sealed record SigstoreClientRegistration(
@@ -137,3 +264,17 @@ internal sealed record SigstoreClientRegistration(
 internal sealed record SigstoreResourceRegistrationSnapshot(
     IReadOnlyList<IResource> RequiredResources,
     IReadOnlyList<SigstoreClientRegistration> Clients);
+
+internal sealed record SigstoreOperationState(
+    Guid Id,
+    string Command,
+    string DisplayState,
+    string Phase,
+    int Completed,
+    int Total,
+    string Message,
+    DateTimeOffset StartedAtUtc);
+
+internal sealed record SigstoreParentPresentationSnapshot(
+    SigstoreRuntimeHealthSnapshot RuntimeHealth,
+    SigstoreOperationState? Operation);
