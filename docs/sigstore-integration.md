@@ -81,7 +81,7 @@ from masking regressions in an earlier step.
 `AddSigstore(...)` creates the parent, bootstrap resources, services, stable
 mounts, health checks, endpoint references, dependencies, and commands.
 
-`WithSigstoreReference(...)` configures a client with:
+The Sigstore-specific `WithReference(...)` overload configures a client with:
 
 - Endpoint references.
 - The immutable TUF bootstrap root.
@@ -349,7 +349,7 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 
 ### Scope
 
-- Add `WithSigstoreReference(...)`.
+- Add a Sigstore-specific `WithReference(...)` overload.
 - Centralize endpoint references, trust mounts, hostname mappings, waits, and
   common environment variables.
 - Preserve language-specific environment and telemetry configuration.
@@ -361,6 +361,37 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 - All clients initialize trust from local TUF.
 - Every language signs, seals, and validates artifacts from every producer.
 - No client falls back to public Sigstore infrastructure.
+
+### Implementation evidence
+
+Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
+
+- Added a container-only `WithReference(...)` overload for
+  `IResourceBuilder<SigstoreResource>` and typed `SigstoreClientOptions`.
+  `AddSigstore(...)` returns that typed parent builder and retains its component
+  aggregate on `SigstoreResource`. The default preserves the individual
+  bootstrap-root mount and canonical host mappings, Go explicitly retains its
+  TUF repository directory mount, and .NET explicitly retains its direct
+  Fulcio, Rekor, and timestamp endpoint variables without host mappings.
+- Normalized pre-change and post-change
+  `aspire describe --include-hidden --format Json` models were identical for
+  all 19 declared resources. Resolved environments, mounts, fixed endpoints,
+  references, and waits matched; runtime inspection also matched the five
+  canonical host mappings on each non-.NET client and none on .NET.
+- `aspire wait` confirmed all 14 long-running resources healthy and the four
+  bootstrap/readiness resources completed. Every client fetched TUF from
+  `tuf.dev.internal`, used the local OIDC, Fulcio, Rekor, and timestamp
+  endpoints, and emitted no public Sigstore endpoint references.
+- OpenTelemetry spans covered all 36 producer-to-validator language pairs with
+  no artifact error spans or structured error logs. The final artifact head
+  advanced from `31` to `42`; Python produced and validated artifact `1`, so
+  the known Go-index-zero parser edge did not occur.
+- Restarting only OIDC preserved the bootstrap manifest, TUF manifest, and
+  artifact `1` byte-for-byte while the head advanced from `135` to `145`.
+  Starting a new AppHost emptied the artifact store, changed all nine recorded
+  trust identifiers, and created a different artifact `1`.
+
+**Validation gate status: passed.**
 
 ## Step 3: Stabilize the TUF filesystem and bind mounts
 
