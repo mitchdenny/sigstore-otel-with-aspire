@@ -102,8 +102,22 @@ func main() {
 	if statePath == "" {
 		fatalf("SIGSTORE_STATE_PATH must identify the Sigstore state directory")
 	}
+	statePath = filepath.Clean(statePath)
 
-	action, err := ensureTUFRepository(filepath.Clean(statePath))
+	rotationRequest := filepath.Join(statePath, "rotate-root.request")
+	if pathExists(rotationRequest) {
+		action, err := rotateTUFRootKey(statePath)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		if err := os.Remove(rotationRequest); err != nil {
+			fatalf("remove rotation request: %v", err)
+		}
+		fmt.Printf("%s Sigstore TUF repository at %s.\n", action, filepath.Join(statePath, "tuf"))
+		return
+	}
+
+	action, err := ensureTUFRepository(statePath)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -424,6 +438,115 @@ func refreshTUFRepository(tufPath string) error {
 	}
 	if err := repository.Commit(); err != nil {
 		return fmt.Errorf("commit refreshed TUF metadata: %w", err)
+	}
+	return nil
+}
+
+// rotateTUFRoot generates a new root key, revokes old root keys, updates the
+// trust_status target with the new root version, and refreshes snapshot and
+// timestamp. go-tuf signs root N+1 with both old and new signing keys in the
+// local store, satisfying both old-root threshold (for clients at version N)
+// and new-root threshold (for the new version N+1). Old private root keys
+// remain in the store for the signing step but are removed from root metadata.
+func rotateTUFRoot(tufPath string, statePath string) error {
+	store := tuf.FileSystemStore(tufPath, nil)
+	repository, err := tuf.NewRepoIndent(store, "", "  ")
+	if err != nil {
+		return fmt.Errorf("open TUF repository for root rotation: %w", err)
+	}
+
+	oldVersion, err := repository.RootVersion()
+	if err != nil {
+		return fmt.Errorf("read current root version: %w", err)
+	}
+	oldKeys, err := repository.RootKeys()
+	if err != nil {
+		return fmt.Errorf("read current root keys: %w", err)
+	}
+	if len(oldKeys) == 0 {
+		return errors.New("TUF repository has no root keys")
+	}
+
+	rootExpires := time.Now().UTC().AddDate(1, 0, 0)
+	newKeyIDs, err := repository.GenKeyWithExpires("root", rootExpires)
+	if err != nil {
+		return fmt.Errorf("generate new root key: %w", err)
+	}
+	if len(newKeyIDs) == 0 {
+		return errors.New("no key IDs returned for new root key")
+	}
+
+	// Revoke old root keys from the root metadata. The signing keys remain in
+	// the local store so Commit() can produce signatures for both old and new
+	// thresholds — the TUF specification requires root N+1 to be signed by
+	// the old threshold (for clients at N) and the new threshold (for N+1).
+	newKeySet := map[string]bool{}
+	for _, id := range newKeyIDs {
+		newKeySet[id] = true
+	}
+	for _, oldKey := range oldKeys {
+		for _, id := range oldKey.IDs() {
+			if newKeySet[id] {
+				continue
+			}
+			if err := repository.RevokeKeyWithExpires("root", id, rootExpires); err != nil {
+				return fmt.Errorf("revoke old root key %s: %w", id, err)
+			}
+		}
+	}
+
+	newVersion := oldVersion + 1
+
+	// Update trust_status target with the new root version. Reading the
+	// existing target preserves trust-generation identity fields.
+	statusPath := filepath.Join(tufPath, "targets", trustStatusTargetName)
+	statusData, err := os.ReadFile(statusPath)
+	if err != nil {
+		return fmt.Errorf("read existing trust status target: %w", err)
+	}
+	var status trustStatusTarget
+	if err := json.Unmarshal(statusData, &status); err != nil {
+		return fmt.Errorf("parse existing trust status target: %w", err)
+	}
+	targetsVersion, err := repository.TargetsVersion()
+	if err != nil {
+		return fmt.Errorf("read current targets version: %w", err)
+	}
+	status.TUFRootVersion = int(newVersion)
+	status.TUFTargetsVersion = int(targetsVersion) + 1
+	updatedStatus, err := json.MarshalIndent(status, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal updated trust status: %w", err)
+	}
+	updatedStatusBytes := append(updatedStatus, '\n')
+
+	// Write to both staged (for go-tuf hashing) and public targets (for serving).
+	stagedStatusPath := filepath.Join(tufPath, "staged", "targets", trustStatusTargetName)
+	if err := os.MkdirAll(filepath.Dir(stagedStatusPath), 0o755); err != nil {
+		return fmt.Errorf("create staged targets directory: %w", err)
+	}
+	if err := os.WriteFile(stagedStatusPath, updatedStatusBytes, 0o644); err != nil {
+		return fmt.Errorf("write staged trust status: %w", err)
+	}
+	if err := os.WriteFile(statusPath, updatedStatusBytes, 0o644); err != nil {
+		return fmt.Errorf("write public trust status: %w", err)
+	}
+	if err := repository.AddTargetWithExpires(
+		trustStatusTargetName,
+		nil,
+		rootExpires,
+	); err != nil {
+		return fmt.Errorf("re-add trust status target: %w", err)
+	}
+
+	if err := repository.SnapshotWithExpires(time.Now().UTC().Add(30 * 24 * time.Hour)); err != nil {
+		return fmt.Errorf("create rotated TUF snapshot: %w", err)
+	}
+	if err := repository.TimestampWithExpires(time.Now().UTC().Add(24 * time.Hour)); err != nil {
+		return fmt.Errorf("create rotated TUF timestamp: %w", err)
+	}
+	if err := repository.Commit(); err != nil {
+		return fmt.Errorf("commit rotated TUF root: %w", err)
 	}
 	return nil
 }

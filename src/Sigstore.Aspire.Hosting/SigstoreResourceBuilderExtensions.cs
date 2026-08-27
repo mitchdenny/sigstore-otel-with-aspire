@@ -73,6 +73,16 @@ public static class SigstoreResourceBuilderExtensions
                     SigstoreOperationCommand.CreateRefreshTufOptions(
                         parent.Resource))
             .WithCommand(
+                name: SigstoreOperationCommand.RotateTufRootCommand,
+                displayName: "Rotate TUF Root Key",
+                executeCommand: context =>
+                    SigstoreOperationCommand.ExecuteRotateTufRootAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreOperationCommand.CreateRotateTufRootOptions(
+                        parent.Resource))
+            .WithCommand(
                 name: SigstoreOperationCommand.RestartClientsCommand,
                 displayName: "Restart Clients",
                 executeCommand: context =>
