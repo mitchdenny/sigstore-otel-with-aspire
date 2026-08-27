@@ -6,21 +6,26 @@ using System.Diagnostics;
 
 var builder = DistributedApplication.CreateBuilder(args);
 
+var appHostDirectory = Path.GetFullPath(
+    builder.AppHostDirectory);
 var sigstoreStatePath =
     Environment.GetEnvironmentVariable("SIGSTORE_STATE_PATH")
-    ?? Path.Combine(builder.AppHostDirectory, ".sigstore");
+    ?? Path.Combine(appHostDirectory, ".sigstore");
 sigstoreStatePath = Path.GetFullPath(
     sigstoreStatePath,
-    builder.AppHostDirectory);
+    appHostDirectory);
 var shadyBlobStoreStatePath = Path.GetFullPath(
     Path.Combine(
-        builder.AppHostDirectory,
+        appHostDirectory,
         ".shady-blob-store"));
-Directory.CreateDirectory(shadyBlobStoreStatePath);
+ResetRunScopedState(
+    appHostDirectory,
+    sigstoreStatePath,
+    shadyBlobStoreStatePath);
 // Materialize bind-mount sources before Docker Desktop resolves the model.
 // The tracked resource below repeats validation so failures remain visible.
 EnsureSigstoreState(
-    builder.AppHostDirectory,
+    appHostDirectory,
     sigstoreStatePath);
 
 var sigstoreBootstrap = builder
@@ -813,6 +818,297 @@ rustClient.WithUrlForEndpoint(
     url => url.DisplayText = "Rust producer and validator");
 
 builder.Build().Run();
+
+static void ResetRunScopedState(
+    string appHostDirectory,
+    string sigstoreStatePath,
+    string shadyBlobStoreStatePath)
+{
+    var stateDirectories = new[]
+    {
+        (Description: "Sigstore", Path: sigstoreStatePath),
+        (Description: "shady blob store", Path: shadyBlobStoreStatePath)
+    };
+
+    foreach (var stateDirectory in stateDirectories)
+    {
+        ValidateStateDirectory(
+            appHostDirectory,
+            stateDirectory.Path,
+            stateDirectory.Description);
+    }
+
+    if (PathsOverlap(
+            sigstoreStatePath,
+            shadyBlobStoreStatePath))
+    {
+        throw new InvalidOperationException(
+            "The Sigstore and shady blob store state directories must not " +
+            "overlap.");
+    }
+
+    foreach (var stateDirectory in stateDirectories)
+    {
+        DeleteDirectoryTree(
+            stateDirectory.Path,
+            stateDirectory.Description);
+        Directory.CreateDirectory(stateDirectory.Path);
+    }
+
+    Console.WriteLine(
+        "Reset run-scoped Sigstore trust and artifact state.");
+}
+
+static void ValidateStateDirectory(
+    string appHostDirectory,
+    string statePath,
+    string description)
+{
+    var normalizedAppHostDirectory =
+        Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(appHostDirectory));
+    var normalizedStatePath =
+        Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(
+                statePath,
+                normalizedAppHostDirectory));
+    var fileSystemRoot = Path.GetPathRoot(normalizedStatePath);
+
+    if (string.IsNullOrWhiteSpace(fileSystemRoot)
+        || PathsEqual(
+            normalizedStatePath,
+            Path.TrimEndingDirectorySeparator(fileSystemRoot)))
+    {
+        throw new InvalidOperationException(
+            $"Refusing to reset the {description} state at filesystem root " +
+            $"'{normalizedStatePath}'.");
+    }
+
+    var relativePath = Path.GetRelativePath(
+        normalizedAppHostDirectory,
+        normalizedStatePath);
+    if (relativePath == "."
+        || Path.IsPathFullyQualified(relativePath)
+        || relativePath == ".."
+        || relativePath.StartsWith(
+            $"..{Path.DirectorySeparatorChar}",
+            GetPathComparison())
+        || relativePath.StartsWith(
+            $"..{Path.AltDirectorySeparatorChar}",
+            GetPathComparison()))
+    {
+        throw new InvalidOperationException(
+            $"The {description} state directory '{normalizedStatePath}' " +
+            $"must be a descendant of the AppHost directory " +
+            $"'{normalizedAppHostDirectory}'.");
+    }
+
+    EnsurePathSegmentsAreDirectories(
+        normalizedAppHostDirectory,
+        relativePath,
+        description);
+    ValidateDirectoryTree(
+        normalizedStatePath,
+        description);
+}
+
+static void EnsurePathSegmentsAreDirectories(
+    string appHostDirectory,
+    string relativePath,
+    string description)
+{
+    ValidateExistingDirectory(
+        appHostDirectory,
+        "AppHost");
+
+    var currentPath = appHostDirectory;
+    foreach (var segment in relativePath.Split(
+        [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+        StringSplitOptions.RemoveEmptyEntries))
+    {
+        currentPath = Path.Combine(
+            currentPath,
+            segment);
+        var attributes = GetExistingAttributes(currentPath);
+        if (attributes is null)
+        {
+            break;
+        }
+        if (attributes.Value.HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new InvalidOperationException(
+                $"Refusing to reset the {description} state because " +
+                $"'{currentPath}' is a symbolic link or reparse point.");
+        }
+        if (!attributes.Value.HasFlag(FileAttributes.Directory))
+        {
+            throw new InvalidOperationException(
+                $"Refusing to reset the {description} state because " +
+                $"'{currentPath}' is not a directory.");
+        }
+    }
+}
+
+static void ValidateExistingDirectory(
+    string path,
+    string description)
+{
+    var attributes = GetExistingAttributes(path)
+        ?? throw new DirectoryNotFoundException(
+            $"{description} directory '{path}' does not exist.");
+    if (attributes.HasFlag(FileAttributes.ReparsePoint))
+    {
+        throw new InvalidOperationException(
+            $"{description} directory '{path}' must not be a symbolic link " +
+            "or reparse point.");
+    }
+    if (!attributes.HasFlag(FileAttributes.Directory))
+    {
+        throw new InvalidOperationException(
+            $"{description} path '{path}' is not a directory.");
+    }
+}
+
+static void ValidateDirectoryTree(
+    string path,
+    string description)
+{
+    var attributes = GetExistingAttributes(path);
+    if (attributes is null)
+    {
+        return;
+    }
+    if (attributes.Value.HasFlag(FileAttributes.ReparsePoint))
+    {
+        throw new InvalidOperationException(
+            $"Refusing to reset the {description} state because '{path}' " +
+            "is a symbolic link or reparse point.");
+    }
+    if (!attributes.Value.HasFlag(FileAttributes.Directory))
+    {
+        throw new InvalidOperationException(
+            $"Refusing to reset the {description} state because '{path}' " +
+            "is not a directory.");
+    }
+
+    foreach (var entry in Directory.EnumerateFileSystemEntries(path))
+    {
+        var entryAttributes = GetExistingAttributes(entry)
+            ?? throw new IOException(
+                $"State entry '{entry}' disappeared during validation.");
+        if (entryAttributes.HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new InvalidOperationException(
+                $"Refusing to reset the {description} state because " +
+                $"'{entry}' is a symbolic link or reparse point.");
+        }
+        if (entryAttributes.HasFlag(FileAttributes.Directory))
+        {
+            ValidateDirectoryTree(
+                entry,
+                description);
+        }
+    }
+}
+
+static void DeleteDirectoryTree(
+    string path,
+    string description)
+{
+    var attributes = GetExistingAttributes(path);
+    if (attributes is null)
+    {
+        return;
+    }
+    if (attributes.Value.HasFlag(FileAttributes.ReparsePoint)
+        || !attributes.Value.HasFlag(FileAttributes.Directory))
+    {
+        throw new InvalidOperationException(
+            $"The validated {description} state path '{path}' changed before " +
+            "it could be reset.");
+    }
+
+    foreach (var entry in Directory.EnumerateFileSystemEntries(path))
+    {
+        var entryAttributes = GetExistingAttributes(entry)
+            ?? throw new IOException(
+                $"State entry '{entry}' disappeared during reset.");
+        if (entryAttributes.HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new InvalidOperationException(
+                $"State entry '{entry}' became a symbolic link or reparse " +
+                "point during reset.");
+        }
+        if (entryAttributes.HasFlag(FileAttributes.Directory))
+        {
+            DeleteDirectoryTree(
+                entry,
+                description);
+        }
+        else
+        {
+            File.Delete(entry);
+        }
+    }
+
+    Directory.Delete(path);
+}
+
+static FileAttributes? GetExistingAttributes(string path)
+{
+    var directory = new DirectoryInfo(path);
+    if (directory.Exists || directory.LinkTarget is not null)
+    {
+        return directory.Attributes;
+    }
+
+    var file = new FileInfo(path);
+    if (file.Exists || file.LinkTarget is not null)
+    {
+        return file.Attributes;
+    }
+
+    return null;
+}
+
+static bool PathsOverlap(
+    string firstPath,
+    string secondPath)
+{
+    var relativeFromFirst = Path.GetRelativePath(
+        firstPath,
+        secondPath);
+    var relativeFromSecond = Path.GetRelativePath(
+        secondPath,
+        firstPath);
+    return relativeFromFirst == "."
+        || IsDescendantRelativePath(relativeFromFirst)
+        || IsDescendantRelativePath(relativeFromSecond);
+}
+
+static bool IsDescendantRelativePath(string relativePath) =>
+    !Path.IsPathFullyQualified(relativePath)
+    && relativePath != ".."
+    && !relativePath.StartsWith(
+        $"..{Path.DirectorySeparatorChar}",
+        GetPathComparison())
+    && !relativePath.StartsWith(
+        $"..{Path.AltDirectorySeparatorChar}",
+        GetPathComparison());
+
+static bool PathsEqual(
+    string firstPath,
+    string secondPath) =>
+    string.Equals(
+        firstPath,
+        secondPath,
+        GetPathComparison());
+
+static StringComparison GetPathComparison() =>
+    OperatingSystem.IsWindows()
+        || OperatingSystem.IsMacOS()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
 
 static void EnsureSigstoreState(
     string appHostDirectory,

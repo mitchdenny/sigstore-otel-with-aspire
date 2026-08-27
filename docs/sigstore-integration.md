@@ -16,8 +16,9 @@ helper rather than duplicating endpoint, bind-mount, and dependency setup.
 
 The finished integration must:
 
-- Bootstrap itself from an empty state directory.
-- Preserve and validate an existing trust domain across restarts.
+- Reset and bootstrap a new trust domain at every AppHost process start.
+- Preserve and validate the active trust domain across child resource restarts
+  within one AppHost run.
 - Run Fulcio, Rekor v2, Tesseract, the timestamp authority, local OIDC, and TUF.
 - Expose the trust-domain services through typed endpoint references.
 - Support safe TUF metadata refresh and root rotation.
@@ -49,11 +50,16 @@ from masking regressions in an earlier step.
   must therefore be serialized; isolated Aspire ports do not represent the
   configured trust domain.
 - `.sigstore/` contains private keys, public trust, append-only log data, and
-  the TUF repository.
+  the TUF repository for the current AppHost run.
 - `.shady-blob-store/` contains artifacts signed under the trust domain.
-- Existing `.sigstore/` state must be migrated, not silently regenerated.
-- Existing artifact history requires historical verification keys to remain
-  trusted during normal additive rotations.
+- AppHost process startup is the intentional destructive reset boundary. It
+  recreates both state directories before bootstrap; child resource restarts
+  must not reset them.
+- A `SIGSTORE_STATE_PATH` override is valid only when it resolves to a safe
+  descendant of the AppHost directory.
+- Within one run, committed trust state must be validated rather than silently
+  regenerated, and artifact history requires historical verification keys to
+  remain trusted during normal additive rotations.
 - Dashboard command callbacks should orchestrate operations. Cryptographic and
   filesystem mutations belong in separately testable libraries or one-shot
   worker resources.
@@ -100,9 +106,11 @@ Every implementation step uses the same validation ladder:
    clients continue to produce and validate artifacts.
 6. **Telemetry validation** - inspect trust initialization, production,
    validation, skip, refresh, and rotation spans.
-7. **Persistence validation** - stop and restart the AppHost and confirm that
-   state versions and fingerprints are preserved.
-8. **Failure validation** - prove an interrupted operation either rolls back to
+7. **Run-boundary validation** - stop and restart the AppHost and confirm that
+   trust identifiers change and artifact numbering restarts at 1.
+8. **In-run durability validation** - restart affected child resources and
+   confirm that committed state and fingerprints are preserved.
+9. **Failure validation** - prove an interrupted operation either rolls back to
    the previous committed state or resumes deterministically.
 
 Live validation uses:
@@ -145,9 +153,13 @@ Resource readiness must use `aspire wait`; HTTP polling is not a substitute.
 - The artifact high watermark advances during the observation window.
 - Each language emits successful `artifact.produce` and `artifact.validate`
   spans.
-- Existing trust and artifact state survive an AppHost restart.
+- Existing trust and artifact state survive child resource restarts within the
+  active AppHost run.
 
 ### Baseline evidence
+
+This evidence predates Step 0a and records the former cross-AppHost persistence
+behavior. Step 0a intentionally supersedes that behavior.
 
 Captured at `2026-08-26T09:58:36Z` with the file-based AppHost pinned to
 Aspire `13.5.2`.
@@ -212,6 +224,77 @@ validator remains stuck retrying artifact `1`, emits error
 though its resource health check stays healthy. No workaround or application
 change was made in Step 0.
 
+## Step 0a: Make runtime state run-scoped
+
+### Run-scoped state invariant
+
+AppHost process startup is the only automatic reset boundary. Before adding any
+resources, it deletes and recreates the resolved Sigstore state directory and
+the root `.shady-blob-store` directory, then bootstraps a new trust domain.
+Restarting a child service, client, or one-shot worker within that AppHost
+process retains the run's state. Starting a new AppHost intentionally creates
+new trust/log identities and restarts artifact numbering at 1.
+
+### Scope
+
+- Reset both gitignored state directories once per AppHost process.
+- Require every reset path to be a non-root descendant of the AppHost
+  directory.
+- Reject unsafe `SIGSTORE_STATE_PATH` overrides, overlapping state roots,
+  non-directory entries, and symbolic links or reparse points.
+- Keep child resource restart behavior unchanged.
+- Replace cross-AppHost persistence expectations throughout this plan with
+  in-run child-restart durability.
+
+### Validation gate
+
+- Neither state directory contains tracked files and both remain ignored.
+- Each of two serialized canonical-port AppHost launches creates different
+  bootstrap, CT log, Rekor log, and public trust identities.
+- Each launch starts with an empty artifact store and creates artifact 1.
+- All one-shot resources complete successfully and long-running resources
+  become healthy.
+- The known sigstore-python 4.x rejection of a Go index-zero bundle may recur;
+  it is recorded but is not a failure of the reset boundary.
+
+### Validation evidence
+
+Captured on `2026-08-27` with two serialized, non-isolated AppHost launches.
+
+- Git tracked no files below either state root, and `.gitignore` matched both
+  anchored directories.
+- Before the first launch, the prior state had artifact head `5287`, CT state
+  `9258495e-a2bf-4c7a-8eea-fdf4f10418f9`, Rekor state
+  `9529346a-6f4f-4698-96cf-b421ebb7ea0f`, Rekor key fingerprint
+  `25b3bb4612b1b777eba57e05958e2a8392f9e6b9abe91958bcc8d947716b0c43`,
+  and TUF source fingerprint
+  `d2b1e54514653a308bfe1a237fa8dac13b8fd0e8032842db605e1c7b73cef867`.
+- The first launch recreated artifact `1` and changed those values to CT
+  `d546ebcf-dc5d-4a6e-96da-718709e1dbbd`, Rekor
+  `4e6f1449-285a-45f2-9b02-4bfa22af94fc`, Rekor key
+  `05ee3d9b0c491f11dd65a1018d602b814fc9330216750fc1a279ba28b4a44c7f`,
+  and TUF source
+  `179de21e1936db8a291fc22d1084af6ac8650587a63252a55a694639636a57e3`.
+  Its artifact head was `18` at capture and `30` at clean stop.
+- Restarting only the OIDC child preserved the bootstrap manifest and artifact
+  `1` byte-for-byte while the artifact count advanced from `24` to `27`.
+- The second AppHost launch again recreated artifact `1` and changed the
+  identities to CT `5366b254-aa63-41b6-9784-a9a8902e62ee`, Rekor
+  `705257e8-c8ca-4b7d-8ff4-9d1d0d120aa6`, Rekor key
+  `ee1e3ef1169f59d678a8b82b03fc85fd383b5d99d2b00bee88fdd89e1172efa4`,
+  and TUF source
+  `55c2a2919b196345bf4c546fff1787abf304cdca251868f5a8ee9287cf9e4d7a`.
+- All nine recorded bootstrap/TUF identity fields changed from the prior state
+  to the first run and again from the first run to the second. Both launches
+  reached 14 healthy long-running resources, and all four bootstrap/readiness
+  resources exited with code `0`.
+- An outside `SIGSTORE_STATE_PATH` override failed before deletion and left the
+  prior manifest and artifact `1` unchanged.
+- Python produced and validated artifact `1` on both launches. In the final
+  run, Rust produced Rekor index-zero artifact `2` with explicit zero fields,
+  and Python validated it. The known Go-index-zero/sigstore-python 4.x parser
+  failure therefore did not reproduce; no interoperability change was made.
+
 ## Step 1: Extract `AddSigstore`
 
 ### Scope
@@ -227,9 +310,10 @@ change was made in Step 0.
 ### Validation gate
 
 - The resource graph differs only by the new non-compute parent and grouping.
-- Existing resource names, endpoints, waits, health checks, and persistent
-  fingerprints are unchanged.
-- The complete Step 0 traffic and telemetry baseline still passes.
+- Existing resource names, endpoints, waits, health checks, and run-scoped
+  lifecycle behavior are unchanged.
+- The complete Step 0 traffic and telemetry baseline, plus the Step 0a reset
+  boundary, still passes.
 
 ## Step 2: Centralize client wiring
 
@@ -253,8 +337,8 @@ change was made in Step 0.
 ### Scope
 
 - Stop replacing the bind-mounted `.sigstore/tuf` directory itself.
-- Introduce a stable TUF parent containing committed, staged, historical, and
-  immutable bootstrap-root state.
+- Introduce a TUF parent that remains stable for the active AppHost run and
+  contains committed, staged, historical, and immutable bootstrap-root state.
 - Preserve the initial bootstrap root so existing clients must follow versioned
   root metadata during later rotations.
 - Mount the stable parent into nginx and clients instead of mounting replaceable
@@ -267,7 +351,8 @@ change was made in Step 0.
 - The served timestamp and snapshot versions change without recreating nginx.
 - The initial bootstrap root remains byte-for-byte unchanged.
 - Injected publication failure leaves the prior repository served.
-- Restarting the AppHost preserves the committed repository and history.
+- Restarting TUF and client child resources within the active AppHost run
+  preserves the committed repository and history.
 
 ## Step 4: Introduce generation-aware trust state
 
@@ -276,7 +361,8 @@ change was made in Step 0.
 - Separate immutable trust-domain identity from active key generations.
 - Add a rotation journal with staged, committed, failed, and recovered states.
 - Replace single-generation manifest assumptions.
-- Migrate existing schema 4 state without regenerating keys or log identities.
+- Migrate schema 4 state supplied to migration tests or present in the active
+  run without regenerating keys or log identities.
 - Use one shared state lock for bootstrap and rotation operations.
 
 ### Validation gate
@@ -450,10 +536,12 @@ change was made in Step 0.
 
 - Exercise concurrent command rejection and idempotency.
 - Add fault-injection coverage around stage, publish, restart, and verify.
-- Confirm recovery after AppHost termination during each operation phase.
+- Confirm recovery after operation-worker or affected-child termination during
+  each operation phase without ending the AppHost run.
 - Document reset, backup, recovery, and intentionally destructive trust-retirement
   scenarios.
-- Run the complete sequence against an existing populated artifact store.
+- Run the complete sequence against a populated artifact store within one
+  AppHost run.
 
 ### Validation gate
 
@@ -461,7 +549,10 @@ change was made in Step 0.
 - No successful command leaves clients or services on an unreported generation.
 - The artifact stream resumes after every supported rotation.
 - Historical artifacts remain verifiable under normal additive policy.
-- The complete AppHost survives stop/start with the final committed state.
+- Every supported child-resource restart preserves the final committed
+  run-scoped state.
+- A subsequent AppHost process starts a new trust domain and empty artifact
+  store as specified by Step 0a.
 
 ## Rotation safety rules
 
@@ -472,7 +563,8 @@ change was made in Step 0.
 - Do not replace a bind-mounted directory or individual mounted file.
 - Do not report success until served content and child health match committed
   state.
-- Do not silently regenerate missing or inconsistent state.
+- Do not silently regenerate missing or inconsistent state within an active
+  AppHost run.
 - Do not permit two bootstrap or rotation operations to mutate state
   concurrently.
 
@@ -482,9 +574,12 @@ The integration is complete when:
 
 - `apphost.cs` consumes a reusable `AddSigstore(...)` resource.
 - Client resources use shared Sigstore wiring.
+- Every AppHost process resets and bootstraps fresh run-scoped trust and
+  artifact state.
 - TUF metadata and root rotations work without recreating the TUF server.
 - Every client exposes the trust generation it is using.
 - Dashboard commands safely orchestrate refresh and rotation workflows.
 - OIDC, TSA, Fulcio, Rekor, and CT rotations preserve the expected history.
-- Failed and interrupted operations recover without ambiguous state.
+- Failed and interrupted operations recover without ambiguous state across
+  supported child-resource restarts within the run.
 - The continuous cross-language artifact stream validates the entire lifecycle.

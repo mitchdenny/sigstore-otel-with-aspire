@@ -25,9 +25,9 @@ do not need to be installed locally.
   certificate, submits the certificate to Tesseract, and embeds the returned
   SCT. Its HTTP API is available at
   `http://fulcio-sigstore.dev.localhost:5555`.
-- `timestamp` issues RFC 3161 signed timestamps using a persistent local file
+- `timestamp` issues RFC 3161 signed timestamps using a run-scoped local file
   signer at `http://timestamp-sigstore.dev.localhost:3004`.
-- `rekor-server` sequences artifact-signature entries into a persistent Rekor
+- `rekor-server` sequences artifact-signature entries into a run-scoped Rekor
   v2 tile log under `.sigstore/data/rekor`.
 - `rekor` is the single Rekor v2 gateway for entry uploads and static tile
   reads at `http://rekor-sigstore.dev.localhost:3000`.
@@ -36,8 +36,9 @@ do not need to be installed locally.
 - `tuf` serves the signed repository and public client configuration at
   `http://tuf-sigstore.dev.localhost:8080`.
 - `shady-blob-store` is a file-based ASP.NET Core application running directly
-  from source in a .NET 10 SDK container. It persists monotonically numbered
-  artifacts and Sigstore bundles under `.shady-blob-store`.
+  from source in a .NET 10 SDK container. It stores monotonically numbered
+  artifacts and Sigstore bundles for the current AppHost run under
+  `.shady-blob-store`.
 - `dotnet-client` runs a file-based .NET 10 producer and validator using
   `Sigstore` `1.1.0-alpha.131.1.fd8696f`. About every 10 seconds it creates
   random bytes, gets a local OIDC token, signs through local Fulcio, TSA, and
@@ -100,13 +101,16 @@ minutes.
 
 The one-shot `sigstore-bootstrap` resource creates the private keys and public
 trust material needed by the isolated Sigstore services. It writes them to the
-gitignored `.sigstore` directory in the repository root and validates the
-existing material on subsequent launches.
+gitignored `.sigstore` directory in the repository root. Every new AppHost
+process deletes and recreates both `.sigstore` and `.shady-blob-store` before
+bootstrap, so each `aspire run` or `aspire start` begins with a new trust domain,
+empty transparency logs, and artifact numbering starting at 1.
 
-Delete `.sigstore` before launching Aspire to intentionally create a new local
-trust domain. Also delete `.shady-blob-store` at the same time: artifacts signed
-by the previous trust domain cannot validate under the new root. The artifact
-store otherwise survives AppHost restarts and resumes with the next numeric ID.
+The AppHost process is the reset boundary. Restarting an individual service or
+client resource within the same run retains that run's trust and artifact
+state. Stopping the AppHost and starting it again intentionally discards that
+state. A `SIGSTORE_STATE_PATH` override is accepted only when its resolved path
+is a safe descendant of the AppHost directory.
 
 ## Artifact protocol
 
