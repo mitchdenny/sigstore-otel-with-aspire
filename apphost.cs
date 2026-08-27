@@ -123,12 +123,7 @@ var goClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithReference(
-        sigstore,
-        new SigstoreClientOptions
-        {
-            TufMount = SigstoreTufMountKind.RepositoryDirectory
-        });
+    .WithReference(sigstore);
 
 goClient.WithUrlForEndpoint(
     "http",
@@ -433,9 +428,8 @@ static void ValidateDirectoryTree(
                 $"State entry '{entry}' disappeared during validation.");
         if (entryAttributes.HasFlag(FileAttributes.ReparsePoint))
         {
-            throw new InvalidOperationException(
-                $"Refusing to reset the {description} state because " +
-                $"'{entry}' is a symbolic link or reparse point.");
+            // Child links are reset as leaf entries and are never traversed.
+            continue;
         }
         if (entryAttributes.HasFlag(FileAttributes.Directory))
         {
@@ -470,9 +464,8 @@ static void DeleteDirectoryTree(
                 $"State entry '{entry}' disappeared during reset.");
         if (entryAttributes.HasFlag(FileAttributes.ReparsePoint))
         {
-            throw new InvalidOperationException(
-                $"State entry '{entry}' became a symbolic link or reparse " +
-                "point during reset.");
+            DeleteReparsePoint(entry, entryAttributes);
+            continue;
         }
         if (entryAttributes.HasFlag(FileAttributes.Directory))
         {
@@ -487,6 +480,20 @@ static void DeleteDirectoryTree(
     }
 
     Directory.Delete(path);
+}
+
+static void DeleteReparsePoint(
+    string path,
+    FileAttributes attributes)
+{
+    if (attributes.HasFlag(FileAttributes.Directory))
+    {
+        Directory.Delete(path);
+    }
+    else
+    {
+        File.Delete(path);
+    }
 }
 
 static FileAttributes? GetExistingAttributes(string path)

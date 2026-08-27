@@ -4,10 +4,10 @@ namespace Aspire.Hosting;
 
 public static class SigstoreClientReferenceExtensions
 {
+    private const string TufTargetPath =
+        "/var/lib/sigstore/tuf";
     private const string BootstrapRootTargetPath =
-        "/var/lib/sigstore/tuf/root.json";
-    private const string RepositoryTargetPath =
-        "/var/lib/sigstore/tuf/repository";
+        "/var/lib/sigstore/tuf/bootstrap/root.json";
 
     public static IResourceBuilder<ContainerResource> WithReference(
         this IResourceBuilder<ContainerResource> client,
@@ -18,13 +18,6 @@ public static class SigstoreClientReferenceExtensions
         ArgumentNullException.ThrowIfNull(sigstore);
 
         options ??= new SigstoreClientOptions();
-        if (!Enum.IsDefined(options.TufMount))
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(options.TufMount),
-                options.TufMount,
-                "The TUF mount kind is not supported.");
-        }
 
         if (options.AddCanonicalHostMappings)
         {
@@ -42,35 +35,18 @@ public static class SigstoreClientReferenceExtensions
         }
 
         var components = sigstore.Resource.Components;
-        var tufRepositoryPath = Path.Combine(
+        var tufPath = Path.Combine(
             sigstore.Resource.StatePath,
-            "tuf",
-            "repository");
-        var (mountSource, mountTarget, bootstrapRootPath) =
-            options.TufMount switch
-            {
-                SigstoreTufMountKind.BootstrapRootFile => (
-                    Path.Combine(tufRepositoryPath, "root.json"),
-                    BootstrapRootTargetPath,
-                    BootstrapRootTargetPath),
-                SigstoreTufMountKind.RepositoryDirectory => (
-                    tufRepositoryPath,
-                    RepositoryTargetPath,
-                    Path.Combine(RepositoryTargetPath, "root.json")),
-                _ => throw new ArgumentOutOfRangeException(
-                    nameof(options.TufMount),
-                    options.TufMount,
-                    "The TUF mount kind is not supported.")
-            };
+            "tuf");
 
         client
             .WithBindMount(
-                mountSource,
-                mountTarget,
+                tufPath,
+                TufTargetPath,
                 isReadOnly: true)
             .WithEnvironment(
                 "SIGSTORE_TUF_ROOT_PATH",
-                bootstrapRootPath)
+                BootstrapRootTargetPath)
             .WithEnvironment(
                 "SIGSTORE_TUF_URL",
                 components.Tuf.GetEndpoint(
