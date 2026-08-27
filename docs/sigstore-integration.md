@@ -81,7 +81,7 @@ from masking regressions in an earlier step.
 `AddSigstore(...)` creates the parent, bootstrap resources, services, stable
 mounts, health checks, endpoint references, dependencies, and commands.
 
-`WithSigstoreReference(...)` configures a client with:
+The Sigstore-specific `WithReference(...)` overload configures a client with:
 
 - Endpoint references.
 - The immutable TUF bootstrap root.
@@ -349,7 +349,7 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 
 ### Scope
 
-- Add `WithSigstoreReference(...)`.
+- Add a Sigstore-specific `WithReference(...)` overload.
 - Centralize endpoint references, trust mounts, hostname mappings, waits, and
   common environment variables.
 - Preserve language-specific environment and telemetry configuration.
@@ -366,11 +366,13 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 
 Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 
-- Added a container-only `WithSigstoreReference(...)` extension and typed
-  `SigstoreClientOptions`. The default preserves the individual bootstrap-root
-  mount and canonical host mappings, Go explicitly retains its TUF repository
-  directory mount, and .NET explicitly retains its direct Fulcio, Rekor, and
-  timestamp endpoint variables without host mappings.
+- Added a container-only `WithReference(...)` overload for
+  `IResourceBuilder<SigstoreResource>` and typed `SigstoreClientOptions`.
+  `AddSigstore(...)` returns that typed parent builder and retains its component
+  aggregate on `SigstoreResource`. The default preserves the individual
+  bootstrap-root mount and canonical host mappings, Go explicitly retains its
+  TUF repository directory mount, and .NET explicitly retains its direct
+  Fulcio, Rekor, and timestamp endpoint variables without host mappings.
 - Normalized pre-change and post-change
   `aspire describe --include-hidden --format Json` models were identical for
   all 19 declared resources. Resolved environments, mounts, fixed endpoints,

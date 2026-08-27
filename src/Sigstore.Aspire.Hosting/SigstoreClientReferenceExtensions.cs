@@ -2,16 +2,16 @@ using Aspire.Hosting.ApplicationModel;
 
 namespace Aspire.Hosting;
 
-public static class SigstoreClientResourceBuilderExtensions
+public static class SigstoreClientReferenceExtensions
 {
     private const string BootstrapRootTargetPath =
         "/var/lib/sigstore/tuf/root.json";
     private const string RepositoryTargetPath =
         "/var/lib/sigstore/tuf/repository";
 
-    public static IResourceBuilder<ContainerResource> WithSigstoreReference(
+    public static IResourceBuilder<ContainerResource> WithReference(
         this IResourceBuilder<ContainerResource> client,
-        SigstoreComponents sigstore,
+        IResourceBuilder<SigstoreResource> sigstore,
         SigstoreClientOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(client);
@@ -41,8 +41,9 @@ public static class SigstoreClientResourceBuilderExtensions
                 "timestamp-sigstore.dev.localhost:host-gateway");
         }
 
+        var components = sigstore.Resource.Components;
         var tufRepositoryPath = Path.Combine(
-            sigstore.Parent.Resource.StatePath,
+            sigstore.Resource.StatePath,
             "tuf",
             "repository");
         var (mountSource, mountTarget, bootstrapRootPath) =
@@ -72,12 +73,12 @@ public static class SigstoreClientResourceBuilderExtensions
                 bootstrapRootPath)
             .WithEnvironment(
                 "SIGSTORE_TUF_URL",
-                sigstore.Tuf.GetEndpoint(
+                components.Tuf.GetEndpoint(
                     "http",
                     KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
             .WithEnvironment(
                 "SIGSTORE_OIDC_URL",
-                sigstore.Oidc.GetEndpoint(
+                components.Oidc.GetEndpoint(
                     "internal",
                     KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
             .WithEnvironment(
@@ -92,27 +93,27 @@ public static class SigstoreClientResourceBuilderExtensions
             client
                 .WithEnvironment(
                     "SIGSTORE_FULCIO_URL",
-                    sigstore.Fulcio.GetEndpoint(
+                    components.Fulcio.GetEndpoint(
                         "http",
                         KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
                 .WithEnvironment(
                     "SIGSTORE_REKOR_URL",
-                    sigstore.Rekor.GetEndpoint(
+                    components.Rekor.GetEndpoint(
                         "http",
                         KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
                 .WithEnvironment(
                     "SIGSTORE_TIMESTAMP_URL",
-                    sigstore.Timestamp.GetEndpoint(
+                    components.Timestamp.GetEndpoint(
                         "http",
                         KnownNetworkIdentifiers.DefaultAspireContainerNetwork));
         }
 
         return client
-            .WaitFor(sigstore.Tuf)
-            .WaitFor(sigstore.Oidc)
-            .WaitFor(sigstore.Fulcio)
-            .WaitFor(sigstore.Timestamp)
-            .WaitFor(sigstore.Rekor);
+            .WaitFor(components.Tuf)
+            .WaitFor(components.Oidc)
+            .WaitFor(components.Fulcio)
+            .WaitFor(components.Timestamp)
+            .WaitFor(components.Rekor);
     }
 }
 

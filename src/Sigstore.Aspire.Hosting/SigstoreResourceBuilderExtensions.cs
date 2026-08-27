@@ -4,7 +4,7 @@ namespace Aspire.Hosting;
 
 public static class SigstoreResourceBuilderExtensions
 {
-    public static SigstoreComponents AddSigstore(
+    public static IResourceBuilder<SigstoreResource> AddSigstore(
         this IDistributedApplicationBuilder builder,
         [ResourceName] string name,
         SigstoreOptions options)
@@ -400,7 +400,7 @@ public static class SigstoreResourceBuilderExtensions
             "http",
             url => url.DisplayText = "Sigstore TUF repository");
 
-        return new SigstoreComponents(
+        parent.Resource.SetComponents(new SigstoreComponents(
             parent,
             bootstrap,
             stateReady,
@@ -412,7 +412,9 @@ public static class SigstoreResourceBuilderExtensions
             rekor,
             tufBootstrap,
             tufStateReady,
-            tuf);
+            tuf));
+
+        return parent;
     }
 
     private static string ResolveDirectoryPath(

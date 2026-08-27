@@ -91,7 +91,7 @@ var dotnetClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithSigstoreReference(
+    .WithReference(
         sigstore,
         new SigstoreClientOptions
         {
@@ -123,7 +123,7 @@ var goClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithSigstoreReference(
+    .WithReference(
         sigstore,
         new SigstoreClientOptions
         {
@@ -157,7 +157,7 @@ var pythonClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithSigstoreReference(sigstore);
+    .WithReference(sigstore);
 
 pythonClient.WithUrlForEndpoint(
     "http",
@@ -189,7 +189,7 @@ var javascriptClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithSigstoreReference(sigstore);
+    .WithReference(sigstore);
 
 javascriptClient.WithUrlForEndpoint(
     "http",
@@ -218,7 +218,7 @@ var javaClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithSigstoreReference(sigstore);
+    .WithReference(sigstore);
 
 javaClient.WithUrlForEndpoint(
     "http",
@@ -246,7 +246,7 @@ var rustClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WithSigstoreReference(sigstore);
+    .WithReference(sigstore);
 
 rustClient.WithUrlForEndpoint(
     "http",
