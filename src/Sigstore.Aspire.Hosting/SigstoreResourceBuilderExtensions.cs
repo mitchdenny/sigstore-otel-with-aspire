@@ -359,9 +359,12 @@ public static class SigstoreResourceBuilderExtensions
             .WithEntrypoint("/bin/sh")
             .WithArgs(
                 "-c",
-                "test -f /var/lib/sigstore/tuf/repository/root.json && " +
-                "test -f /var/lib/sigstore/tuf/targets/trusted_root.json && " +
-                "test -f /var/lib/sigstore/tuf/targets/signing_config.v0.2.json")
+                "test -L /var/lib/sigstore/tuf/active && " +
+                "test -f /var/lib/sigstore/tuf/bootstrap/root.json && " +
+                "test -f /var/lib/sigstore/tuf/active/repository/root.json && " +
+                "test -f /var/lib/sigstore/tuf/active/targets/trusted_root.json && " +
+                "test -f /var/lib/sigstore/tuf/active/targets/signing_config.v0.2.json && " +
+                "test -f /var/lib/sigstore/tuf/publication/state.json")
             .WaitForCompletion(tufBootstrap)
             .WithParentRelationship(parent.Resource);
 
@@ -371,12 +374,8 @@ public static class SigstoreResourceBuilderExtensions
                 "nginx",
                 "1.31.1@sha256:5aca99593157f4ae539a5dec1092a0ad8762f8e2eb1789085a13a0f5622369f6")
             .WithBindMount(
-                Path.Combine(statePath, "tuf", "repository"),
-                "/usr/share/nginx/html",
-                isReadOnly: true)
-            .WithBindMount(
-                Path.Combine(statePath, "tuf", "targets"),
-                "/usr/share/nginx/bootstrap",
+                Path.Combine(statePath, "tuf"),
+                "/var/lib/sigstore/tuf",
                 isReadOnly: true)
             .WithBindMount(
                 Path.Combine(

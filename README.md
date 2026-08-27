@@ -112,6 +112,41 @@ state. Stopping the AppHost and starting it again intentionally discards that
 state. A `SIGSTORE_STATE_PATH` override is accepted only when its resolved path
 is a safe descendant of the AppHost directory.
 
+The TUF worker keeps `.sigstore/tuf` itself stable for the entire AppHost run.
+Nginx and all clients bind-mount that parent, whose layout is:
+
+```text
+.sigstore/tuf/
+|-- bootstrap/root.json
+|-- active -> committed/sha256-<manifest-hash>
+|-- committed/sha256-<manifest-hash>/
+|   |-- keys/
+|   |-- repository/
+|   |-- targets/
+|   `-- manifest.json
+|-- history/previous/
+|-- staging/
+`-- publication/state.json
+```
+
+`bootstrap/root.json` is a read-only, byte-for-byte copy of the initial
+version-1 root and is never replaced during refresh. `active` is switched
+atomically only after a complete candidate has passed source-fingerprint and
+file-hash validation. `history/previous` retains exactly the prior committed
+repository; older refresh history is retired so ordinary refreshes remain
+bounded. `staging` contains the candidate and, while publishing, the history
+entry being retired. `publication/state.json` records either `committed` or
+`preparing` plus the expected bootstrap and manifest hashes.
+
+Recovery uses that journal and the `active` link as the commit record. A
+`preparing` refresh with the old link still active rolls back and restores the
+parked history. If the link already selects the fully validated candidate,
+recovery completes the commit and archives the old active repository. Initial
+creation always completes forward once its journal exists. Missing,
+conflicting, or hash-mismatched state fails without discarding the ambiguous
+files; only an unjournaled staging candidate created before the journal write
+is known scratch and removed.
+
 ## Artifact protocol
 
 The initial protocol is deliberately small:

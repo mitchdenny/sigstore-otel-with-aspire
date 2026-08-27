@@ -415,6 +415,81 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 - Restarting TUF and client child resources within the active AppHost run
   preserves the committed repository and history.
 
+### Implementation evidence
+
+Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
+
+- `.sigstore/tuf` is now the stable bind-mount boundary. It contains the
+  read-only `bootstrap/root.json`, an `active` relative symlink, one
+  content-addressed active directory under `committed/`, an optional
+  `history/previous`, the bounded `staging/` workspace, and
+  `publication/state.json`. Nginx and every client mount only that parent.
+- Publication stages and validates a complete repository before atomically
+  replacing `active`. A `preparing` journal with the old link active rolls
+  back and restores parked history; the candidate link active completes
+  forward and archives the old repository. Missing, conflicting, or
+  hash-mismatched state fails instead of being discarded. Ordinary refresh
+  retains exactly one prior committed repository.
+- Focused Go tests use temporary trust state and cover initial creation,
+  metadata refresh, immutable bootstrap bytes and inode, successful
+  publication, exact file-hash validation, injected pre-commit rollback, and
+  recovery at every filesystem checkpoint before and after the atomic switch.
+- During the non-isolated live run, TUF nginx remained container
+  `51a2a0eebd726efb9f672d1b7921f8f37f94262eac7a7852c3828027919af058`.
+  Served root version `1` stayed at SHA-256
+  `31ba7d3cec36eb5ef6fcce8ea33a1f374b9a80937dc43bc2f0eebda30d7f0bd5`.
+  Snapshot version `1`
+  (`99a2333c73d0eb06cd060f3ae32cf8ca8faa147e952a13b590f1340ad65f0045`)
+  advanced to version `2`
+  (`0f113a723e49eaa0fce4042e2378645f3ed07ff8dedcbfb9f19911794ec1d8c1`);
+  timestamp version `1`
+  (`29f2d0a8732aeb0e60f7db1afd3f07ff7c328f809d8807d12c6669c28570ba9e`)
+  advanced to version `2`
+  (`8b224176ae9d97bd78db30194c207b862f10443c259148e8172915bbbef54094`).
+  The bootstrap root stayed byte-for-byte identical.
+- The active manifest changed from
+  `cc609b9909e06eb72f5175e88f6b8f428d22efc613c7f1a4825060e8fb9f0181`
+  to
+  `e292aa64c2f9e1a37e47e0fbbe706fdce284cac2cc6084726989d482eedb7063`;
+  both hashes matched their publication journal entries, and the first
+  manifest became `history/previous` unchanged.
+- Resolved Aspire models and Docker inspection showed nginx and all six
+  clients read-only mounting the same host `.sigstore/tuf` directory at
+  `/var/lib/sigstore/tuf`. Every client used
+  `/var/lib/sigstore/tuf/bootstrap/root.json` and the local
+  `http://tuf.dev.internal:8080` repository. No public Sigstore endpoint
+  appeared in client configuration or logs.
+- Restarting only TUF and the Go client changed their container identities to
+  `5c860500fc5f67e884a76841d793e994bdd5e3298509dc7a9774463dc9b97c3b`
+  and
+  `fe283783bb88a40fae9552c65d03206855bdf5f7950da1debbcc02e172f49315`
+  while every TUF state file, active link, served metadata byte, bootstrap
+  root, and history entry remained unchanged. The restarted Go client
+  initialized trust and resumed producing and validating.
+- A replacement AppHost removed sentinels from both run-scoped state trees,
+  removed the prior TUF history, reset snapshot and timestamp to version `1`,
+  and changed the bootstrap-manifest hash from
+  `941e5b2ec25e9ac9e6b0cfefa13ef81f4c4c6bfc1e8dcae98142a4219871040f`
+  to
+  `c20432fbf4969f352732127720f9c15f0716cd47dbe5f283154fb49a0b68f7e4`.
+  The bootstrap-root hash likewise changed from
+  `31ba7d3cec36eb5ef6fcce8ea33a1f374b9a80937dc43bc2f0eebda30d7f0bd5`
+  to
+  `87e630fc8cee0e6aec3b01040dd7046bde9267d23d8c83a5cc6c5ca7b51600f6`.
+  The reset walker treats child symlinks as non-traversed leaf entries while
+  continuing to reject a symlinked state root or ancestor.
+- All four one-shot resources completed and all 14 long-running resources
+  became healthy. The artifact head advanced from `19` before refresh to `31`
+  after refresh and `84` after child restarts. All six languages produced.
+  Five languages validated the shared stream; Python encountered the known
+  out-of-scope index-zero interoperability issue on artifact `1`
+  (`logIndex` and `inclusionProof.logIndex`). No Go or Python bundle
+  serialization was changed or masked in this step.
+
+**Validation gate status: passed for the Step 3 filesystem, publication,
+recovery, and bind-mount invariants; the full six-language validation sweep
+retains the documented index-zero Python interoperability exception.**
+
 ## Step 4: Introduce generation-aware trust state
 
 ### Scope
