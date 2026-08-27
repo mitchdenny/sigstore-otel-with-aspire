@@ -8,6 +8,8 @@ public static class SigstoreClientReferenceExtensions
         "/var/lib/sigstore/tuf";
     private const string BootstrapRootTargetPath =
         "/var/lib/sigstore/tuf/bootstrap/root.json";
+    private const string TrustStatusTargetPath =
+        "/var/lib/sigstore/tuf/active/targets/trust_status.v1.json";
 
     public static IResourceBuilder<ContainerResource> WithReference(
         this IResourceBuilder<ContainerResource> client,
@@ -18,6 +20,12 @@ public static class SigstoreClientReferenceExtensions
         ArgumentNullException.ThrowIfNull(sigstore);
 
         options ??= new SigstoreClientOptions();
+        if (options.TrustStatusEndpointName is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(
+                options.TrustStatusEndpointName);
+            ArgumentException.ThrowIfNullOrWhiteSpace(options.Language);
+        }
 
         if (options.AddCanonicalHostMappings)
         {
@@ -53,6 +61,9 @@ public static class SigstoreClientReferenceExtensions
                     "http",
                     KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
             .WithEnvironment(
+                "SIGSTORE_TUF_TRUST_STATUS_PATH",
+                TrustStatusTargetPath)
+            .WithEnvironment(
                 "SIGSTORE_OIDC_URL",
                 components.Oidc.GetEndpoint(
                     "internal",
@@ -84,12 +95,26 @@ public static class SigstoreClientReferenceExtensions
                         KnownNetworkIdentifiers.DefaultAspireContainerNetwork));
         }
 
-        return client
+        client
             .WaitFor(components.Tuf)
             .WaitFor(components.Oidc)
             .WaitFor(components.Fulcio)
             .WaitFor(components.Timestamp)
-            .WaitFor(components.Rekor);
+            .WaitFor(components.Rekor)
+            .WithParentRelationship(sigstore.Resource);
+
+        sigstore.Resource.RegisterRequiredResource(client.Resource);
+        if (options.TrustStatusEndpointName is not null)
+        {
+            sigstore.Resource.RegisterClient(
+                new SigstoreClientRegistration(
+                    options.Language!,
+                    client.Resource,
+                    client.GetEndpoint(
+                        options.TrustStatusEndpointName)));
+        }
+
+        return client;
     }
 }
 

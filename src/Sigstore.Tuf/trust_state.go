@@ -167,14 +167,18 @@ func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
 	}
 
 	return bootstrapManifest{
-		SchemaVersion:        4,
-		CreatedAtUTC:         generation.CreatedAtUTC,
-		FulcioRootSHA256:     generation.FulcioRootSHA256,
-		CtLogPublicKeySHA256: generation.CtLogPublicKeySHA256,
-		RekorPublicKeySHA256: generation.RekorPublicKeySHA256,
-		TsaRootSHA256:        generation.TsaRootSHA256,
-		TsaLeafSHA256:        generation.TsaLeafSHA256,
-		OIDCKeyID:            generation.OIDCKeyID,
+		SchemaVersion:            4,
+		CreatedAtUTC:             generation.CreatedAtUTC,
+		FulcioRootSHA256:         generation.FulcioRootSHA256,
+		CtLogPublicKeySHA256:     generation.CtLogPublicKeySHA256,
+		RekorPublicKeySHA256:     generation.RekorPublicKeySHA256,
+		TsaRootSHA256:            generation.TsaRootSHA256,
+		TsaLeafSHA256:            generation.TsaLeafSHA256,
+		OIDCKeyID:                generation.OIDCKeyID,
+		TrustDomainID:            domain.TrustDomainID,
+		Generation:               generation.Generation,
+		GenerationID:             generation.GenerationID,
+		GenerationManifestSHA256: journal.Candidate.ManifestSHA256,
 	}, nil
 }
 

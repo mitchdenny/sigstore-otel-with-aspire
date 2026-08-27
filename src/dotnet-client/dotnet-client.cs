@@ -62,15 +62,31 @@ builder.Services
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton(artifactStoreClient);
 builder.Services.AddSingleton(sigstoreRuntime);
+builder.Services.AddHostedService<TrustStatusInitializer>();
 builder.Services.AddHostedService<ArtifactProducer>();
 builder.Services.AddHostedService<ArtifactValidator>();
 
 var app = builder.Build();
 app.MapGet(
     "/healthz",
-    () => Results.Text(
-        """{"status":"SERVING"}""",
-        "application/json"));
+    (SigstoreRuntime runtime) => runtime.TrustStatus is not null
+        ? Results.Text(
+            """{"status":"SERVING"}""",
+            "application/json")
+        : Results.Text(
+            """{"status":"NOT_SERVING"}""",
+            "application/json",
+            statusCode: StatusCodes.Status503ServiceUnavailable));
+app.MapGet(
+    "/trust/status",
+    (SigstoreRuntime runtime) => runtime.TrustStatus is { } status
+        ? Results.Json(status)
+        : Results.Json(
+            new
+            {
+                error = "trust initialization has not completed"
+            },
+            statusCode: StatusCodes.Status503ServiceUnavailable));
 
 await app.RunAsync();
 
@@ -602,6 +618,9 @@ internal sealed class ArtifactMissingException(
 
 internal sealed class SigstoreRuntime : IDisposable
 {
+    private const int TrustStatusSchemaVersion = 1;
+    private const string TrustStatusTargetName = "trust_status.v1.json";
+    private readonly DemoOptions options;
     private readonly HttpClient fulcioHttpClient = CreateHttpClient();
     private readonly HttpClient rekorHttpClient = CreateHttpClient();
     private readonly HttpClient timestampHttpClient = CreateHttpClient();
@@ -613,6 +632,7 @@ internal sealed class SigstoreRuntime : IDisposable
 
     public SigstoreRuntime(DemoOptions options)
     {
+        this.options = options;
         var bootstrapRoot = File.ReadAllBytes(
             options.TufRootPath);
         trustRootProvider = new TufTrustRootProvider(
@@ -670,6 +690,86 @@ internal sealed class SigstoreRuntime : IDisposable
 
     public VerificationPolicy VerificationPolicy { get; }
 
+    public ClientTrustStatus? TrustStatus { get; private set; }
+
+    public async Task InitializeAsync(CancellationToken cancellationToken)
+    {
+        if (TrustStatus is not null)
+        {
+            throw new InvalidOperationException(
+                "Sigstore trust has already been initialized.");
+        }
+
+        using var activity = DemoTelemetry.Source.StartActivity(
+            "sigstore.trust.initialize",
+            ActivityKind.Internal);
+        activity?.SetTag("client.language", "dotnet");
+        activity?.SetTag("client.resource.name", "dotnet-client");
+
+        try
+        {
+            _ = await trustRootProvider.GetTrustRootAsync(
+                cancellationToken);
+            var bootstrapRoot = await File.ReadAllBytesAsync(
+                options.TufRootPath,
+                cancellationToken);
+            var statusCache = new FileSystemTufCache(
+                options.TufCachePath + "-status");
+            using var client = new TufClient(
+                new TufClientOptions
+                {
+                    MetadataBaseUrl = options.TufUrl,
+                    TargetsBaseUrl = new Uri(
+                        NormalizeBaseUrl(options.TufUrl),
+                        "targets/"),
+                    TrustedRoot = bootstrapRoot,
+                    Cache = statusCache
+                });
+            var trustedRoot = await client.GetTargetAsync(
+                "trusted_root.json",
+                cancellationToken);
+            var signingConfig = await client.GetTargetAsync(
+                "signing_config.v0.2.json",
+                cancellationToken);
+            var published = await client.GetTargetAsync(
+                TrustStatusTargetName,
+                cancellationToken);
+            _ = TrustedRoot.Deserialize(
+                Encoding.UTF8.GetString(trustedRoot.Content.Span));
+            ValidateSigningConfig(signingConfig.Content.Span);
+            var rootVersion = ReadMetadataVersion(
+                statusCache.LoadMetadata("root"),
+                "root");
+            var targetsVersion = ReadMetadataVersion(
+                statusCache.LoadMetadata("targets"),
+                "targets");
+            var initialized = CreateClientTrustStatus(
+                published.Content.Span,
+                trustedRoot.Content.Span,
+                signingConfig.Content.Span,
+                rootVersion,
+                targetsVersion,
+                DateTimeOffset.UtcNow);
+            TrustStatus = initialized;
+            SetTrustSpanAttributes(activity, initialized);
+            activity?.SetStatus(ActivityStatusCode.Ok);
+        }
+        catch (Exception exception)
+            when (exception is IOException
+                or JsonException
+                or TufException
+                or InvalidOperationException
+                or CryptographicException
+                or HttpRequestException)
+        {
+            activity?.AddException(exception);
+            activity?.SetStatus(
+                ActivityStatusCode.Error,
+                exception.Message);
+            throw;
+        }
+    }
+
     public void Dispose()
     {
         trustRootProvider.Dispose();
@@ -690,7 +790,176 @@ internal sealed class SigstoreRuntime : IDisposable
 
     private static Uri NormalizeBaseUrl(Uri uri) =>
         new(uri.AbsoluteUri.TrimEnd('/') + "/");
+
+    internal static ClientTrustStatus CreateClientTrustStatus(
+        ReadOnlySpan<byte> publishedStatusBytes,
+        ReadOnlySpan<byte> trustedRootBytes,
+        ReadOnlySpan<byte> signingConfigBytes,
+        int rootVersion,
+        int targetsVersion,
+        DateTimeOffset initializedAtUtc)
+    {
+        var published =
+            JsonSerializer.Deserialize<PublishedTrustStatus>(
+                publishedStatusBytes,
+                new JsonSerializerOptions(JsonSerializerDefaults.Web)
+                {
+                    PropertyNameCaseInsensitive = false
+                })
+            ?? throw new InvalidDataException(
+                "Published trust status is empty.");
+        var trustedRootHash = Hash(trustedRootBytes);
+        var signingConfigHash = Hash(signingConfigBytes);
+        if (published.SchemaVersion != TrustStatusSchemaVersion
+            || string.IsNullOrWhiteSpace(published.TrustDomainId)
+            || published.Generation <= 0
+            || string.IsNullOrWhiteSpace(published.GenerationId)
+            || !IsLowerHexSha256(
+                published.GenerationManifestSha256)
+            || published.TufRootVersion != rootVersion
+            || published.TufTargetsVersion != targetsVersion
+            || published.TrustedRootSha256 != trustedRootHash
+            || published.SigningConfigSha256 != signingConfigHash)
+        {
+            throw new InvalidDataException(
+                "Published trust status does not match verified TUF material.");
+        }
+
+        return new ClientTrustStatus(
+            TrustStatusSchemaVersion,
+            "dotnet-client",
+            "dotnet",
+            true,
+            null,
+            published.TrustDomainId,
+            published.Generation,
+            published.GenerationId,
+            published.GenerationManifestSha256,
+            rootVersion,
+            targetsVersion,
+            trustedRootHash,
+            signingConfigHash,
+            initializedAtUtc);
+    }
+
+    private static void ValidateSigningConfig(
+        ReadOnlySpan<byte> signingConfigBytes)
+    {
+        using var document = JsonDocument.Parse(
+            signingConfigBytes.ToArray());
+        var mediaType = document.RootElement
+            .GetProperty("mediaType")
+            .GetString();
+        if (mediaType
+            != "application/vnd.dev.sigstore.signingconfig.v0.2+json")
+        {
+            throw new InvalidDataException(
+                $"Unsupported signing configuration media type '{mediaType}'.");
+        }
+    }
+
+    private static int ReadMetadataVersion(
+        byte[]? metadata,
+        string role)
+    {
+        if (metadata is null)
+        {
+            throw new InvalidDataException(
+                $"Verified TUF {role} metadata is missing.");
+        }
+        using var document = JsonDocument.Parse(metadata);
+        var version = document.RootElement
+            .GetProperty("signed")
+            .GetProperty("version")
+            .GetInt32();
+        if (version <= 0)
+        {
+            throw new InvalidDataException(
+                $"Verified TUF {role} metadata has invalid version {version}.");
+        }
+        return version;
+    }
+
+    private static void SetTrustSpanAttributes(
+        Activity? activity,
+        ClientTrustStatus status)
+    {
+        activity?.SetTag(
+            "sigstore.trust.domain.id",
+            status.TrustDomainId);
+        activity?.SetTag(
+            "sigstore.trust.generation",
+            status.Generation);
+        activity?.SetTag(
+            "sigstore.trust.generation.id",
+            status.GenerationId);
+        activity?.SetTag(
+            "sigstore.trust.generation.manifest.sha256",
+            status.GenerationManifestSha256);
+        activity?.SetTag(
+            "sigstore.trust.tuf.root.version",
+            status.TufRootVersion);
+        activity?.SetTag(
+            "sigstore.trust.tuf.targets.version",
+            status.TufTargetsVersion);
+        activity?.SetTag(
+            "sigstore.trust.trusted_root.sha256",
+            status.TrustedRootSha256);
+        activity?.SetTag(
+            "sigstore.trust.signing_config.sha256",
+            status.SigningConfigSha256);
+        activity?.SetTag(
+            "sigstore.trust.initialized_at",
+            status.InitializedAtUtc.ToString("O"));
+    }
+
+    private static string Hash(ReadOnlySpan<byte> value) =>
+        Convert.ToHexString(SHA256.HashData(value))
+            .ToLowerInvariant();
+
+    private static bool IsLowerHexSha256(string value) =>
+        value is { Length: 64 }
+        && value.All(
+            character => character is >= '0' and <= '9'
+                or >= 'a' and <= 'f');
 }
+
+internal sealed class TrustStatusInitializer(
+    SigstoreRuntime runtime) : IHostedService
+{
+    public Task StartAsync(CancellationToken cancellationToken) =>
+        runtime.InitializeAsync(cancellationToken);
+
+    public Task StopAsync(CancellationToken cancellationToken) =>
+        Task.CompletedTask;
+}
+
+internal sealed record PublishedTrustStatus(
+    int SchemaVersion,
+    string TrustDomainId,
+    int Generation,
+    string GenerationId,
+    string GenerationManifestSha256,
+    int TufRootVersion,
+    int TufTargetsVersion,
+    string TrustedRootSha256,
+    string SigningConfigSha256);
+
+internal sealed record ClientTrustStatus(
+    int SchemaVersion,
+    string Resource,
+    string Language,
+    bool Ready,
+    string? LastError,
+    string TrustDomainId,
+    int Generation,
+    string GenerationId,
+    string GenerationManifestSha256,
+    int TufRootVersion,
+    int TufTargetsVersion,
+    string TrustedRootSha256,
+    string SigningConfigSha256,
+    DateTimeOffset InitializedAtUtc);
 
 internal sealed class HttpOidcTokenProvider(
     HttpClient httpClient,

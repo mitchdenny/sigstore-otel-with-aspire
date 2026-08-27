@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +48,9 @@ const (
 	pollInterval           = 2 * time.Second
 	produceInterval        = 10 * time.Second
 	requestTimeout         = 30 * time.Second
+	trustStatusSchema      = 1
+	trustStatusTargetName  = "trust_status.v1.json"
+	tufCachePath           = "/tmp/sigstore-go-tuf-cache"
 )
 
 var tracer = otel.Tracer("sigstore.demo.go-client")
@@ -73,6 +79,41 @@ type artifactReservation struct {
 
 type artifactHead struct {
 	ID uint64 `json:"id"`
+}
+
+type publishedTrustStatus struct {
+	SchemaVersion            int    `json:"schemaVersion"`
+	TrustDomainID            string `json:"trustDomainId"`
+	Generation               int    `json:"generation"`
+	GenerationID             string `json:"generationId"`
+	GenerationManifestSHA256 string `json:"generationManifestSha256"`
+	TUFRootVersion           int    `json:"tufRootVersion"`
+	TUFTargetsVersion        int    `json:"tufTargetsVersion"`
+	TrustedRootSHA256        string `json:"trustedRootSha256"`
+	SigningConfigSHA256      string `json:"signingConfigSha256"`
+}
+
+type clientTrustStatus struct {
+	SchemaVersion            int       `json:"schemaVersion"`
+	Resource                 string    `json:"resource"`
+	Language                 string    `json:"language"`
+	Ready                    bool      `json:"ready"`
+	LastError                *string   `json:"lastError"`
+	TrustDomainID            string    `json:"trustDomainId"`
+	Generation               int       `json:"generation"`
+	GenerationID             string    `json:"generationId"`
+	GenerationManifestSHA256 string    `json:"generationManifestSha256"`
+	TUFRootVersion           int       `json:"tufRootVersion"`
+	TUFTargetsVersion        int       `json:"tufTargetsVersion"`
+	TrustedRootSHA256        string    `json:"trustedRootSha256"`
+	SigningConfigSHA256      string    `json:"signingConfigSha256"`
+	InitializedAtUTC         time.Time `json:"initializedAtUtc"`
+}
+
+type tufMetadataEnvelope struct {
+	Signed struct {
+		Version int `json:"version"`
+	} `json:"signed"`
 }
 
 type fetchState int
@@ -149,7 +190,7 @@ func main() {
 		log.Fatal(err)
 	}
 	store := newArtifactStore(cfg.artifactStoreURL)
-	trustedRoot, signingConfig, err := initializeTrust(ctx, cfg)
+	trustedRoot, signingConfig, trustStatus, err := initializeTrust(ctx, cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -167,9 +208,12 @@ func main() {
 		log.Fatal(err)
 	}
 
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", healthHandler(ctx))
+	mux.Handle("/trust/status", trustStatusHandler(ctx, trustStatus))
 	server := &http.Server{
 		Addr:              ":" + cfg.port,
-		Handler:           otelhttp.NewHandler(healthHandler(ctx), "GET /healthz"),
+		Handler:           otelhttp.NewHandler(mux, "client.status"),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
@@ -251,37 +295,87 @@ func initTelemetry(ctx context.Context) (
 func initializeTrust(
 	ctx context.Context,
 	cfg config,
-) (*root.TrustedRoot, *root.SigningConfig, error) {
-	ctx, span := tracer.Start(ctx, "sigstore.trust.initialize")
+) (*root.TrustedRoot, *root.SigningConfig, clientTrustStatus, error) {
+	ctx, span := tracer.Start(
+		ctx,
+		"sigstore.trust.initialize",
+		trace.WithAttributes(
+			attribute.String("client.language", "go"),
+			attribute.String("client.resource.name", "go-client"),
+		),
+	)
 	defer span.End()
 
 	rootBytes, err := os.ReadFile(cfg.tufRootPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
 	}
 	httpTransport := otelhttp.NewTransport(http.DefaultTransport)
 	defaultFetcher := fetcher.NewDefaultFetcher()
 	defaultFetcher.SetHTTPUserAgent(util.ConstructUserAgent())
 	defaultFetcher.SetTransport(httpTransport)
 	client, err := tuf.New(&tuf.Options{
-		CachePath:         "/tmp/sigstore-go-tuf-cache",
+		CachePath:         tufCachePath,
 		Context:           ctx,
 		Fetcher:           defaultFetcher,
 		RepositoryBaseURL: cfg.tufURL,
 		Root:              rootBytes,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
 	}
 	trustedRoot, err := root.GetTrustedRoot(client)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
 	}
 	signingConfig, err := root.GetSigningConfig(client)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
 	}
-	return trustedRoot, signingConfig, nil
+	trustedRootBytes, err := client.GetTarget("trusted_root.json")
+	if err != nil {
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
+	}
+	signingConfigBytes, err := client.GetTarget("signing_config.v0.2.json")
+	if err != nil {
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
+	}
+	publishedBytes, err := client.GetTarget(trustStatusTargetName)
+	if err != nil {
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
+	}
+	metadataPath := filepath.Join(
+		tufCachePath,
+		tuf.URLToPath(cfg.tufURL),
+	)
+	rootVersion, err := readTUFMetadataVersion(
+		filepath.Join(metadataPath, "root.json"),
+	)
+	if err != nil {
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
+	}
+	targetsVersion, err := readTUFMetadataVersion(
+		filepath.Join(metadataPath, "targets.json"),
+	)
+	if err != nil {
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
+	}
+	status, err := newClientTrustStatus(
+		"go-client",
+		"go",
+		publishedBytes,
+		trustedRootBytes,
+		signingConfigBytes,
+		rootVersion,
+		targetsVersion,
+		time.Now().UTC(),
+	)
+	if err != nil {
+		return nil, nil, clientTrustStatus{}, recordError(span, err)
+	}
+	setTrustSpanAttributes(span, status)
+	span.SetStatus(codes.Ok, "")
+	return trustedRoot, signingConfig, status, nil
 }
 
 func createSignerOptions(
@@ -861,6 +955,138 @@ func healthHandler(ctx context.Context) http.Handler {
 		response.WriteHeader(http.StatusOK)
 		_, _ = response.Write([]byte(`{"status":"SERVING"}`))
 	})
+}
+
+func trustStatusHandler(
+	ctx context.Context,
+	status clientTrustStatus,
+) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		current := status
+		if ctx.Err() != nil {
+			message := "client is stopping"
+			current.Ready = false
+			current.LastError = &message
+		}
+		response.Header().Set("Content-Type", "application/json")
+		if !current.Ready {
+			response.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			response.WriteHeader(http.StatusOK)
+		}
+		if err := json.NewEncoder(response).Encode(current); err != nil {
+			log.Printf("write trust status: %v", err)
+		}
+	})
+}
+
+func newClientTrustStatus(
+	resourceName string,
+	language string,
+	publishedBytes []byte,
+	trustedRootBytes []byte,
+	signingConfigBytes []byte,
+	rootVersion int,
+	targetsVersion int,
+	initializedAt time.Time,
+) (clientTrustStatus, error) {
+	var published publishedTrustStatus
+	if err := json.Unmarshal(publishedBytes, &published); err != nil {
+		return clientTrustStatus{}, fmt.Errorf("parse published trust status: %w", err)
+	}
+	trustedRootHash := sha256Hex(trustedRootBytes)
+	signingConfigHash := sha256Hex(signingConfigBytes)
+	if published.SchemaVersion != trustStatusSchema ||
+		published.TrustDomainID == "" ||
+		published.Generation <= 0 ||
+		published.GenerationID == "" ||
+		published.TUFRootVersion != rootVersion ||
+		published.TUFTargetsVersion != targetsVersion ||
+		published.TrustedRootSHA256 != trustedRootHash ||
+		published.SigningConfigSHA256 != signingConfigHash ||
+		!isLowerHexSHA256(published.GenerationManifestSHA256) {
+		return clientTrustStatus{}, errors.New(
+			"published trust status does not match verified TUF material",
+		)
+	}
+	return clientTrustStatus{
+		SchemaVersion:            trustStatusSchema,
+		Resource:                 resourceName,
+		Language:                 language,
+		Ready:                    true,
+		TrustDomainID:            published.TrustDomainID,
+		Generation:               published.Generation,
+		GenerationID:             published.GenerationID,
+		GenerationManifestSHA256: published.GenerationManifestSHA256,
+		TUFRootVersion:           rootVersion,
+		TUFTargetsVersion:        targetsVersion,
+		TrustedRootSHA256:        trustedRootHash,
+		SigningConfigSHA256:      signingConfigHash,
+		InitializedAtUTC:         initializedAt,
+	}, nil
+}
+
+func readTUFMetadataVersion(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read TUF metadata %s: %w", filepath.Base(path), err)
+	}
+	var envelope tufMetadataEnvelope
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return 0, fmt.Errorf("parse TUF metadata %s: %w", filepath.Base(path), err)
+	}
+	if envelope.Signed.Version <= 0 {
+		return 0, fmt.Errorf(
+			"TUF metadata %s has invalid version %d",
+			filepath.Base(path),
+			envelope.Signed.Version,
+		)
+	}
+	return envelope.Signed.Version, nil
+}
+
+func setTrustSpanAttributes(span trace.Span, status clientTrustStatus) {
+	span.SetAttributes(
+		attribute.String("sigstore.trust.domain.id", status.TrustDomainID),
+		attribute.Int("sigstore.trust.generation", status.Generation),
+		attribute.String("sigstore.trust.generation.id", status.GenerationID),
+		attribute.String(
+			"sigstore.trust.generation.manifest.sha256",
+			status.GenerationManifestSHA256,
+		),
+		attribute.Int("sigstore.trust.tuf.root.version", status.TUFRootVersion),
+		attribute.Int("sigstore.trust.tuf.targets.version", status.TUFTargetsVersion),
+		attribute.String(
+			"sigstore.trust.trusted_root.sha256",
+			status.TrustedRootSHA256,
+		),
+		attribute.String(
+			"sigstore.trust.signing_config.sha256",
+			status.SigningConfigSHA256,
+		),
+		attribute.String(
+			"sigstore.trust.initialized_at",
+			status.InitializedAtUTC.Format(time.RFC3339Nano),
+		),
+	)
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func isLowerHexSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, character := range value {
+		if !((character >= '0' && character <= '9') ||
+			(character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func recordError(span trace.Span, err error) error {

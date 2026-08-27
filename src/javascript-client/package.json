@@ -6,6 +6,9 @@
   "engines": {
     "node": ">=24.15.0"
   },
+  "scripts": {
+    "test": "node --test trust-status.test.mjs"
+  },
   "dependencies": {
     "@opentelemetry/api": "1.9.1",
     "@opentelemetry/exporter-trace-otlp-grpc": "0.221.0",

@@ -10,7 +10,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY client.mjs ./
+COPY client.mjs trust-status.mjs ./
 
 USER node
 

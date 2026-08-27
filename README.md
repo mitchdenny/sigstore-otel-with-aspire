@@ -266,6 +266,84 @@ request for the next root version can return `404`, so an initialization trace
 may appear as an error even though trust loading succeeds. Clients then reuse
 their trusted configuration until refresh is required.
 
+## Trust status and parent health
+
+Every client serves a read-only `GET /trust/status` route on its existing local
+HTTP endpoint. The response uses the same schema in all six languages:
+
+```json
+{
+  "schemaVersion": 1,
+  "resource": "go-client",
+  "language": "go",
+  "ready": true,
+  "lastError": null,
+  "trustDomainId": "sha256-...",
+  "generation": 1,
+  "generationId": "generation-00000001",
+  "generationManifestSha256": "...",
+  "tufRootVersion": 1,
+  "tufTargetsVersion": 1,
+  "trustedRootSha256": "...",
+  "signingConfigSha256": "...",
+  "initializedAtUtc": "2026-08-27T00:00:00Z"
+}
+```
+
+`schemaVersion`, `generation`, `tufRootVersion`, and `tufTargetsVersion` are
+JSON integers; `ready` is a boolean; `lastError` is either `null` or a string;
+and all other fields are strings. Timestamps use RFC 3339 UTC. SHA-256 values
+are 64 lowercase hexadecimal characters without a `sha256:` prefix, except the
+trust-domain identifier, whose schema already includes `sha256-`.
+
+The TUF repository includes `trust_status.v1.json` as a signed target. It binds
+the active trust-domain and generation identity to the root and targets metadata
+versions and the expected trust-target hashes. Each client hashes the exact
+verified `trusted_root.json` and `signing_config.v0.2.json` bytes it initialized,
+then rejects a mismatch. The Java client validates its mounted status target
+against the already verified targets metadata; the other clients retrieve the
+status target through their TUF updater. No client derives trust hashes from
+unverified host configuration.
+
+The typed `sigstore` parent has one read-only command:
+
+```bash
+aspire resource sigstore status | jq
+```
+
+The command writes its structured JSON payload to stdout and its status message
+to stderr. It validates the complete schema-5 generation/journal state, the
+committed TUF publication layout and manifests, the bytes served by TUF, and all
+six client payloads. Missing, malformed, stale, unreachable, or inconsistent
+data produces a nonzero command result with explicit entries in `errors`; it
+does not return fallback values.
+
+The parent state is event-driven and aggregates all 14 long-running resources:
+the seven Sigstore services, `shady-blob-store`, and six clients. It shows
+**Healthy** only when all 14 are running and healthy, **Starting** while initial
+readiness is pending, and **Degraded** with the first definitive reason when a
+required resource stops or becomes unhealthy. Starting a stopped child restores
+the parent to **Healthy** without changing trust state.
+
+Every `sigstore.trust.initialize` span contains these attributes:
+
+| Attribute | Type |
+| --- | --- |
+| `client.language` | string |
+| `client.resource.name` | string |
+| `sigstore.trust.domain.id` | string |
+| `sigstore.trust.generation` | integer |
+| `sigstore.trust.generation.id` | string |
+| `sigstore.trust.generation.manifest.sha256` | string |
+| `sigstore.trust.tuf.root.version` | integer |
+| `sigstore.trust.tuf.targets.version` | integer |
+| `sigstore.trust.trusted_root.sha256` | string |
+| `sigstore.trust.signing_config.sha256` | string |
+| `sigstore.trust.initialized_at` | RFC 3339 UTC string |
+
+The status routes and command are local and read-only. This step adds no refresh,
+restart, or rotation command.
+
 ## Stop
 
 Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in the terminal running `aspire run`, or run

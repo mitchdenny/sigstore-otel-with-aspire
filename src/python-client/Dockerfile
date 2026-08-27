@@ -20,7 +20,7 @@ RUN python -m pip install \
 RUN useradd --create-home --uid 10001 client
 
 WORKDIR /app
-COPY client.py ./
+COPY client.py test_client.py ./
 
 USER client
 

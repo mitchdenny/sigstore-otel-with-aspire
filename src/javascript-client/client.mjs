@@ -7,6 +7,13 @@ import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
 import { UndiciInstrumentation } from '@opentelemetry/instrumentation-undici';
 import { NodeSDK } from '@opentelemetry/sdk-node';
 
+import {
+  createClientTrustStatus,
+  targetText,
+  TRUST_STATUS_TARGET_NAME,
+  trustSpanAttributes,
+} from './trust-status.mjs';
+
 const REQUEST_TIMEOUT_MILLISECONDS = 30_000;
 const PRODUCE_INTERVAL_MILLISECONDS = 10_000;
 const POLL_INTERVAL_MILLISECONDS = 2_000;
@@ -57,12 +64,15 @@ let workersHealthy = true;
 let artifactStore;
 let bundleBuilder;
 let verifier;
+let trustStatus;
+let lastWorkerError = null;
 
 async function runWorker(name, worker) {
   try {
     await worker();
   } catch (error) {
     workersHealthy = false;
+    lastWorkerError = error instanceof Error ? error.message : String(error);
     console.error(`The ${name} worker stopped unexpectedly.`, error);
     stopController.abort();
     throw error;
@@ -206,7 +216,7 @@ async function validateArtifact(artifactID) {
       'artifact.size': artifact.length,
       'client.language': 'javascript',
     },
-    async () => {
+    async (span) => {
       verifier.verify(JSON.parse(bundleJSON), artifact);
     },
   );
@@ -457,11 +467,14 @@ function normalizeURL(value) {
 
 artifactStore = new ArtifactStore(config.artifactStoreURL);
 
-({ bundleBuilder, verifier } = await inSpan(
+({ bundleBuilder, verifier, trustStatus } = await inSpan(
   'sigstore.trust.initialize',
   SpanKind.INTERNAL,
-  { 'client.language': 'javascript' },
-  async () => {
+  {
+    'client.language': 'javascript',
+    'client.resource.name': 'javascript-client',
+  },
+  async (span) => {
     const cachePath = '/tmp/sigstore-javascript-tuf-cache';
     const tufOptions = {
       cachePath,
@@ -469,11 +482,15 @@ artifactStore = new ArtifactStore(config.artifactStoreURL);
       rootPath: config.tufRootPath,
     };
     const tuf = await initTUF(tufOptions);
+    const trustedRootJSON = await tuf.getTarget('trusted_root.json');
     const signingConfigJSON = await tuf.getTarget(
       'signing_config.v0.2.json',
     );
+    const publishedStatusJSON = await tuf.getTarget(
+      TRUST_STATUS_TARGET_NAME,
+    );
     const signingConfig = SigningConfig.fromJSON(
-      JSON.parse(signingConfigJSON),
+      JSON.parse(targetText(signingConfigJSON)),
     );
     const initializedBundleBuilder = bundleBuilderFromSigningConfig({
       bundleType: 'messageSignature',
@@ -494,14 +511,41 @@ artifactStore = new ArtifactStore(config.artifactStoreURL);
       tufMirrorURL: config.tufURL,
       tufRootPath: config.tufRootPath,
     });
+    const initializedStatus = createClientTrustStatus({
+      resource: 'javascript-client',
+      language: 'javascript',
+      publishedTarget: publishedStatusJSON,
+      trustedRootTarget: trustedRootJSON,
+      signingConfigTarget: signingConfigJSON,
+      initializedAtUtc: new Date().toISOString(),
+    });
+    span.setAttributes(trustSpanAttributes(initializedStatus));
     return {
       bundleBuilder: initializedBundleBuilder,
       verifier: initializedVerifier,
+      trustStatus: initializedStatus,
     };
   },
 ));
 
 const server = createServer((request, response) => {
+  if (request.url === '/trust/status') {
+    const ready = !stopController.signal.aborted && workersHealthy;
+    const body = JSON.stringify({
+      ...trustStatus,
+      ready,
+      lastError: ready
+        ? null
+        : (lastWorkerError ?? 'client is stopping'),
+    });
+    response.writeHead(ready ? 200 : 503, {
+      'Content-Length': Buffer.byteLength(body),
+      'Content-Type': 'application/json',
+    });
+    response.end(body);
+    return;
+  }
+
   const healthy =
     request.url === '/healthz' &&
     !stopController.signal.aborted &&
