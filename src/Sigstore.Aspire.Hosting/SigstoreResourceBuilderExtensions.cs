@@ -78,7 +78,7 @@ public static class SigstoreResourceBuilderExtensions
                 isReadOnly: true)
             .WithEnvironment(
                 "SIGSTORE_OIDC_ISSUER",
-                "https://oidc-sigstore.dev.localhost:7443")
+                SigstoreDefaults.ExpectedIssuer)
             .WithEnvironment(
                 "SIGSTORE_OIDC_PRIVATE_KEY_PATH",
                 "/var/lib/sigstore/private/oidc/signer.key")
@@ -87,7 +87,7 @@ public static class SigstoreResourceBuilderExtensions
                 "/var/lib/sigstore/public/oidc/jwks.json")
             .WithEnvironment(
                 "SIGSTORE_OIDC_DEFAULT_IDENTITY",
-                "demo@sigstore.local")
+                SigstoreDefaults.ExpectedIdentity)
             .WithEnvironment(
                 "ASPNETCORE_URLS",
                 "https://+:8443;http://+:8080")

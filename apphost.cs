@@ -72,56 +72,14 @@ var dotnetClient = builder
     .AddDockerfile(
         "dotnet-client",
         "./src/dotnet-client")
-    .WithBindMount(
-        Path.Combine(
-            sigstoreStatePath,
-            "tuf",
-            "repository",
-            "root.json"),
-        "/var/lib/sigstore/tuf/root.json",
-        isReadOnly: true)
     .WithEnvironment(
         "ASPNETCORE_URLS",
         "http://+:8080")
     .WithEnvironment("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
-    .WithEnvironment(
-        "SIGSTORE_TUF_ROOT_PATH",
-        "/var/lib/sigstore/tuf/root.json")
     .WithEnvironment("SIGSTORE_TUF_CACHE_PATH", "/tmp/sigstore-tuf-cache")
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_IDENTITY",
-        "demo@sigstore.local")
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_ISSUER",
-        "https://oidc-sigstore.dev.localhost:7443")
     .WithEnvironment(
         "SHADY_BLOB_STORE_URL",
         shadyBlobStore.GetEndpoint(
-            "http",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_URL",
-        sigstore.Tuf.GetEndpoint(
-            "http",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_OIDC_URL",
-        sigstore.Oidc.GetEndpoint(
-            "internal",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_FULCIO_URL",
-        sigstore.Fulcio.GetEndpoint(
-            "http",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_REKOR_URL",
-        sigstore.Rekor.GetEndpoint(
-            "http",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TIMESTAMP_URL",
-        sigstore.Timestamp.GetEndpoint(
             "http",
             KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
     .WithHttpEndpoint(
@@ -133,11 +91,13 @@ var dotnetClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WaitFor(sigstore.Tuf)
-    .WaitFor(sigstore.Oidc)
-    .WaitFor(sigstore.Fulcio)
-    .WaitFor(sigstore.Timestamp)
-    .WaitFor(sigstore.Rekor);
+    .WithSigstoreReference(
+        sigstore,
+        new SigstoreClientOptions
+        {
+            AddCanonicalHostMappings = false,
+            IncludeDirectServiceEndpointVariables = true
+        });
 
 dotnetClient.WithUrlForEndpoint(
     "http",
@@ -145,45 +105,11 @@ dotnetClient.WithUrlForEndpoint(
 
 var goClient = builder
     .AddDockerfile("go-client", "./src/go-client")
-    .WithContainerRuntimeArgs(
-        "--add-host",
-        "tuf-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "oidc-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "fulcio-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "rekor-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "timestamp-sigstore.dev.localhost:host-gateway")
-    .WithBindMount(
-        Path.Combine(sigstoreStatePath, "tuf", "repository"),
-        "/var/lib/sigstore/tuf/repository",
-        isReadOnly: true)
-    .WithEnvironment(
-        "SIGSTORE_TUF_ROOT_PATH",
-        "/var/lib/sigstore/tuf/repository/root.json")
     .WithEnvironment(
         "SHADY_BLOB_STORE_URL",
         shadyBlobStore.GetEndpoint(
             "http",
             KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_URL",
-        sigstore.Tuf.GetEndpoint(
-            "http",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_OIDC_URL",
-        sigstore.Oidc.GetEndpoint(
-            "internal",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_IDENTITY",
-        "demo@sigstore.local")
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_ISSUER",
-        "https://oidc-sigstore.dev.localhost:7443")
     .WithEnvironment("GO_CLIENT_PORT", "8080")
     .WithEnvironment(
         "OTEL_EXPORTER_OTLP_CERTIFICATE",
@@ -197,11 +123,12 @@ var goClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WaitFor(sigstore.Tuf)
-    .WaitFor(sigstore.Oidc)
-    .WaitFor(sigstore.Fulcio)
-    .WaitFor(sigstore.Timestamp)
-    .WaitFor(sigstore.Rekor);
+    .WithSigstoreReference(
+        sigstore,
+        new SigstoreClientOptions
+        {
+            TufMount = SigstoreTufMountKind.RepositoryDirectory
+        });
 
 goClient.WithUrlForEndpoint(
     "http",
@@ -209,49 +136,11 @@ goClient.WithUrlForEndpoint(
 
 var pythonClient = builder
     .AddDockerfile("python-client", "./src/python-client")
-    .WithContainerRuntimeArgs(
-        "--add-host",
-        "tuf-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "oidc-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "fulcio-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "rekor-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "timestamp-sigstore.dev.localhost:host-gateway")
-    .WithBindMount(
-        Path.Combine(
-            sigstoreStatePath,
-            "tuf",
-            "repository",
-            "root.json"),
-        "/var/lib/sigstore/tuf/root.json",
-        isReadOnly: true)
     .WithEnvironment(
         "SHADY_BLOB_STORE_URL",
         shadyBlobStore.GetEndpoint(
             "http",
             KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_URL",
-        sigstore.Tuf.GetEndpoint(
-            "http",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_ROOT_PATH",
-        "/var/lib/sigstore/tuf/root.json")
-    .WithEnvironment(
-        "SIGSTORE_OIDC_URL",
-        sigstore.Oidc.GetEndpoint(
-            "internal",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_IDENTITY",
-        "demo@sigstore.local")
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_ISSUER",
-        "https://oidc-sigstore.dev.localhost:7443")
     .WithEnvironment("PYTHON_CLIENT_PORT", "8080")
     .WithEnvironment("OTEL_TRACES_EXPORTER", "otlp")
     .WithEnvironment("OTEL_METRICS_EXPORTER", "otlp")
@@ -268,11 +157,7 @@ var pythonClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WaitFor(sigstore.Tuf)
-    .WaitFor(sigstore.Oidc)
-    .WaitFor(sigstore.Fulcio)
-    .WaitFor(sigstore.Timestamp)
-    .WaitFor(sigstore.Rekor);
+    .WithSigstoreReference(sigstore);
 
 pythonClient.WithUrlForEndpoint(
     "http",
@@ -282,49 +167,11 @@ var javascriptClient = builder
     .AddDockerfile(
         "javascript-client",
         "./src/javascript-client")
-    .WithContainerRuntimeArgs(
-        "--add-host",
-        "tuf-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "oidc-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "fulcio-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "rekor-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "timestamp-sigstore.dev.localhost:host-gateway")
-    .WithBindMount(
-        Path.Combine(
-            sigstoreStatePath,
-            "tuf",
-            "repository",
-            "root.json"),
-        "/var/lib/sigstore/tuf/root.json",
-        isReadOnly: true)
     .WithEnvironment(
         "SHADY_BLOB_STORE_URL",
         shadyBlobStore.GetEndpoint(
             "http",
             KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_URL",
-        sigstore.Tuf.GetEndpoint(
-            "http",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_ROOT_PATH",
-        "/var/lib/sigstore/tuf/root.json")
-    .WithEnvironment(
-        "SIGSTORE_OIDC_URL",
-        sigstore.Oidc.GetEndpoint(
-            "internal",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_IDENTITY",
-        "demo@sigstore.local")
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_ISSUER",
-        "https://oidc-sigstore.dev.localhost:7443")
     .WithEnvironment(
         "JAVASCRIPT_CLIENT_PORT",
         "8080")
@@ -342,11 +189,7 @@ var javascriptClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WaitFor(sigstore.Tuf)
-    .WaitFor(sigstore.Oidc)
-    .WaitFor(sigstore.Fulcio)
-    .WaitFor(sigstore.Timestamp)
-    .WaitFor(sigstore.Rekor);
+    .WithSigstoreReference(sigstore);
 
 javascriptClient.WithUrlForEndpoint(
     "http",
@@ -355,49 +198,11 @@ javascriptClient.WithUrlForEndpoint(
 
 var javaClient = builder
     .AddDockerfile("java-client", "./src/java-client")
-    .WithContainerRuntimeArgs(
-        "--add-host",
-        "tuf-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "oidc-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "fulcio-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "rekor-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "timestamp-sigstore.dev.localhost:host-gateway")
-    .WithBindMount(
-        Path.Combine(
-            sigstoreStatePath,
-            "tuf",
-            "repository",
-            "root.json"),
-        "/var/lib/sigstore/tuf/root.json",
-        isReadOnly: true)
     .WithEnvironment(
         "SHADY_BLOB_STORE_URL",
         shadyBlobStore.GetEndpoint(
             "http",
             KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_URL",
-        sigstore.Tuf.GetEndpoint(
-            "http",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_ROOT_PATH",
-        "/var/lib/sigstore/tuf/root.json")
-    .WithEnvironment(
-        "SIGSTORE_OIDC_URL",
-        sigstore.Oidc.GetEndpoint(
-            "internal",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_IDENTITY",
-        "demo@sigstore.local")
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_ISSUER",
-        "https://oidc-sigstore.dev.localhost:7443")
     .WithEnvironment("JAVA_CLIENT_PORT", "8080")
     .WithEnvironment("OTEL_METRICS_EXPORTER", "none")
     .WithEnvironment("OTEL_LOGS_EXPORTER", "none")
@@ -413,11 +218,7 @@ var javaClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WaitFor(sigstore.Tuf)
-    .WaitFor(sigstore.Oidc)
-    .WaitFor(sigstore.Fulcio)
-    .WaitFor(sigstore.Timestamp)
-    .WaitFor(sigstore.Rekor);
+    .WithSigstoreReference(sigstore);
 
 javaClient.WithUrlForEndpoint(
     "http",
@@ -425,49 +226,11 @@ javaClient.WithUrlForEndpoint(
 
 var rustClient = builder
     .AddDockerfile("rust-client", "./src/rust-client")
-    .WithContainerRuntimeArgs(
-        "--add-host",
-        "tuf-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "oidc-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "fulcio-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "rekor-sigstore.dev.localhost:host-gateway",
-        "--add-host",
-        "timestamp-sigstore.dev.localhost:host-gateway")
-    .WithBindMount(
-        Path.Combine(
-            sigstoreStatePath,
-            "tuf",
-            "repository",
-            "root.json"),
-        "/var/lib/sigstore/tuf/root.json",
-        isReadOnly: true)
     .WithEnvironment(
         "SHADY_BLOB_STORE_URL",
         shadyBlobStore.GetEndpoint(
             "http",
             KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_URL",
-        sigstore.Tuf.GetEndpoint(
-            "http",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_TUF_ROOT_PATH",
-        "/var/lib/sigstore/tuf/root.json")
-    .WithEnvironment(
-        "SIGSTORE_OIDC_URL",
-        sigstore.Oidc.GetEndpoint(
-            "internal",
-            KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_IDENTITY",
-        "demo@sigstore.local")
-    .WithEnvironment(
-        "SIGSTORE_EXPECTED_ISSUER",
-        "https://oidc-sigstore.dev.localhost:7443")
     .WithEnvironment("RUST_CLIENT_PORT", "8080")
     .WithEnvironment("OTEL_METRICS_EXPORTER", "none")
     .WithEnvironment("OTEL_LOGS_EXPORTER", "none")
@@ -483,11 +246,7 @@ var rustClient = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc)
     .WaitFor(shadyBlobStore)
-    .WaitFor(sigstore.Tuf)
-    .WaitFor(sigstore.Oidc)
-    .WaitFor(sigstore.Fulcio)
-    .WaitFor(sigstore.Timestamp)
-    .WaitFor(sigstore.Rekor);
+    .WithSigstoreReference(sigstore);
 
 rustClient.WithUrlForEndpoint(
     "http",
