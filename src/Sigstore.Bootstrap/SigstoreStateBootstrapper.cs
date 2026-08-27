@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -6,11 +5,10 @@ using System.Text.Json;
 
 namespace Sigstore.Bootstrap;
 
-internal static class SigstoreStateBootstrapper
+internal static partial class SigstoreStateBootstrapper
 {
-    private const int CurrentSchemaVersion = 4;
+    private const int LegacySchemaVersion = 4;
     private const string TimestampingEkuOid = "1.3.6.1.5.5.7.3.8";
-    private const string LockFileName = ".bootstrap.lock";
     private const string ManifestFileName = "bootstrap-manifest.json";
     private const string FulcioPrivateKeyPath = "private/fulcio/root.key";
     private const string FulcioPrivateKeyPasswordPath =
@@ -35,7 +33,7 @@ internal static class SigstoreStateBootstrapper
     private const string RekorStateMarkerPath =
         "data/rekor/bootstrap-state";
 
-    private static readonly string[] RequiredStateFiles =
+    private static readonly string[] LegacyRequiredStateFiles =
     [
         ManifestFileName,
         FulcioPrivateKeyPath,
@@ -65,95 +63,103 @@ internal static class SigstoreStateBootstrapper
         };
 
     public static BootstrapResult EnsureInitialized(string statePath)
+        => EnsureInitialized(
+            statePath,
+            TrustStateOperationOptions.Default);
+
+    internal static BootstrapResult EnsureInitialized(
+        string statePath,
+        TrustStateOperationOptions options)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
+        ArgumentNullException.ThrowIfNull(options);
 
         var rootPath = Path.GetFullPath(statePath);
         Directory.CreateDirectory(rootPath);
 
-        var lockFilePath = Path.Combine(rootPath, LockFileName);
-        using var lockFile = AcquireLock(lockFilePath);
-
-        var manifestPath = Resolve(rootPath, ManifestFileName);
-        if (File.Exists(manifestPath))
-        {
-            return new BootstrapResult(
-                Created: false,
-                ValidateState(rootPath));
-        }
-
-        var unexpectedEntries = Directory
-            .EnumerateFiles(
-                rootPath,
-                "*",
-                SearchOption.AllDirectories)
-            .Where(path => !string.Equals(
-                path,
-                lockFilePath,
-                StringComparison.Ordinal))
-            .ToArray();
-
-        if (unexpectedEntries.Length > 0)
-        {
-            throw new InvalidDataException(
-                $"Sigstore state at '{rootPath}' is incomplete. " +
-                $"Delete the directory to create a new trust domain.");
-        }
-
-        GenerateState(rootPath);
-
-        return new BootstrapResult(
-            Created: true,
-            ValidateState(rootPath));
+        using var stateLock = StateFileLock.Acquire(
+            rootPath,
+            options.LockTimeout,
+            "bootstrap-or-trust-transition");
+        return EnsureTrustStateLocked(
+            rootPath,
+            options);
     }
 
-    private static void GenerateState(string rootPath)
+    internal static BootstrapManifest CreateSchema4StateForMigrationTests(
+        string statePath)
     {
-        var ctLogStateId = InitializeCtLogState(rootPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
+        var rootPath = Path.GetFullPath(statePath);
+        Directory.CreateDirectory(rootPath);
+        if (Directory.EnumerateFileSystemEntries(rootPath).Any())
+        {
+            throw new InvalidOperationException(
+                "The schema-4 test state directory must be empty.");
+        }
+
+        return GenerateLegacyState(
+            rootPath,
+            rootPath,
+            writeManifest: true);
+    }
+
+    private static BootstrapManifest GenerateLegacyState(
+        string stateRootPath,
+        string materialRootPath,
+        bool writeManifest)
+    {
+        var ctLogStateId = InitializeCtLogState(stateRootPath);
         var rekorStateId = InitializeRuntimeState(
-            rootPath,
+            stateRootPath,
             RekorStateMarkerPath);
-        GenerateFulcioRoot(rootPath);
+        GenerateFulcioRoot(materialRootPath);
         GenerateEcdsaKeyPair(
-            rootPath,
+            materialRootPath,
             CtLogPrivateKeyPath,
             CtLogPublicKeyPath);
         GenerateEcdsaKeyPair(
-            rootPath,
+            materialRootPath,
             RekorPrivateKeyPath,
             RekorPublicKeyPath);
-        GenerateOidcKeyPair(rootPath);
-        GenerateTimestampAuthority(rootPath);
-        var tsa = ValidateTimestampAuthority(rootPath);
+        GenerateOidcKeyPair(materialRootPath);
+        GenerateTimestampAuthority(materialRootPath);
+        var tsa = ValidateTimestampAuthority(materialRootPath);
 
         var manifest = new BootstrapManifest(
-            CurrentSchemaVersion,
+            LegacySchemaVersion,
             DateTimeOffset.UtcNow,
             ctLogStateId,
             rekorStateId,
-            ValidateFulcioRoot(rootPath),
+            ValidateFulcioRoot(materialRootPath),
             ValidateEcdsaKeyPair(
-                rootPath,
+                materialRootPath,
                 CtLogPrivateKeyPath,
                 CtLogPublicKeyPath),
             ValidateEcdsaKeyPair(
-                rootPath,
+                materialRootPath,
                 RekorPrivateKeyPath,
                 RekorPublicKeyPath),
             tsa.RootSha256,
             tsa.LeafSha256,
-            ValidateOidcKeyPair(rootPath));
+            ValidateOidcKeyPair(materialRootPath));
 
-        var temporaryManifestPath = Resolve(
-            rootPath,
-            $".{ManifestFileName}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
-        WriteFile(
-            temporaryManifestPath,
-            JsonSerializer.Serialize(manifest, JsonOptions) + "\n",
-            isPrivate: false);
-        File.Move(
-            temporaryManifestPath,
-            Resolve(rootPath, ManifestFileName));
+        if (writeManifest)
+        {
+            var temporaryManifestPath = Resolve(
+                stateRootPath,
+                $".{ManifestFileName}.{Environment.ProcessId}." +
+                $"{Guid.NewGuid():N}.tmp");
+            WriteFile(
+                temporaryManifestPath,
+                JsonSerializer.Serialize(manifest, JsonOptions) + "\n",
+                isPrivate: false);
+            File.Move(
+                temporaryManifestPath,
+                Resolve(stateRootPath, ManifestFileName));
+        }
+
+        return manifest;
     }
 
     private static string InitializeCtLogState(string rootPath)
@@ -379,9 +385,9 @@ internal static class SigstoreStateBootstrapper
             isPrivate: false);
     }
 
-    private static BootstrapManifest ValidateState(string rootPath)
+    private static BootstrapManifest ValidateLegacyState(string rootPath)
     {
-        foreach (var relativePath in RequiredStateFiles)
+        foreach (var relativePath in LegacyRequiredStateFiles)
         {
             var path = Resolve(rootPath, relativePath);
             if (!File.Exists(path))
@@ -400,11 +406,11 @@ internal static class SigstoreStateBootstrapper
             ?? throw new InvalidDataException(
                 $"Manifest '{manifestPath}' is empty.");
 
-        if (manifest.SchemaVersion != CurrentSchemaVersion)
+        if (manifest.SchemaVersion != LegacySchemaVersion)
         {
             throw new InvalidDataException(
                 $"Sigstore state schema {manifest.SchemaVersion} is not " +
-                $"supported; expected {CurrentSchemaVersion}.");
+                $"supported for migration; expected {LegacySchemaVersion}.");
         }
 
         EnsureEqual(
@@ -685,9 +691,24 @@ internal static class SigstoreStateBootstrapper
 
     private static ECDsa LoadEcdsaKey(string path)
     {
-        var key = ECDsa.Create();
-        key.ImportFromPem(File.ReadAllText(path));
-        return key;
+        try
+        {
+            var key = ECDsa.Create();
+            key.ImportFromPem(File.ReadAllText(path));
+            return key;
+        }
+        catch (ArgumentException exception)
+        {
+            throw new InvalidDataException(
+                $"ECDSA key '{path}' is invalid.",
+                exception);
+        }
+        catch (CryptographicException exception)
+        {
+            throw new InvalidDataException(
+                $"ECDSA key '{path}' is invalid.",
+                exception);
+        }
     }
 
     private static byte[] CreateSerialNumber()
@@ -727,47 +748,48 @@ internal static class SigstoreStateBootstrapper
         string path,
         string passwordPath)
     {
-        var key = ECDsa.Create();
-        key.ImportFromEncryptedPem(
-            File.ReadAllText(path),
-            File.ReadAllText(passwordPath));
-        return key;
-    }
-
-    private static FileStream AcquireLock(string path)
-    {
-        var timeout = TimeSpan.FromSeconds(30);
-        var stopwatch = Stopwatch.StartNew();
-
-        while (true)
+        try
         {
-            try
-            {
-                return new FileStream(
-                    path,
-                    FileMode.OpenOrCreate,
-                    FileAccess.ReadWrite,
-                    FileShare.None);
-            }
-            catch (IOException) when (stopwatch.Elapsed < timeout)
-            {
-                Thread.Sleep(TimeSpan.FromMilliseconds(100));
-            }
-            catch (IOException exception)
-            {
-                throw new InvalidOperationException(
-                    $"Another bootstrapper is using Sigstore state at " +
-                    $"'{Path.GetDirectoryName(path)}'.",
-                    exception);
-            }
+            var key = ECDsa.Create();
+            key.ImportFromEncryptedPem(
+                File.ReadAllText(path),
+                File.ReadAllText(passwordPath));
+            return key;
+        }
+        catch (ArgumentException exception)
+        {
+            throw new InvalidDataException(
+                $"Encrypted ECDSA key '{path}' is invalid.",
+                exception);
+        }
+        catch (CryptographicException exception)
+        {
+            throw new InvalidDataException(
+                $"Encrypted ECDSA key '{path}' is invalid.",
+                exception);
         }
     }
 
     private static RSA LoadRsaKey(string path)
     {
-        var key = RSA.Create();
-        key.ImportFromPem(File.ReadAllText(path));
-        return key;
+        try
+        {
+            var key = RSA.Create();
+            key.ImportFromPem(File.ReadAllText(path));
+            return key;
+        }
+        catch (ArgumentException exception)
+        {
+            throw new InvalidDataException(
+                $"RSA key '{path}' is invalid.",
+                exception);
+        }
+        catch (CryptographicException exception)
+        {
+            throw new InvalidDataException(
+                $"RSA key '{path}' is invalid.",
+                exception);
+        }
     }
 
     private static void EnsureKeyBytesEqual(

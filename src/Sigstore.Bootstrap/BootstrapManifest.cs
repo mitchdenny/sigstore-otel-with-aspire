@@ -12,6 +12,15 @@ internal sealed record BootstrapManifest(
     string TsaLeafSha256,
     string OidcKeyId);
 
+internal enum BootstrapAction
+{
+    Created,
+    Migrated,
+    Recovered,
+    Reused
+}
+
 internal sealed record BootstrapResult(
-    bool Created,
-    BootstrapManifest Manifest);
+    BootstrapAction Action,
+    TrustDomainManifest TrustDomain,
+    GenerationManifest Generation);

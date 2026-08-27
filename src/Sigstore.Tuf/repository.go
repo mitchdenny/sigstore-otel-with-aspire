@@ -111,7 +111,13 @@ func ensureTUFRepositoryWithHooks(
 	statePath string,
 	hooks publicationHooks,
 ) (repositoryAction, error) {
-	bootstrap, err := loadBootstrapManifest(filepath.Join(statePath, "bootstrap-manifest.json"))
+	stateLock, err := acquireStateLock(statePath, 30*time.Second, "tuf-publication")
+	if err != nil {
+		return "", err
+	}
+	defer stateLock.release()
+
+	bootstrap, err := loadActiveTrustGeneration(statePath)
 	if err != nil {
 		return "", err
 	}
