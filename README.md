@@ -100,17 +100,65 @@ minutes.
 ## Local Sigstore state
 
 The one-shot `sigstore-bootstrap` resource creates the private keys and public
-trust material needed by the isolated Sigstore services. It writes them to the
-gitignored `.sigstore` directory in the repository root. Every new AppHost
-process deletes and recreates both `.sigstore` and `.shady-blob-store` before
-bootstrap, so each `aspire run` or `aspire start` begins with a new trust domain,
-empty transparency logs, and artifact numbering starting at 1.
+trust material needed by the isolated Sigstore services. It writes schema-5
+generation-aware state to the gitignored `.sigstore` directory in the
+repository root. Every new AppHost process deletes and recreates both
+`.sigstore` and `.shady-blob-store` before bootstrap, so each `aspire run` or
+`aspire start` begins with a new trust domain, empty transparency logs, and
+artifact numbering starting at 1.
 
 The AppHost process is the reset boundary. Restarting an individual service or
 client resource within the same run retains that run's trust and artifact
 state. Stopping the AppHost and starting it again intentionally discards that
 state. A `SIGSTORE_STATE_PATH` override is accepted only when its resolved path
 is a safe descendant of the AppHost directory.
+
+The trust-domain identity is separate from its active key generation:
+
+```text
+.sigstore/
+|-- state.lock
+|-- trust-domain.json
+|-- active-generation -> generations/generation-00000001
+|-- generations/
+|   `-- generation-00000001/
+|       |-- private/
+|       |-- public/
+|       `-- manifest.json
+|-- transition/
+|   `-- state.json
+|-- migration/
+|   `-- bootstrap-manifest.schema-4.json  # migrated state only
+|-- data/
+`-- tuf/
+```
+
+`trust-domain.json` is immutable identity: its ID, creation time, and the CT
+and Rekor log-state IDs do not belong to a replaceable key generation. Each
+numbered generation has its own immutable manifest containing the generation
+reference, trust-domain ID, source-schema provenance, trust fingerprints, and
+the exact SHA-256 and path of every private and public material file.
+`active-generation` is a normalized relative link switched atomically only
+after the candidate and immutable identity have been validated.
+
+`transition/state.json` is a durable trust-transition journal, distinct from
+TUF publication state and publication IDs. It can record `staged`, `committed`,
+`failed`, and `recovered`; the active-generation link is the commit record.
+Interrupted pre-commit initialization or schema-4 migration completes forward
+because there is no prior generation, while an interruption after that switch
+also finalizes forward. A known operation failure is recorded as `failed` and
+recovered by the next bootstrap. Step 4 creates or imports generation 1 only;
+it does not expose a rotation command or mutate generations during live
+operation.
+
+Bootstrap and TUF publication both serialize through `state.lock`. The lock is
+an operating-system advisory lock, so an interrupted owner cannot leave a
+stale lock behind; the JSON owner record is diagnostic and is overwritten by
+the next holder. Schema-4 migration validates the old state before writing a
+journal, moves the existing `private` and `public` trees without rewriting
+their bytes, and archives the original bootstrap manifest byte-for-byte.
+Ambiguous layouts, extra generation files, changed hashes, or inconsistent
+keys and certificates fail instead of regenerating or discarding state.
 
 The TUF worker keeps `.sigstore/tuf` itself stable for the entire AppHost run.
 Nginx and all clients bind-mount that parent, whose layout is:

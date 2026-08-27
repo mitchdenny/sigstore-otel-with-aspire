@@ -509,6 +509,65 @@ retains the documented index-zero Python interoperability exception.**
 - Unexpected file changes still fail validation.
 - Interrupted staged and committed transitions recover deterministically.
 
+### Implementation evidence
+
+Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
+
+- Schema 5 stores immutable identity in `trust-domain.json`, key material and
+  exact file hashes in
+  `generations/generation-00000001/manifest.json`, and a separate normalized
+  `active-generation` link. Step 4 creates or imports generation 1 only; no
+  rotation command or live generation mutation was added.
+- `transition/state.json` is independent of TUF publication IDs and represents
+  `staged`, `committed`, `failed`, and `recovered`. The active-generation link
+  is its commit record. Initialization and schema-4 migration complete forward
+  because no prior generation exists, including recovery after the link switch.
+- Schema-4 migration validates the original keys, certificates, JWKS, log
+  markers, and exact private/public file set before journaling. It moves the
+  material directories without rewriting them and archives the original
+  manifest byte-for-byte. Twenty-one temporary-directory .NET tests cover
+  fresh state, copied schema-4 state, idempotence, pre- and post-migration
+  corruption, contention and released-owner recovery, durable failure, all 13
+  filesystem checkpoints, and the archive rename/mode crash window. Every
+  pre/post material hash, trust fingerprint, CT state ID, and Rekor state ID
+  matched.
+- Bootstrap and TUF publication use the same root `state.lock` and kernel
+  `flock`; process exit releases the lock while owner JSON remains diagnostic.
+  Ten Go tests retain Step 3 publication/recovery coverage and additionally
+  prove lock contention/recovery, generation file corruption rejection, and
+  identical TUF source fingerprints before and after a schema-4 projection.
+- The `.sigstore/tuf` bind-mount parent, immutable bootstrap root, atomic
+  publication link, exact publication manifests, and one-entry history remain
+  unchanged. In the live run, TUF nginx stayed container
+  `df43c76008917b6985558eeda759697a356e8c00a33756ec1599fccee4c21c23`
+  while snapshot and timestamp advanced from version `1` to `2`. The bootstrap
+  root retained SHA-256
+  `b3f94869cd2409af0d34b34d76c250938abee66f525182712b42b4eac7f525aa`
+  and inode `57371418`; source fingerprint
+  `22761cb5b9d6c30d68ea4b47cfafb1f19f38f10e39ee21cf2555bd0b6d1f13c5`
+  was unchanged, and the prior manifest became `history/previous`.
+- Both serialized non-isolated AppHosts completed all four one-shots with exit
+  code `0` and made all 14 application resources healthy. Resolved service
+  mounts use `active-generation/private` and `active-generation/public`; nginx
+  and all six typed clients still mount the stable TUF parent and resolve only
+  local endpoints. Every language produced, and five validated the shared
+  stream in the first run. Python encountered the documented out-of-scope
+  index-zero bundle omission on artifact `1`; no Go or Python serialization was
+  changed. In the replacement run all six produced and validated.
+- A replacement AppHost removed sentinels from both run-scoped state trees,
+  changed the trust-domain ID from
+  `sha256-177f160ae2bf3b6627659d5bcc84cdc72900e71eb6ec8d9f029df251c0689751`
+  to
+  `sha256-31c484c6199589ebe040b57efdec95b5fdaf0b031baaa591261e2f6b73111cc2`,
+  changed the generation-manifest and bootstrap-root hashes, reset TUF
+  snapshot/timestamp to version `1` with empty history, and replaced artifact
+  `1`. The final AppHost remains running at
+  `https://sigstore.dev.localhost:17249` (fixed HTTP dashboard route
+  `http://sigstore.dev.localhost:15096`).
+
+**Validation gate status: passed; the first live run retained the documented
+index-zero Python interoperability exception.**
+
 ## Step 5: Add trust status and client observability
 
 ### Scope

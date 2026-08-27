@@ -6,19 +6,24 @@ var statePath =
         "SIGSTORE_STATE_PATH must identify the Sigstore state directory.");
 
 var result = SigstoreStateBootstrapper.EnsureInitialized(statePath);
-var action = result.Created ? "Created" : "Reused";
 
 Console.WriteLine(
-    $"{action} Sigstore bootstrap state at {Path.GetFullPath(statePath)}.");
+    $"{result.Action} Sigstore trust state at {Path.GetFullPath(statePath)}.");
 Console.WriteLine(
-    $"Fulcio root SHA-256: {result.Manifest.FulcioRootSha256}");
+    $"Trust domain: {result.TrustDomain.TrustDomainId}");
 Console.WriteLine(
-    $"CT log public key SHA-256: {result.Manifest.CtLogPublicKeySha256}");
+    $"Active generation: {result.Generation.GenerationId}");
 Console.WriteLine(
-    $"Rekor public key SHA-256: {result.Manifest.RekorPublicKeySha256}");
+    $"Fulcio root SHA-256: {result.Generation.FulcioRootSha256}");
 Console.WriteLine(
-    $"TSA root SHA-256: {result.Manifest.TsaRootSha256}");
+    $"CT log public key SHA-256: " +
+    $"{result.Generation.CtLogPublicKeySha256}");
 Console.WriteLine(
-    $"TSA leaf SHA-256: {result.Manifest.TsaLeafSha256}");
+    $"Rekor public key SHA-256: " +
+    $"{result.Generation.RekorPublicKeySha256}");
 Console.WriteLine(
-    $"OIDC key ID: {result.Manifest.OidcKeyId}");
+    $"TSA root SHA-256: {result.Generation.TsaRootSha256}");
+Console.WriteLine(
+    $"TSA leaf SHA-256: {result.Generation.TsaLeafSha256}");
+Console.WriteLine(
+    $"OIDC key ID: {result.Generation.OidcKeyId}");

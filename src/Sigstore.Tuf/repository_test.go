@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -356,6 +357,83 @@ func TestRefreshRejectsCommittedFileCorruption(t *testing.T) {
 	}
 }
 
+func TestGenerationAwareStatePreservesSchema4SourceFingerprint(t *testing.T) {
+	statePath := newTestState(t)
+	legacyData := readTestFile(
+		t,
+		filepath.Join(
+			statePath,
+			"migration",
+			"bootstrap-manifest.schema-4.json",
+		),
+	)
+	var legacy bootstrapManifest
+	if err := json.Unmarshal(legacyData, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	before, err := fingerprintSource(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := fingerprintSource(active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("source fingerprint changed across schema-4 migration: %s != %s", before, after)
+	}
+}
+
+func TestGenerationStateRejectsUnexpectedFile(t *testing.T) {
+	statePath := newTestState(t)
+	writeTestFile(
+		t,
+		filepath.Join(
+			statePath,
+			"generations",
+			initialGenerationID,
+			"public",
+			"unexpected.pem",
+		),
+		[]byte("unexpected"),
+	)
+
+	if _, err := ensureTUFRepository(statePath); err == nil {
+		t.Fatal("TUF initialization accepted an unexpected generation file")
+	}
+}
+
+func TestSharedStateLockContentionAndRecovery(t *testing.T) {
+	statePath := t.TempDir()
+	holder, err := acquireStateLock(statePath, time.Second, "test-holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireStateLock(
+		statePath,
+		100*time.Millisecond,
+		"test-contender",
+	); err == nil {
+		t.Fatal("contending state operation unexpectedly acquired the lock")
+	}
+	holder.release()
+
+	recovered, err := acquireStateLock(
+		statePath,
+		time.Second,
+		"test-recovered",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered.release()
+}
+
 type testMetadata struct {
 	Version int
 	Hash    string
@@ -404,7 +482,7 @@ func readTestFile(t *testing.T, path string) []byte {
 
 func assertCommittedLayout(t *testing.T, statePath string) {
 	t.Helper()
-	bootstrap, err := loadBootstrapManifest(filepath.Join(statePath, "bootstrap-manifest.json"))
+	bootstrap, err := loadActiveTrustGeneration(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,6 +533,11 @@ func runUntilCrash(
 func newTestState(t *testing.T) string {
 	t.Helper()
 	statePath := t.TempDir()
+	generationPath := filepath.Join(
+		statePath,
+		"generations",
+		initialGenerationID,
+	)
 	createdAt := time.Date(2026, time.August, 27, 0, 0, 0, 0, time.UTC)
 
 	fulcioKey := newTestKey(t)
@@ -474,12 +557,12 @@ func newTestState(t *testing.T) string {
 		fulcioKey,
 	)
 	fulcioPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: fulcioDER})
-	writeTestFile(t, filepath.Join(statePath, "public", "fulcio", "root.pem"), fulcioPEM)
+	writeTestFile(t, filepath.Join(generationPath, "public", "fulcio", "root.pem"), fulcioPEM)
 
 	ctPEM := testPublicKeyPEM(t, newTestKey(t))
-	writeTestFile(t, filepath.Join(statePath, "public", "ctlog", "pubkey.pem"), ctPEM)
+	writeTestFile(t, filepath.Join(generationPath, "public", "ctlog", "pubkey.pem"), ctPEM)
 	rekorPEM := testPublicKeyPEM(t, newTestKey(t))
-	writeTestFile(t, filepath.Join(statePath, "public", "rekor", "signer.pub"), rekorPEM)
+	writeTestFile(t, filepath.Join(generationPath, "public", "rekor", "signer.pub"), rekorPEM)
 
 	tsaRootKey := newTestKey(t)
 	tsaRootTemplate := &x509.Certificate{
@@ -521,7 +604,18 @@ func newTestState(t *testing.T) string {
 		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tsaLeafDER}),
 		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tsaRootDER})...,
 	)
-	writeTestFile(t, filepath.Join(statePath, "public", "tsa", "cert-chain.pem"), tsaChain)
+	writeTestFile(t, filepath.Join(generationPath, "public", "tsa", "cert-chain.pem"), tsaChain)
+	writeTestFile(t, filepath.Join(generationPath, "private", "test.key"), []byte("test private material\n"))
+	writeTestFile(
+		t,
+		filepath.Join(statePath, "data", "ctlog", "bootstrap-state"),
+		[]byte("test-ct-log-state"),
+	)
+	writeTestFile(
+		t,
+		filepath.Join(statePath, "data", "rekor", "bootstrap-state"),
+		[]byte("test-rekor-state"),
+	)
 
 	manifest := bootstrapManifest{
 		SchemaVersion:        4,
@@ -533,9 +627,109 @@ func newTestState(t *testing.T) string {
 		TsaLeafSHA256:        testHash(tsaLeafDER),
 		OIDCKeyID:            "test-oidc-key",
 	}
+	if err := os.MkdirAll(
+		filepath.Join(statePath, "migration"),
+		0o755,
+	); err != nil {
+		t.Fatal(err)
+	}
+	legacyManifestPath := filepath.Join(
+		statePath,
+		"migration",
+		"bootstrap-manifest.schema-4.json",
+	)
 	if err := writeJSON(
-		filepath.Join(statePath, "bootstrap-manifest.json"),
+		legacyManifestPath,
 		manifest,
+		0o444,
+	); err != nil {
+		t.Fatal(err)
+	}
+	domain := trustDomainManifest{
+		SchemaVersion: trustStateSchemaVersion,
+		TrustDomainID: "sha256-" + strings.Repeat("a", 64),
+		CreatedAtUTC:  createdAt,
+		CtLogStateID:  "test-ct-log-state",
+		RekorStateID:  "test-rekor-state",
+	}
+	sourceManifestHash, err := hashFile(legacyManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := generationManifest{
+		SchemaVersion:        trustStateSchemaVersion,
+		Generation:           initialGeneration,
+		GenerationID:         initialGenerationID,
+		TrustDomainID:        domain.TrustDomainID,
+		CreatedAtUTC:         createdAt,
+		SourceSchemaVersion:  4,
+		SourceManifestSHA256: &sourceManifestHash,
+		FulcioRootSHA256:     manifest.FulcioRootSHA256,
+		CtLogPublicKeySHA256: manifest.CtLogPublicKeySHA256,
+		RekorPublicKeySHA256: manifest.RekorPublicKeySHA256,
+		TsaRootSHA256:        manifest.TsaRootSHA256,
+		TsaLeafSHA256:        manifest.TsaLeafSHA256,
+		OIDCKeyID:            manifest.OIDCKeyID,
+	}
+	files, err := collectGenerationFileHashes(generationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation.Files = files
+	if err := writeJSON(
+		filepath.Join(generationPath, "manifest.json"),
+		generation,
+		0o444,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(
+		filepath.Join(statePath, "trust-domain.json"),
+		domain,
+		0o444,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(
+		filepath.Join("generations", initialGenerationID),
+		filepath.Join(statePath, "active-generation"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	generationManifestHash, err := hashFile(
+		filepath.Join(generationPath, "manifest.json"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	domainManifestHash, err := hashFile(
+		filepath.Join(statePath, "trust-domain.json"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := trustTransitionJournal{
+		SchemaVersion:  trustTransitionSchemaVersion,
+		Status:         "committed",
+		LastCheckpoint: "transition-finalized",
+		Candidate: generationReference{
+			Generation:     initialGeneration,
+			GenerationID:   initialGenerationID,
+			ManifestSHA256: generationManifestHash,
+		},
+		TrustDomainManifestSHA256: domainManifestHash,
+		TrustDomain:               domain,
+		CandidateManifest:         generation,
+	}
+	if err := os.MkdirAll(
+		filepath.Join(statePath, "transition"),
+		0o755,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(
+		filepath.Join(statePath, "transition", "state.json"),
+		journal,
 		0o644,
 	); err != nil {
 		t.Fatal(err)

@@ -22,6 +22,15 @@ public static class SigstoreResourceBuilderExtensions
             appHostDirectory,
             options.SourcePath,
             nameof(options.SourcePath));
+        var activeGenerationPath = Path.Combine(
+            statePath,
+            "active-generation");
+        var activePrivatePath = Path.Combine(
+            activeGenerationPath,
+            "private");
+        var activePublicPath = Path.Combine(
+            activeGenerationPath,
+            "public");
 
         var parent = builder
             .AddResource(
@@ -60,7 +69,10 @@ public static class SigstoreResourceBuilderExtensions
             .WithEntrypoint("/bin/sh")
             .WithArgs(
                 "-c",
-                "test -f /var/lib/sigstore/bootstrap-manifest.json")
+                "test -f /var/lib/sigstore/trust-domain.json && " +
+                "test -L /var/lib/sigstore/active-generation && " +
+                "test -f /var/lib/sigstore/active-generation/manifest.json && " +
+                "test -f /var/lib/sigstore/transition/state.json")
             .WaitForCompletion(bootstrap)
             .WithParentRelationship(parent.Resource);
 
@@ -69,11 +81,11 @@ public static class SigstoreResourceBuilderExtensions
                 "oidc",
                 Path.Combine(sourcePath, "Sigstore.Oidc"))
             .WithBindMount(
-                Path.Combine(statePath, "private"),
+                activePrivatePath,
                 "/var/lib/sigstore/private",
                 isReadOnly: true)
             .WithBindMount(
-                Path.Combine(statePath, "public"),
+                activePublicPath,
                 "/var/lib/sigstore/public",
                 isReadOnly: true)
             .WithEnvironment(
@@ -127,11 +139,11 @@ public static class SigstoreResourceBuilderExtensions
                 "v0.1.2")
             .WithContainerRuntimeArgs("--user", "root")
             .WithBindMount(
-                Path.Combine(statePath, "private"),
+                activePrivatePath,
                 "/var/lib/sigstore/private",
                 isReadOnly: true)
             .WithBindMount(
-                Path.Combine(statePath, "public"),
+                activePublicPath,
                 "/var/lib/sigstore/public",
                 isReadOnly: true)
             .WithBindMount(
@@ -171,11 +183,11 @@ public static class SigstoreResourceBuilderExtensions
                 "--add-host",
                 "oidc-sigstore.dev.localhost:host-gateway")
             .WithBindMount(
-                Path.Combine(statePath, "private"),
+                activePrivatePath,
                 "/var/lib/sigstore/private",
                 isReadOnly: true)
             .WithBindMount(
-                Path.Combine(statePath, "public"),
+                activePublicPath,
                 "/var/lib/sigstore/public",
                 isReadOnly: true)
             .WithBindMount(
@@ -231,11 +243,11 @@ public static class SigstoreResourceBuilderExtensions
                 Path.Combine(sourcePath, "Sigstore.Timestamp"))
             .WithContainerRuntimeArgs("--user", "root")
             .WithBindMount(
-                Path.Combine(statePath, "private"),
+                activePrivatePath,
                 "/var/lib/sigstore/private",
                 isReadOnly: true)
             .WithBindMount(
-                Path.Combine(statePath, "public"),
+                activePublicPath,
                 "/var/lib/sigstore/public",
                 isReadOnly: true)
             .WithArgs(
@@ -270,7 +282,7 @@ public static class SigstoreResourceBuilderExtensions
                 "v2.3.0@sha256:a5ceeff41b2468f965f7259685a9553c6dbba6870108ffebfa6584df5ae22504")
             .WithContainerRuntimeArgs("--user", "root")
             .WithBindMount(
-                Path.Combine(statePath, "private"),
+                activePrivatePath,
                 "/var/lib/sigstore/private",
                 isReadOnly: true)
             .WithBindMount(

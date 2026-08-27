@@ -93,7 +93,8 @@ func main() {
 }
 
 func buildSigstoreTargets(statePath string, bootstrap bootstrapManifest) ([]tufTarget, error) {
-	fulcioPEM, err := os.ReadFile(filepath.Join(statePath, "public", "fulcio", "root.pem"))
+	activeGenerationPath := filepath.Join(statePath, "active-generation")
+	fulcioPEM, err := os.ReadFile(filepath.Join(activeGenerationPath, "public", "fulcio", "root.pem"))
 	if err != nil {
 		return nil, fmt.Errorf("read Fulcio root: %w", err)
 	}
@@ -106,16 +107,20 @@ func buildSigstoreTargets(statePath string, bootstrap bootstrapManifest) ([]tufT
 		return nil, fmt.Errorf("parse Fulcio root: %w", err)
 	}
 
-	ctPEM, ctDER, err := loadP256PublicKey(filepath.Join(statePath, "public", "ctlog", "pubkey.pem"))
+	ctPEM, ctDER, err := loadP256PublicKey(
+		filepath.Join(activeGenerationPath, "public", "ctlog", "pubkey.pem"),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("load CT log key: %w", err)
 	}
-	rekorPEM, rekorDER, err := loadP256PublicKey(filepath.Join(statePath, "public", "rekor", "signer.pub"))
+	rekorPEM, rekorDER, err := loadP256PublicKey(
+		filepath.Join(activeGenerationPath, "public", "rekor", "signer.pub"),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("load Rekor key: %w", err)
 	}
 	tsaChainPEM, tsaCertificates, err := loadCertificateChain(
-		filepath.Join(statePath, "public", "tsa", "cert-chain.pem"))
+		filepath.Join(activeGenerationPath, "public", "tsa", "cert-chain.pem"))
 	if err != nil {
 		return nil, fmt.Errorf("load TSA certificate chain: %w", err)
 	}
@@ -379,21 +384,6 @@ func refreshTUFRepository(tufPath string) error {
 		return fmt.Errorf("commit refreshed TUF metadata: %w", err)
 	}
 	return nil
-}
-
-func loadBootstrapManifest(path string) (bootstrapManifest, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return bootstrapManifest{}, fmt.Errorf("read bootstrap manifest: %w", err)
-	}
-	var manifest bootstrapManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return bootstrapManifest{}, fmt.Errorf("parse bootstrap manifest: %w", err)
-	}
-	if manifest.SchemaVersion < 4 {
-		return bootstrapManifest{}, fmt.Errorf("bootstrap schema %d does not include the required Sigstore state", manifest.SchemaVersion)
-	}
-	return manifest, nil
 }
 
 func fingerprintSource(bootstrap bootstrapManifest) (string, error) {
