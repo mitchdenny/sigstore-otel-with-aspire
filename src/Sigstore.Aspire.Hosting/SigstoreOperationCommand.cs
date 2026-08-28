@@ -470,6 +470,7 @@ internal sealed class SigstoreOperationExecutor(
             "Validating current trust, OIDC, and Fulcio state for OIDC key rotation.");
 
         SigstoreOperationSnapshot before;
+        SigstoreOperationSnapshot after = default!;
         SigstoreResourceInstanceSnapshot workerBefore;
         SigstoreResourceInstanceSnapshot oidcBefore;
         SigstoreResourceInstanceSnapshot fulcioBefore;
@@ -477,8 +478,9 @@ internal sealed class SigstoreOperationExecutor(
         string? oldTokenKid = null;
         string? beforeOidcKeyId = null;
         string? afterOidcKeyId = null;
+        bool forwardComplete = false;
 
-        ExecuteCommandResult workerStart;
+        ExecuteCommandResult workerStart = new() { Success = true };
         using (stateInspector.AcquireLock(
             resource.StatePath,
             "dashboard-rotate-oidc-preflight"))
@@ -549,6 +551,25 @@ internal sealed class SigstoreOperationExecutor(
                 "capture-old-token",
                 resource.Components.Oidc.Resource.Name);
 
+            // Forward-complete detection: if a prior rotation completed at the
+            // worker level (generation advanced, completion file exists) but this
+            // command crashed before restarting OIDC, skip directly to restart.
+            var completionPath = Path.Combine(
+                resource.StatePath, "rotate-oidc-signing-key.completed");
+            if (File.Exists(completionPath) && before.Tuf.Trust.Generation > 1)
+            {
+                afterOidcKeyId = ReadOidcKeyIdFromManifest(resource.StatePath);
+                if (afterOidcKeyId != null && afterOidcKeyId != oldTokenKid)
+                {
+                    forwardComplete = true;
+                    await execution.ReportAsync(
+                        "forward-complete", 2,
+                        "Detected prior incomplete rotation; forwarding to OIDC restart.");
+                }
+            }
+
+            if (!forwardComplete)
+            {
             // Phase 2: Write signal file.
             await execution.ReportAsync(
                 "write-signal", 2,
@@ -589,8 +610,11 @@ internal sealed class SigstoreOperationExecutor(
                 resource.Components.TufBootstrap.Resource,
                 KnownResourceCommands.StartCommand,
                 workerCritical.Token);
+            } // end if (!forwardComplete) inside lock
         }
 
+        if (!forwardComplete)
+        {
         if (!workerStart.Success)
         {
             execution.AddError("start-worker",
@@ -637,7 +661,6 @@ internal sealed class SigstoreOperationExecutor(
         await execution.ReportAsync(
             "postconditions", 5,
             "Validating generation advance and new OIDC key ID.");
-        SigstoreOperationSnapshot after;
         using (stateInspector.AcquireLock(resource.StatePath,
             "dashboard-rotate-oidc-postconditions"))
         {
@@ -666,8 +689,17 @@ internal sealed class SigstoreOperationExecutor(
             before.Tuf.Trust.SigningConfigSha256, after.Tuf.Trust.SigningConfigSha256);
         if (execution.HasFailures)
             return execution.Failure("OIDC rotation postconditions failed.");
+        } // end if (!forwardComplete)
 
         // Phase 6: Restart OIDC.
+        // Ensure post-rotation state is captured (needed for forward-complete path).
+        if (execution.After == null)
+        {
+            using var postFwd = new CancellationTokenSource(WorkerTimeout);
+            after = await CaptureAsync(postFwd.Token);
+            execution.After = after;
+            afterOidcKeyId ??= ReadOidcKeyIdFromManifest(resource.StatePath);
+        }
         await execution.ReportAsync("restart-oidc", 6,
             "Restarting OIDC issuer to activate new signing key.");
         var oidcRestart = await runtime.ExecuteCommandAsync(

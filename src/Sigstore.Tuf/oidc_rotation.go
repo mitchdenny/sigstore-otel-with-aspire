@@ -33,19 +33,32 @@ type oidcRotationRequest struct {
 
 // oidcRotationCompletion records that OIDC rotation completed successfully.
 type oidcRotationCompletion struct {
-	SchemaVersion      int       `json:"schemaVersion"`
-	OperationID        string    `json:"operationId"`
-	TrustDomainID      string    `json:"trustDomainId"`
-	CompletedAt        time.Time `json:"completedAtUtc"`
-	PriorGeneration    int       `json:"priorGeneration"`
-	PriorGenerationID  string    `json:"priorGenerationId"`
-	PriorOidcKeyID     string    `json:"priorOidcKeyId"`
-	NewGeneration      int       `json:"newGeneration"`
-	NewGenerationID    string    `json:"newGenerationId"`
-	NewOidcKeyID       string    `json:"newOidcKeyId"`
-	ManifestSHA256     string    `json:"manifestSha256"`
-	JwksKeyIDs         []string  `json:"jwksKeyIds"`
+	SchemaVersion        int       `json:"schemaVersion"`
+	OperationID          string    `json:"operationId"`
+	TrustDomainID        string    `json:"trustDomainId"`
+	CompletedAt          time.Time `json:"completedAtUtc"`
+	PriorGeneration      int       `json:"priorGeneration"`
+	PriorGenerationID    string    `json:"priorGenerationId"`
+	PriorOidcKeyID       string    `json:"priorOidcKeyId"`
+	NewGeneration        int       `json:"newGeneration"`
+	NewGenerationID      string    `json:"newGenerationId"`
+	NewOidcKeyID         string    `json:"newOidcKeyId"`
+	ManifestSHA256       string    `json:"manifestSha256"`
+	JwksKeyIDs           []string  `json:"jwksKeyIds"`
+	TokenLifetimeSeconds int       `json:"tokenLifetimeSeconds"`
+	OverlapExpiresAt     time.Time `json:"overlapExpiresAtUtc"`
+	PublicationID        string    `json:"publicationId"`
 }
+
+const (
+	// oidcTokenLifetimeSeconds is the configured OIDC token lifetime (5 min).
+	oidcTokenLifetimeSeconds = 300
+	// oidcClockSkewSeconds is allowed clock drift for token validation.
+	oidcClockSkewSeconds = 30
+	// oidcMaxJwksKeys bounds the number of keys retained in overlapping JWKS.
+	// Current active + at most 2 historical (one overlap + one retained).
+	oidcMaxJwksKeys = 3
+)
 
 // jwk represents a single RSA public key in JWK format.
 type jwk struct {
@@ -167,19 +180,33 @@ func dispatchOidcRotationWithHooks(statePath string, hooks publicationHooks) (re
 	}
 
 	// Write completion atomically.
+	now := time.Now().UTC()
+	overlapExpires := now.Add(time.Duration(oidcTokenLifetimeSeconds+oidcClockSkewSeconds) * time.Second)
+
+	// Read final publication ID.
+	layout := newTUFLayout(statePath)
+	finalState, _ := loadPublicationState(layout)
+	publicationID := ""
+	if finalState.Active != nil {
+		publicationID = finalState.Active.ID
+	}
+
 	newComp := oidcRotationCompletion{
-		SchemaVersion:     oidcRotationCompletionSchema,
-		OperationID:       req.OperationID,
-		TrustDomainID:     req.TrustDomainID,
-		CompletedAt:       time.Now().UTC(),
-		PriorGeneration:   bootstrap.Generation,
-		PriorGenerationID: bootstrap.GenerationID,
-		PriorOidcKeyID:    bootstrap.OIDCKeyID,
-		NewGeneration:     newBootstrap.Generation,
-		NewGenerationID:   newBootstrap.GenerationID,
-		NewOidcKeyID:      newBootstrap.OIDCKeyID,
-		ManifestSHA256:    newBootstrap.GenerationManifestSHA256,
-		JwksKeyIDs:        jwksKeyIDs,
+		SchemaVersion:        oidcRotationCompletionSchema,
+		OperationID:          req.OperationID,
+		TrustDomainID:        req.TrustDomainID,
+		CompletedAt:          now,
+		PriorGeneration:      bootstrap.Generation,
+		PriorGenerationID:    bootstrap.GenerationID,
+		PriorOidcKeyID:       bootstrap.OIDCKeyID,
+		NewGeneration:        newBootstrap.Generation,
+		NewGenerationID:      newBootstrap.GenerationID,
+		NewOidcKeyID:         newBootstrap.OIDCKeyID,
+		ManifestSHA256:       newBootstrap.GenerationManifestSHA256,
+		JwksKeyIDs:           jwksKeyIDs,
+		TokenLifetimeSeconds: oidcTokenLifetimeSeconds,
+		OverlapExpiresAt:     overlapExpires,
+		PublicationID:        publicationID,
 	}
 	if err := writeOidcRotationCompletion(statePath, newComp); err != nil {
 		return "", err
@@ -282,7 +309,7 @@ func rotateOidcGeneration(statePath string, current bootstrapManifest) (bootstra
 		return bootstrapManifest{}, fmt.Errorf("write new OIDC public key: %w", err)
 	}
 
-	// Build overlapping JWKS containing new key + all prior keys.
+	// Build overlapping JWKS containing new key + retained prior keys.
 	existingJwksData, err := os.ReadFile(filepath.Join(currentGenerationPath, "public", "oidc", "jwks.json"))
 	if err != nil {
 		_ = os.RemoveAll(newGenerationPath)
@@ -297,10 +324,22 @@ func rotateOidcGeneration(statePath string, current bootstrapManifest) (bootstra
 	// Create new JWK entry for the new key.
 	newJWK := rsaPublicKeyToJWK(&newKey.PublicKey, newKid)
 
-	// Overlapping JWKS: new key first, then all existing keys.
+	// Apply bounded retention: keep keys whose overlap hasn't expired,
+	// up to oidcMaxJwksKeys total (including the new active key).
+	retainedKeys := retainJwksKeys(existingJwks.Keys, statePath, oidcMaxJwksKeys-1)
+
+	// Overlapping JWKS: new active key first, then retained historical keys.
 	overlappingJwks := jwks{
-		Keys: append([]jwk{newJWK}, existingJwks.Keys...),
+		Keys: append([]jwk{newJWK}, retainedKeys...),
 	}
+
+	// Remove private keys for retired public keys.
+	retainedKids := map[string]bool{newKid: true}
+	for _, k := range retainedKeys {
+		retainedKids[k.Kid] = true
+	}
+	retireExpiredPrivateKeys(retainedDir, retainedKids)
+
 	overlappingJwksData, err := json.MarshalIndent(overlappingJwks, "", "  ")
 	if err != nil {
 		_ = os.RemoveAll(newGenerationPath)
@@ -730,4 +769,57 @@ func mustMarshalPKCS8(key *rsa.PrivateKey) []byte {
 		panic(fmt.Sprintf("marshal PKCS#8: %v", err))
 	}
 	return data
+}
+
+// retainJwksKeys applies bounded retention policy to existing JWKS keys.
+// It retains keys that still have unexpired overlap (based on prior completion
+// record), up to maxRetained total. Keys are kept in order (most recent first).
+func retainJwksKeys(existingKeys []jwk, statePath string, maxRetained int) []jwk {
+	if len(existingKeys) == 0 {
+		return nil
+	}
+
+	// Load prior completion to check overlap expiry.
+	comp, err := loadOidcRotationCompletion(statePath)
+	now := time.Now().UTC()
+
+	var retained []jwk
+	for _, k := range existingKeys {
+		if len(retained) >= maxRetained {
+			break
+		}
+		// If we have a completion record and this key's overlap has expired,
+		// retire it (don't include in new JWKS).
+		if err == nil && comp != nil && !comp.OverlapExpiresAt.IsZero() {
+			// The prior completion's OverlapExpiresAt covers the PRIOR active key.
+			// If this key is the prior active key and overlap expired, retire.
+			if k.Kid == comp.PriorOidcKeyID && now.After(comp.OverlapExpiresAt) {
+				continue
+			}
+		}
+		retained = append(retained, k)
+	}
+	return retained
+}
+
+// retireExpiredPrivateKeys removes private key files from the retained directory
+// that are no longer needed (their public key was retired from JWKS).
+func retireExpiredPrivateKeys(retainedDir string, activeKids map[string]bool) {
+	entries, err := os.ReadDir(retainedDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		// Extract kid from filename: signer-<kid>.key
+		name := entry.Name()
+		if len(name) > 11 && name[:7] == "signer-" && name[len(name)-4:] == ".key" {
+			kid := name[7 : len(name)-4]
+			if !activeKids[kid] {
+				_ = os.Remove(filepath.Join(retainedDir, name))
+			}
+		}
+	}
 }
