@@ -125,6 +125,16 @@ func main() {
 		return
 	}
 
+	tsaRotationRequest := filepath.Join(statePath, tsaRotationRequestFile)
+	if pathExists(tsaRotationRequest) {
+		action, err := dispatchTsaRotation(statePath)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		fmt.Printf("%s Sigstore TUF repository at %s.\n", action, filepath.Join(statePath, "tuf"))
+		return
+	}
+
 	rotationRequest := filepath.Join(statePath, "rotate-root.request")
 	if pathExists(rotationRequest) {
 		action, err := rotateTUFRootKey(statePath)

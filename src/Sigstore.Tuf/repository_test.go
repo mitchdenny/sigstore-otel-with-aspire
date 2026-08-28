@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/youmark/pkcs8"
 )
 
 func TestInitialCreationUsesStableLayoutAndVersionOneBootstrap(t *testing.T) {
@@ -1010,7 +1013,7 @@ func newTestState(t *testing.T) string {
 		NotAfter:              createdAt.AddDate(1, 0, 0),
 		IsCA:                  true,
 		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 	}
 	tsaRootDER := createTestCertificate(
 		t,
@@ -1027,22 +1030,39 @@ func newTestState(t *testing.T) string {
 	tsaLeafDER := createTestCertificate(
 		t,
 		&x509.Certificate{
-			SerialNumber: big.NewInt(3),
-			Subject:      pkix.Name{Organization: []string{"Test TSA"}, CommonName: "TSA Leaf"},
-			NotBefore:    createdAt.Add(-time.Hour),
-			NotAfter:     createdAt.AddDate(0, 6, 0),
-			KeyUsage:     x509.KeyUsageDigitalSignature,
-			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping},
+			SerialNumber:          big.NewInt(3),
+			Subject:               pkix.Name{Organization: []string{"Test TSA"}, CommonName: "TSA Leaf"},
+			NotBefore:             createdAt.Add(-time.Hour),
+			NotAfter:              createdAt.AddDate(0, 6, 0),
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageTimeStamping},
+			ExtraExtensions: []pkix.Extension{
+				mustMarshalCriticalTimestampingEKU(t),
+			},
 		},
 		tsaRootCertificate,
 		tsaLeafKey,
 		tsaRootKey,
 	)
-	tsaChain := append(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tsaLeafDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tsaRootDER})...,
-	)
+	tsaRootPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tsaRootDER})
+	tsaLeafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tsaLeafDER})
+	tsaChain := append(append([]byte{}, tsaLeafPEM...), tsaRootPEM...)
 	writeTestFile(t, filepath.Join(generationPath, "public", "tsa", "cert-chain.pem"), tsaChain)
+	writeTestFile(t, filepath.Join(generationPath, "public", "tsa", "root.pem"), tsaRootPEM)
+	writeTestFile(t, filepath.Join(generationPath, "public", "tsa", "leaf.pem"), tsaLeafPEM)
+	tsaPassword := []byte("test-tsa-password")
+	writeTestFile(t, filepath.Join(generationPath, "private", "tsa", "password"), tsaPassword)
+	writeTestFile(
+		t,
+		filepath.Join(generationPath, "private", "tsa", "root.key"),
+		mustMarshalEncryptedECDSAKey(t, tsaRootKey, tsaPassword),
+	)
+	writeTestFile(
+		t,
+		filepath.Join(generationPath, "private", "tsa", "signer.key"),
+		mustMarshalEncryptedECDSAKey(t, tsaLeafKey, tsaPassword),
+	)
 	writeTestFile(t, filepath.Join(generationPath, "private", "test.key"), []byte("test private material\n"))
 	oidcKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -1266,6 +1286,37 @@ func writeTestFile(t *testing.T, path string, data []byte) {
 func testHash(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// mustMarshalCriticalTimestampingEKU builds a raw, critical extended-key-usage
+// extension containing only id-kp-timeStamping, matching the criticality the
+// TSA rotation worker requires from real timestamping leaf certificates
+// (crypto/x509's ExtKeyUsage template field always marshals as non-critical).
+func mustMarshalCriticalTimestampingEKU(t *testing.T) pkix.Extension {
+	t.Helper()
+	value, err := asn1.Marshal([]asn1.ObjectIdentifier{
+		{1, 3, 6, 1, 5, 5, 7, 3, 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pkix.Extension{
+		Id:       asn1.ObjectIdentifier{2, 5, 29, 37},
+		Critical: true,
+		Value:    value,
+	}
+}
+
+// mustMarshalEncryptedECDSAKey encrypts an ECDSA private key into PEM-wrapped
+// PKCS#8 using the same AES-256/PBES2 encoding the TSA rotation worker
+// decrypts via github.com/youmark/pkcs8.
+func mustMarshalEncryptedECDSAKey(t *testing.T, key *ecdsa.PrivateKey, password []byte) []byte {
+	t.Helper()
+	der, err := pkcs8.MarshalPrivateKey(key, password, pkcs8.DefaultOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: der})
 }
 
 func countRootKeyStoreEntries(t *testing.T, repoPath string) int {

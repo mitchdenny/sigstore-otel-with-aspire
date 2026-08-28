@@ -123,4 +123,6 @@ internal static class SigstoreDefaults
     public const string ExpectedIdentity = "demo@sigstore.local";
     public const string ExpectedIssuer =
         "https://oidc-sigstore.dev.localhost:7443";
+    public const string TimestampAuthorityUrl =
+        "http://timestamp-sigstore.dev.localhost:3004/api/v1/timestamp";
 }

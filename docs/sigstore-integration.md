@@ -1003,6 +1003,8 @@ health condition fails the parent command.
 
 ## Step 10: Implement timestamp-authority rotation
 
+**Status: Implemented**
+
 ### Scope
 
 - Generate a new TSA chain and signer.
@@ -1016,6 +1018,164 @@ health condition fails the parent command.
 - New artifacts use the new TSA certificate.
 - All clients verify artifacts from both generations.
 - Failure before activation leaves the old signer active.
+
+### Implementation
+
+`rotate-timestamp-authority` is a confirmed, non-cancelable parent command with
+the same in-process contention gate and shared `state.lock` used by Steps 3-9.
+Its schema-versioned result contains the old/new generation and TSA
+fingerprints, TUF publication identity, every client convergence record,
+timestamp lifecycle identity, RFC3161 evidence, postconditions, and recovery
+errors.
+
+The AppHost first issues a nonce-bound RFC3161 request to the running timestamp
+service. It verifies the CMS signature and message imprint, validates the
+returned leaf against the active TSA root, and stores the exact request and
+response under `tsa-rotation/<operation-id>/` with mode `0600`. Candidate
+generation uses the bootstrapper's existing ECDSA P-256, SHA-256, encrypted
+PKCS#8, AES-256/PBES2, and random-password profile. The candidate has:
+
+```text
+tsa-rotation/<operation-id>/
+|-- command.json
+|-- old-request.tsq
+|-- old-response.tsr
+`-- candidate/
+    |-- private/tsa/                 # removed after worker completion
+    |   |-- signer.key
+    |   `-- password
+    `-- public/tsa/
+        |-- root.pem
+        |-- leaf.pem
+        `-- cert-chain.pem
+```
+
+The TSA root private key exists only while the candidate is being built and
+validated. Generation N+1 contains only the active signer and password in its
+private TSA subtree. It copies every non-TSA file from N byte-for-byte,
+replaces the TSA subtree, writes exact operation/prior-generation fingerprints
+to the immutable manifest, and retains generation N unchanged.
+
+The Go worker owns the durable mutation while holding `state.lock`:
+
+1. Strictly validate the request, candidate profile, old active chain, manifest
+   binding, and any replay state.
+2. Commit immutable generation N+1 without changing `active-generation`.
+3. Clone the active TUF publication, append the new chain to
+   `TrustedRoot.TimestampAuthorities`, preserve every existing Fulcio, CT,
+   Rekor, standby, and historical TSA entry, and retain
+   `signing_config.v0.2.json` byte-for-byte.
+4. Rebuild `client_trust_config.json`, replace only the current TSA alias
+   targets, update `trust_status.v1.json`, and advance targets, snapshot, and
+   timestamp through the existing preparing/committed publication transaction.
+   TUF root and `bootstrap/root.json` remain unchanged.
+5. Switch `active-generation` through the trust-transition journal only after
+   the additive TUF publication commits.
+6. Atomically write the operation-bound worker completion, remove the request,
+   retire candidate private material, and retain only its public chain as
+   journal evidence.
+
+The old timestamp process continues using its prior in-memory signer throughout
+publication. The parent proves that old signer is still running, restarts the
+six clients in deterministic name order, and requires each `/trust/status` to
+match generation N+1 and the additive TrustedRoot hash. It then writes the
+`clients-converged` checkpoint and restarts only `timestamp`. OIDC, Fulcio,
+Tesseract, Rekor server/proxy, TUF nginx, and `shady-blob-store` are protected
+by exact container ID and start-time postconditions.
+
+The timestamp container now bind-mounts the stable state root at
+`/var/lib/sigstore`; both the entrypoint password and server key/chain arguments
+resolve through `/var/lib/sigstore/active-generation/...` inside the replacement
+container. A post-restart RFC3161 request must be signed by the N+1 leaf and
+validate to the new trusted root. `--include-chain-in-response=false` remains
+unchanged; the response includes the signing leaf requested by the client while
+verification obtains roots from additive TrustedRoot.
+
+### Recovery and status
+
+Candidate generation, TUF preparing/commit, generation switch, each client
+convergence, timestamp restart, old/new RFC3161 proof, and final completion are
+durable replay boundaries. Before TUF activation, recovery removes only known
+unjournaled scratch and keeps the old signer active. After TUF activation it
+always completes forward. A replay checks live client status before restarting,
+so already converged clients are not restarted again. It probes the live TSA
+before issuing the service command; if the new signer and a replacement
+container are already present after all recorded client start times, the second
+restart is suppressed. Any mismatched operation ID, fingerprint, generation,
+publication, container ordering, or file hash fails loudly.
+
+While additive trust is committed but activation is incomplete, the parent
+shows `TSA Activation Pending` (or `TSA Verification Pending`) and disables
+unrelated mutation commands. The TSA command remains available for recovery.
+The read-only `status` command parses and validates every TSA chain in
+TrustedRoot, exposes the active and running root/leaf identities, and remains
+degraded until the running RFC3161 signer matches the active generation.
+
+### Known limitation
+
+The existing sigstore-python rejection of a bundle whose protobuf JSON omits an
+index-zero enum remains out of scope. Rotation does not alter or normalize
+bundle serialization; live validation reports the issue if that producer wins
+the affected artifact instead of masking it.
+
+### Validation evidence
+
+Validated non-isolated on `2026-08-28` at implementation commit
+`c004227be74bef3514c9656535a80dd20c172d09` with Aspire SDK `13.5.2`.
+
+- `rotate-timestamp-authority` completed generation `1` to `2` with all `48`
+  structured postconditions passing. The old TSA root/leaf fingerprints were
+  `27a504e148b89b91f0a5474c19d34338ad296f74a0a0f00573a0faf497d3b81c`
+  and
+  `27bcd224b5f51b030fd30be66ce45bdb9171fd359b42c721abcb91a9dbfa3dad`;
+  the new fingerprints were
+  `edbfba70454f7fc7d31552c7e5f03158c71c6fe3be6991995ce0a91bf9287cc7`
+  and
+  `4dee58e997fe76c0a7f54db8230ce8e946fba90b76b1eef645e10e7c6d7c391f`.
+  Pre- and post-activation RFC3161 responses validated to those exact chains.
+- TrustedRoot advanced from
+  `fa0d7fb9c26eebe5a952c54d70a3b5e891eadf3a051633ee954f1735b3b948bf`
+  to
+  `c999c72cdd0612943955787bc81241141816f345270c43a6e6f77129ee698673`
+  and contained the old chain followed by the new chain. SigningConfig stayed
+  byte-identical at
+  `fadd7279f1ea31f67a21a4b5af57398ee726a06c53a8ddcc044a839d26536916`.
+  Root/bootstrap stayed version `1` at
+  `f6ad1c1b703ce51ca59181b838726596fde8866203c15525ba72e4e9e3b5820b`.
+  Targets, snapshot, and timestamp advanced `1` to `2`.
+- The six clients restarted and converged in sorted order before timestamp.
+  Timestamp then changed exactly once from container
+  `7e56cf69cdf8c8582d261e81abf3119814b28f60f6eaa849605ba20b15bc6267`
+  to
+  `e61d31a11e00a660331d31e258e5d45d6d49362f9495ae11657087ec6e7b8487`.
+  OIDC, Fulcio, Tesseract, Rekor server/proxy, TUF nginx, and
+  `shady-blob-store` retained their exact pre-operation container IDs and start
+  times.
+- Artifact `315` was retained before rotation; its RFC3161 response contained
+  exactly one certificate, preserving `include-chain-in-response=false`, and
+  its signer fingerprint matched the old leaf. Post-activation artifact `382`
+  identified the new leaf by its CMS issuer/serial and matched the active leaf
+  certificate. .NET, Go, Java, JavaScript, and Rust normal validators each
+  verified both IDs after restart. The normal Python validator visibly remained
+  blocked at artifact `1` by the documented omitted-index-zero fields; a
+  targeted verification inside the same restarted Python container, using the
+  same generation-2 TUF trust, verified both `315` and `382`. No bundle bytes
+  were changed and no public Sigstore endpoint appeared in any client log.
+- Active `private/tsa` contained exactly `signer.key` and `password`; the
+  operation candidate private directory and request were absent after
+  completion. Immutable generation `1` retained its original root, signer, and
+  password. Status finished `Healthy`, `14/14`, with no operation/recovery
+  marker, two trusted TSA entries, the new running signer, and all clients on
+  generation `2`.
+- Focused and regression validation passed all `33` Bootstrap tests, all `27`
+  Hosting tests, `53` top-level TUF/Go tests plus their fault-injection
+  subtests, `go vet`, AppHost and .NET client builds, and Go, JavaScript,
+  Python-container, Java-container-build, and Rust client tests. Runtime state
+  remained ignored under `.sigstore` and `.shady-blob-store`; `git diff --check`
+  passed.
+
+**Validation gate status: passed, with the documented Python index-zero
+limitation reported rather than masked.**
 
 ## Step 11: Implement Fulcio CA rotation
 

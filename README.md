@@ -127,6 +127,13 @@ The trust-domain identity is separate from its active key generation:
 |       `-- manifest.json
 |-- transition/
 |   `-- state.json
+|-- tsa-rotation/
+|   `-- <operation-id>/
+|       |-- command.json
+|       |-- old-request.tsq
+|       |-- old-response.tsr
+|       `-- candidate/public/           # public chain evidence retained
+|-- rotate-timestamp-authority.completed
 |-- migration/
 |   `-- bootstrap-manifest.schema-4.json  # migrated state only
 |-- data/
@@ -318,6 +325,14 @@ six client payloads. Missing, malformed, stale, unreachable, or inconsistent
 data produces a nonzero command result with explicit entries in `errors`; it
 does not return fallback values.
 
+The aggregate payload also includes `timestampAuthority`: the active
+generation's root/leaf fingerprints, every ordered TrustedRoot TSA entry, the
+fingerprints from a freshly verified RFC3161 response, and
+`activeSignerMatches`. During a command it includes the active operation phase;
+after an interrupted mutation it includes the durable recovery phase. A
+running old signer against already-published additive trust is reported
+explicitly as activation pending rather than Healthy.
+
 The parent state is event-driven and aggregates all 14 long-running resources:
 the seven Sigstore services, `shady-blob-store`, and six clients. It shows
 **Healthy** only when all 14 are running and healthy, **Starting** while initial
@@ -327,13 +342,16 @@ the parent to **Healthy** without changing trust state.
 
 ## Dashboard operations
 
-The parent also exposes three confirmed, progress-reporting operations in the
+The parent also exposes six confirmed, progress-reporting operations in the
 dashboard and through the Aspire CLI:
 
 ```bash
 aspire resource sigstore refresh-tuf | jq
 aspire resource sigstore restart-clients | jq
 aspire resource sigstore rotate-tuf-root | jq
+aspire resource sigstore publish-trusted-root | jq
+aspire resource sigstore rotate-oidc-signing-key | jq
+aspire resource sigstore rotate-timestamp-authority | jq
 ```
 
 `refresh-tuf` starts a new instance of the existing `tuf-bootstrap` one-shot
@@ -459,3 +477,55 @@ keys; repeated rotations grow JWKS history rather than retiring keys. The
 overlap deadline recorded in the generation is the minimum token TTL plus
 clock-skew safety window, not a deletion trigger. Retirement is a separate
 future policy and is not performed by this command.
+
+## Timestamp-Authority Rotation (Step 10)
+
+The `rotate-timestamp-authority` command replaces the local RFC3161 signer
+without creating a trust gap:
+
+```bash
+aspire resource sigstore rotate-timestamp-authority
+```
+
+The confirmed, non-cancelable operation captures and durably validates a real
+timestamp from the old signer, generates a new ECDSA P-256 root/leaf/signer
+candidate, and dispatches the existing TUF one-shot worker. The worker creates
+immutable generation N+1, appends the new TSA chain to `TrustedRoot`, preserves
+every prior trust entry, and transactionally advances targets, snapshot, and
+timestamp metadata. The TUF bootstrap root and `SigningConfig` bytes, including
+the canonical TSA URL, remain unchanged.
+
+Activation is intentionally asymmetric. The old timestamp container keeps
+signing from its in-memory key while all six clients restart and report the
+additive N+1 trust. Only after every client converges does the command restart
+`timestamp` exactly once. OIDC, Fulcio, Tesseract, Rekor, TUF nginx, and the
+artifact store retain their original container identities. The timestamp
+container mounts the stable state root and resolves
+`active-generation/private/tsa` and `active-generation/public/tsa` when its
+replacement starts, so Docker cannot pin the replacement to the old
+generation.
+
+Both the worker completion and AppHost command journal are operation-bound.
+Before TUF activation, replay regenerates or reuses the candidate and leaves the
+old signer active. Once additive TUF trust commits, recovery completes forward:
+it resumes partial client convergence, suppresses a duplicate timestamp restart
+when a new-signer RFC3161 probe proves activation already occurred, revalidates
+the retained old response, and writes the final journal. Hash-mismatched or
+ambiguously ordered state fails instead of being guessed.
+
+Rotated active generations contain only `private/tsa/signer.key` and its
+password plus the current public chain; candidate private material is retired
+after completion while its public chain remains as journal evidence. Prior
+generation directories remain immutable. `status` parses every TSA entry in the
+served `TrustedRoot`, probes the running signer, and reports
+`TSA Activation Pending` until disk, served TUF, all clients, and the live
+leaf/root identity agree.
+
+The Step 10 validation run advanced generation `1` to `2`, retained both TSA
+chains, passed all `48` command postconditions, changed the timestamp container
+exactly once after all six client replacements, and left every unrelated
+service container unchanged. All six language stacks verified retained
+old-TSA artifact `315` and new-TSA artifact `382`; Python required a targeted
+verification in its restarted container because its normal sequential worker
+remained visibly blocked by the known omitted-index-zero bundle parsing issue.
+Rotation does not rewrite that bundle or use a public Sigstore fallback.

@@ -24,3 +24,12 @@ internal sealed record BootstrapResult(
     BootstrapAction Action,
     TrustDomainManifest TrustDomain,
     GenerationManifest Generation);
+
+internal sealed record TimestampAuthorityMaterialInfo(
+    string RootSha256,
+    string LeafSha256,
+    string SignerPublicKeySha256,
+    string CertificateChainSha256,
+    bool HasRootPrivateKey,
+    DateTimeOffset NotBeforeUtc,
+    DateTimeOffset NotAfterUtc);

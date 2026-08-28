@@ -48,6 +48,11 @@ type generationManifest struct {
 	OIDCPriorKeyID              string            `json:"oidcPriorKeyId,omitempty"`
 	OIDCOverlapExpiresAtUTC     *time.Time        `json:"oidcOverlapExpiresAtUtc,omitempty"`
 	OIDCRetainedPrivateKeyPaths []string          `json:"oidcRetainedPrivateKeyPaths,omitempty"`
+	TSARotationOperationID      string            `json:"tsaRotationOperationId,omitempty"`
+	TSAPriorGeneration          int               `json:"tsaPriorGeneration,omitempty"`
+	TSAPriorGenerationID        string            `json:"tsaPriorGenerationId,omitempty"`
+	TSAPriorRootSHA256          string            `json:"tsaPriorRootSha256,omitempty"`
+	TSAPriorLeafSHA256          string            `json:"tsaPriorLeafSha256,omitempty"`
 	Files                       map[string]string `json:"files"`
 }
 
@@ -300,6 +305,9 @@ func validateGenerationState(
 	}
 	if err := validateOIDCGenerationMaterial(generationPath, generation); err != nil {
 		return fmt.Errorf("validate OIDC generation material: %w", err)
+	}
+	if err := validateTSAGenerationMaterial(generationPath, generation); err != nil {
+		return fmt.Errorf("validate TSA generation material: %w", err)
 	}
 	ctState, err := os.ReadFile(filepath.Join(statePath, "data", "ctlog", "bootstrap-state"))
 	if err != nil {

@@ -112,6 +112,16 @@ public static class SigstoreResourceBuilderExtensions
                 commandOptions:
                     SigstoreOidcRotationCommand.CreateOptions(
                         parent.Resource))
+            .WithCommand(
+                name: SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+                displayName: "Rotate Timestamp Authority",
+                executeCommand: context =>
+                    SigstoreTimestampAuthorityRotationCommand.ExecuteAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreTimestampAuthorityRotationCommand.CreateOptions(
+                        parent.Resource))
             .OnInitializeResource(
                (resource, context, cancellationToken) =>
                {
@@ -316,12 +326,8 @@ public static class SigstoreResourceBuilderExtensions
                 Path.Combine(sourcePath, "Sigstore.Timestamp"))
             .WithContainerRuntimeArgs("--user", "root")
             .WithBindMount(
-                activePrivatePath,
-                "/var/lib/sigstore/private",
-                isReadOnly: true)
-            .WithBindMount(
-                activePublicPath,
-                "/var/lib/sigstore/public",
+                statePath,
+                "/var/lib/sigstore",
                 isReadOnly: true)
             .WithArgs(
                 "serve",
@@ -329,8 +335,8 @@ public static class SigstoreResourceBuilderExtensions
                 "--port=3004",
                 "--timestamp-signer=file",
                 "--timestamp-signer-hash=sha256",
-                "--file-signer-key-path=/var/lib/sigstore/private/tsa/signer.key",
-                "--certificate-chain-path=/var/lib/sigstore/public/tsa/cert-chain.pem",
+                "--file-signer-key-path=/var/lib/sigstore/active-generation/private/tsa/signer.key",
+                "--certificate-chain-path=/var/lib/sigstore/active-generation/public/tsa/cert-chain.pem",
                 "--include-chain-in-response=false",
                 "--disable-ntp-monitoring")
             .WithHttpEndpoint(

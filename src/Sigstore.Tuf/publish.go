@@ -562,7 +562,12 @@ func advanceTrustGeneration(statePath string, current bootstrapManifest) (bootst
 			[]string(nil),
 			currentGenerationManifest.OIDCRetainedPrivateKeyPaths...,
 		),
-		Files:                newFiles,
+		TSARotationOperationID: currentGenerationManifest.TSARotationOperationID,
+		TSAPriorGeneration:     currentGenerationManifest.TSAPriorGeneration,
+		TSAPriorGenerationID:   currentGenerationManifest.TSAPriorGenerationID,
+		TSAPriorRootSHA256:     currentGenerationManifest.TSAPriorRootSHA256,
+		TSAPriorLeafSHA256:     currentGenerationManifest.TSAPriorLeafSHA256,
+		Files:                  newFiles,
 	}
 	manifestBytes, err := json.MarshalIndent(genManifest, "", "  ")
 	if err != nil {
@@ -636,9 +641,16 @@ func switchActiveGeneration(statePath string, current bootstrapManifest, newBoot
 	}
 	operation := "generation-advance"
 	transitionID := journal.TransitionID
-	if genManifest.OIDCRotationOperationID != "" {
+	switch {
+	case genManifest.OIDCRotationOperationID != "":
 		operation = "oidc-rotation"
 		transitionID = genManifest.OIDCRotationOperationID
+	case genManifest.TSARotationOperationID != "" &&
+		genManifest.TSAPriorGeneration == current.Generation &&
+		genManifest.TsaRootSHA256 != current.TsaRootSHA256 &&
+		genManifest.TsaLeafSHA256 != current.TsaLeafSHA256:
+		operation = "tsa-rotation"
+		transitionID = genManifest.TSARotationOperationID
 	}
 	now := time.Now().UTC()
 	newJournal := trustTransitionJournal{

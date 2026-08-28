@@ -27,6 +27,11 @@ internal sealed record GenerationManifest(
     string? OidcPriorKeyId,
     DateTimeOffset? OidcOverlapExpiresAtUtc,
     IReadOnlyList<string>? OidcRetainedPrivateKeyPaths,
+    string? TsaRotationOperationId,
+    int TsaPriorGeneration,
+    string? TsaPriorGenerationId,
+    string? TsaPriorRootSha256,
+    string? TsaPriorLeafSha256,
     SortedDictionary<string, string> Files);
 
 internal sealed record GenerationReference(
