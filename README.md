@@ -516,6 +516,16 @@ ambiguously ordered state fails instead of being guessed.
 Rotated active generations contain only `private/tsa/signer.key` and its
 password plus the current public chain; candidate private material is retired
 after completion while its public chain remains as journal evidence. Prior
-generation directories remain immutable. `status` parses every TSA entry in the served `TrustedRoot`, probes
-the running signer, and reports `TSA Activation Pending` until disk, served TUF,
-all clients, and the live leaf/root identity agree.
+generation directories remain immutable. `status` parses every TSA entry in the
+served `TrustedRoot`, probes the running signer, and reports
+`TSA Activation Pending` until disk, served TUF, all clients, and the live
+leaf/root identity agree.
+
+The Step 10 validation run advanced generation `1` to `2`, retained both TSA
+chains, passed all `48` command postconditions, changed the timestamp container
+exactly once after all six client replacements, and left every unrelated
+service container unchanged. All six language stacks verified retained
+old-TSA artifact `315` and new-TSA artifact `382`; Python required a targeted
+verification in its restarted container because its normal sequential worker
+remained visibly blocked by the known omitted-index-zero bundle parsing issue.
+Rotation does not rewrite that bundle or use a public Sigstore fallback.

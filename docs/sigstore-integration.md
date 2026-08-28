@@ -1118,6 +1118,65 @@ index-zero enum remains out of scope. Rotation does not alter or normalize
 bundle serialization; live validation reports the issue if that producer wins
 the affected artifact instead of masking it.
 
+### Validation evidence
+
+Validated non-isolated on `2026-08-28` at implementation commit
+`c004227be74bef3514c9656535a80dd20c172d09` with Aspire SDK `13.5.2`.
+
+- `rotate-timestamp-authority` completed generation `1` to `2` with all `48`
+  structured postconditions passing. The old TSA root/leaf fingerprints were
+  `27a504e148b89b91f0a5474c19d34338ad296f74a0a0f00573a0faf497d3b81c`
+  and
+  `27bcd224b5f51b030fd30be66ce45bdb9171fd359b42c721abcb91a9dbfa3dad`;
+  the new fingerprints were
+  `edbfba70454f7fc7d31552c7e5f03158c71c6fe3be6991995ce0a91bf9287cc7`
+  and
+  `4dee58e997fe76c0a7f54db8230ce8e946fba90b76b1eef645e10e7c6d7c391f`.
+  Pre- and post-activation RFC3161 responses validated to those exact chains.
+- TrustedRoot advanced from
+  `fa0d7fb9c26eebe5a952c54d70a3b5e891eadf3a051633ee954f1735b3b948bf`
+  to
+  `c999c72cdd0612943955787bc81241141816f345270c43a6e6f77129ee698673`
+  and contained the old chain followed by the new chain. SigningConfig stayed
+  byte-identical at
+  `fadd7279f1ea31f67a21a4b5af57398ee726a06c53a8ddcc044a839d26536916`.
+  Root/bootstrap stayed version `1` at
+  `f6ad1c1b703ce51ca59181b838726596fde8866203c15525ba72e4e9e3b5820b`.
+  Targets, snapshot, and timestamp advanced `1` to `2`.
+- The six clients restarted and converged in sorted order before timestamp.
+  Timestamp then changed exactly once from container
+  `7e56cf69cdf8c8582d261e81abf3119814b28f60f6eaa849605ba20b15bc6267`
+  to
+  `e61d31a11e00a660331d31e258e5d45d6d49362f9495ae11657087ec6e7b8487`.
+  OIDC, Fulcio, Tesseract, Rekor server/proxy, TUF nginx, and
+  `shady-blob-store` retained their exact pre-operation container IDs and start
+  times.
+- Artifact `315` was retained before rotation; its RFC3161 response contained
+  exactly one certificate, preserving `include-chain-in-response=false`, and
+  its signer fingerprint matched the old leaf. Post-activation artifact `382`
+  identified the new leaf by its CMS issuer/serial and matched the active leaf
+  certificate. .NET, Go, Java, JavaScript, and Rust normal validators each
+  verified both IDs after restart. The normal Python validator visibly remained
+  blocked at artifact `1` by the documented omitted-index-zero fields; a
+  targeted verification inside the same restarted Python container, using the
+  same generation-2 TUF trust, verified both `315` and `382`. No bundle bytes
+  were changed and no public Sigstore endpoint appeared in any client log.
+- Active `private/tsa` contained exactly `signer.key` and `password`; the
+  operation candidate private directory and request were absent after
+  completion. Immutable generation `1` retained its original root, signer, and
+  password. Status finished `Healthy`, `14/14`, with no operation/recovery
+  marker, two trusted TSA entries, the new running signer, and all clients on
+  generation `2`.
+- Focused and regression validation passed all `33` Bootstrap tests, all `27`
+  Hosting tests, `53` top-level TUF/Go tests plus their fault-injection
+  subtests, `go vet`, AppHost and .NET client builds, and Go, JavaScript,
+  Python-container, Java-container-build, and Rust client tests. Runtime state
+  remained ignored under `.sigstore` and `.shady-blob-store`; `git diff --check`
+  passed.
+
+**Validation gate status: passed, with the documented Python index-zero
+limitation reported rather than masked.**
+
 ## Step 11: Implement Fulcio CA rotation
 
 ### Scope
