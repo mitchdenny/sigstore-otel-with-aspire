@@ -92,6 +92,16 @@ public static class SigstoreResourceBuilderExtensions
                 commandOptions:
                     SigstoreOperationCommand.CreateRestartClientsOptions(
                         parent.Resource))
+            .WithCommand(
+                name: SigstoreOperationCommand.PublishTrustedRootCommand,
+                displayName: "Publish Trusted Root",
+                executeCommand: context =>
+                    SigstoreOperationCommand.ExecutePublishTrustedRootAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreOperationCommand.CreatePublishTrustedRootOptions(
+                        parent.Resource))
             .OnInitializeResource(
                (resource, context, cancellationToken) =>
                {

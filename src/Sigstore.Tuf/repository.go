@@ -29,6 +29,7 @@ const (
 	repositoryActionRecovered repositoryAction = "Recovered"
 	repositoryActionRefreshed repositoryAction = "Refreshed"
 	repositoryActionRotated   repositoryAction = "Rotated"
+	repositoryActionPublished repositoryAction = "Published"
 )
 
 type publicationReference struct {
@@ -153,8 +154,17 @@ func ensureTUFRepositoryWithHooks(
 
 	if state.Status == publicationStatusPreparing {
 		initial := state.Active == nil
-		if err := recoverPreparingPublication(layout, state, sourceFingerprint, hooks); err != nil {
+		if err := recoverPreparingPublication(layout, state, sourceFingerprint, hooks, statePath, bootstrap); err != nil {
+			// Cross-generation rollback: if the candidate has a different fingerprint
+			// (from a generation advance), we may need to detect an orphaned generation
+			// and clean it up. The rollback itself now handles mismatched candidate
+			// fingerprints by removing without validation.
 			return "", err
+		}
+		// After successful rollback/recovery, clean up any orphaned generation
+		// directory that was created during the failed cross-generation publish.
+		if cleanErr := cleanupOrphanedGeneration(statePath, bootstrap); cleanErr != nil {
+			return "", fmt.Errorf("orphaned generation cleanup after rollback: %w", cleanErr)
 		}
 		if initial {
 			return repositoryActionCreated, nil
@@ -171,12 +181,163 @@ func ensureTUFRepositoryWithHooks(
 		return "", err
 	}
 	if err := validateCommittedPublication(layout, state, sourceFingerprint); err != nil {
-		return "", err
+		// If validation fails due to source fingerprint mismatch, check for a
+		// cross-generation forward-complete scenario: TUF publication committed
+		// with a newer generation's fingerprint, but the generation symlink
+		// wasn't switched yet.
+		recovered, fwdErr := tryForwardCompleteGeneration(statePath, layout, state, bootstrap)
+		if fwdErr != nil || !recovered {
+			return "", err // Return the original validation error.
+		}
+		return repositoryActionRecovered, nil
+	}
+	// Clean up any orphaned generation directory from an incomplete publish
+	// that crashed before TUF publication started.
+	if cleanErr := cleanupOrphanedGeneration(statePath, bootstrap); cleanErr != nil {
+		return "", fmt.Errorf("orphaned generation cleanup: %w", cleanErr)
 	}
 	if err := refreshPublication(layout, state, sourceFingerprint, hooks); err != nil {
 		return "", err
 	}
 	return repositoryActionRefreshed, nil
+}
+
+// recoverTUFState reconciles any interrupted TUF/generation state without
+// performing a metadata refresh or creating new publications. It handles:
+// - preparing status: rollback or cross-generation forward-complete
+// - committed with stale generation: forward-complete generation switch
+// - orphaned generation directories: validated cleanup
+// Acquires the state lock. Returns the recovery outcome.
+func recoverTUFState(statePath string) (recoveryOutcome, error) {
+	return recoverTUFStateWithHooks(statePath, publicationHooks{})
+}
+
+func recoverTUFStateWithHooks(statePath string, hooks publicationHooks) (recoveryOutcome, error) {
+	stateLock, err := acquireStateLock(statePath, 30*time.Second, "tuf-recover")
+	if err != nil {
+		return recoveryNoop, err
+	}
+	defer stateLock.release()
+	return recoverTUFStateLocked(statePath, hooks)
+}
+
+// recoverTUFStateLocked is the lock-free internal recovery implementation.
+// The caller MUST hold the state lock.
+func recoverTUFStateLocked(statePath string, hooks publicationHooks) (recoveryOutcome, error) {
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		return recoveryNoop, err
+	}
+	sourceFingerprint, err := fingerprintSource(bootstrap)
+	if err != nil {
+		return recoveryNoop, err
+	}
+
+	layout := newTUFLayout(statePath)
+	if err := ensureTUFLayout(layout); err != nil {
+		return recoveryNoop, err
+	}
+	state, err := loadPublicationState(layout)
+	if errors.Is(err, os.ErrNotExist) {
+		return recoveryNoop, nil
+	}
+	if err != nil {
+		return recoveryNoop, err
+	}
+
+	if state.Status == publicationStatusPreparing {
+		if err := recoverPreparingPublication(layout, state, sourceFingerprint, hooks, statePath, bootstrap); err != nil {
+			return recoveryNoop, err
+		}
+		if cleanErr := cleanupOrphanedGeneration(statePath, bootstrap); cleanErr != nil {
+			return recoveryNoop, fmt.Errorf("orphaned generation cleanup after recovery: %w", cleanErr)
+		}
+		// Determine outcome: if gen changed, it was forward-completed.
+		newBootstrap, loadErr := loadActiveTrustGeneration(statePath)
+		if loadErr == nil && newBootstrap.Generation > bootstrap.Generation {
+			return recoveryForwardCompleted, nil
+		}
+		return recoveryRolledBack, nil
+	}
+	if state.Status != publicationStatusCommitted {
+		return recoveryNoop, fmt.Errorf("TUF publication status %q is unsupported", state.Status)
+	}
+
+	// Committed state: clean temps and validate active reference.
+	if err := cleanupPublicationTemps(layout); err != nil {
+		return recoveryNoop, err
+	}
+	if err := cleanupUnjournaledCandidate(layout); err != nil {
+		return recoveryNoop, err
+	}
+	if state.Active == nil {
+		return recoveryNoop, fmt.Errorf("committed TUF publication has no active repository")
+	}
+	if err := validateReference(
+		committedPath(layout, state.Active.ID),
+		*state.Active,
+		sourceFingerprint,
+	); err != nil {
+		// Check cross-generation forward-complete scenario.
+		recovered, fwdErr := tryForwardCompleteGeneration(statePath, layout, state, bootstrap)
+		if fwdErr != nil || !recovered {
+			return recoveryNoop, err
+		}
+		return recoveryForwardCompleted, nil
+	}
+	// Validate previous with prior generation's fingerprint if available.
+	if state.Previous != nil {
+		priorFingerprint, priorErr := loadPriorGenerationFingerprint(statePath)
+		if priorErr != nil {
+			return recoveryNoop, fmt.Errorf("derive prior generation fingerprint: %w", priorErr)
+		}
+		if priorFingerprint != "" {
+			if err := validateReference(layout.previous, *state.Previous, priorFingerprint); err != nil {
+				return recoveryNoop, fmt.Errorf("previous publication corrupted: %w", err)
+			}
+		}
+		// priorFingerprint == "" only when journal.PriorGeneration is nil (initial gen1).
+	}
+	// Clean orphaned generation dirs but do NOT refresh.
+	if cleanErr := cleanupOrphanedGeneration(statePath, bootstrap); cleanErr != nil {
+		return recoveryNoop, fmt.Errorf("orphaned generation cleanup: %w", cleanErr)
+	}
+	return recoveryNoop, nil
+}
+
+// loadPriorGenerationFingerprint loads the prior generation's source fingerprint
+// from the transition journal's PriorGeneration reference.
+func loadPriorGenerationFingerprint(statePath string) (string, error) {
+	journalPath := filepath.Join(statePath, "transition", "state.json")
+	journalBytes, err := os.ReadFile(journalPath)
+	if err != nil {
+		return "", err
+	}
+	var journal trustTransitionJournal
+	if err := json.Unmarshal(journalBytes, &journal); err != nil {
+		return "", err
+	}
+	if journal.PriorGeneration == nil {
+		return "", nil // Initial generation, no prior.
+	}
+	// Load the prior generation manifest to compute its fingerprint.
+	priorGenPath := filepath.Join(statePath, "generations", journal.PriorGeneration.GenerationID)
+	if !pathExists(priorGenPath) {
+		return "", fmt.Errorf("prior generation dir %q missing but referenced in journal", journal.PriorGeneration.GenerationID)
+	}
+	priorManifestPath := filepath.Join(priorGenPath, "manifest.json")
+	priorManifestBytes, err := os.ReadFile(priorManifestPath)
+	if err != nil {
+		return "", fmt.Errorf("read prior generation manifest: %w", err)
+	}
+	if hashBytes(priorManifestBytes) != journal.PriorGeneration.ManifestSHA256 {
+		return "", fmt.Errorf("prior generation manifest hash mismatch")
+	}
+	priorBootstrap, err := loadBootstrapFromGeneration(statePath, priorGenPath, journal.PriorGeneration.GenerationID)
+	if err != nil {
+		return "", fmt.Errorf("load prior generation bootstrap: %w", err)
+	}
+	return fingerprintSource(priorBootstrap)
 }
 
 // rotateTUFRootKey generates a new root key and publishes root N+1 within the
@@ -504,6 +665,8 @@ func recoverPreparingPublication(
 	state publicationState,
 	sourceFingerprint string,
 	hooks publicationHooks,
+	statePath string,
+	activeBootstrap bootstrapManifest,
 ) error {
 	if err := validatePreparingState(state); err != nil {
 		return err
@@ -529,7 +692,27 @@ func recoverPreparingPublication(
 	case state.Active.ID:
 		return rollbackPreparingPublication(layout, state, sourceFingerprint, nil)
 	case state.Candidate.ID:
-		return finalizeRefreshedPublication(layout, state, sourceFingerprint, hooks)
+		err := finalizeRefreshedPublication(layout, state, sourceFingerprint, hooks)
+		if err == nil {
+			return nil
+		}
+		// Cross-generation forward-complete: the candidate was published with
+		// generation N+1's fingerprint. Validate the next-gen directory strictly
+		// against the immutable trust-domain before proceeding.
+		nextGenID := fmt.Sprintf("generation-%08d", activeBootstrap.Generation+1)
+		nextGenPath := filepath.Join(statePath, "generations", nextGenID)
+		if !pathExists(nextGenPath) {
+			return err // Not a cross-gen issue.
+		}
+		_, nextBootstrap, nextFingerprint, validErr := validateNextGenerationForRecovery(statePath, activeBootstrap)
+		if validErr != nil {
+			return err // Validation failed; return original finalize error.
+		}
+		if fwdErr := finalizePublishPublication(layout, state, sourceFingerprint, nextFingerprint, hooks); fwdErr != nil {
+			return err // Still can't finalize — return original error.
+		}
+		// Forward-complete: finalize succeeded with next-gen fingerprint, switch generation.
+		return switchActiveGeneration(statePath, activeBootstrap, nextBootstrap, nextBootstrap.GenerationManifestSHA256)
 	default:
 		return fmt.Errorf(
 			"active TUF publication %q matches neither the prior %q nor candidate %q",
@@ -669,12 +852,13 @@ func finalizeRefreshedPublication(
 		if preparing.Previous == nil {
 			return errors.New("retired TUF history exists without journal metadata")
 		}
-		retired, err := repositoryReference(layout.retiredPrevious, sourceFingerprint)
-		if err != nil {
-			return err
-		}
-		if retired != *preparing.Previous {
-			return errors.New("retired TUF history does not match the publication journal")
+		// The retired previous may have been committed by a prior generation
+		// (different source fingerprint). Use self-consistent validation.
+		if err := validateReferenceSelfConsistent(
+			layout.retiredPrevious,
+			*preparing.Previous,
+		); err != nil {
+			return fmt.Errorf("validate retired TUF history: %w", err)
 		}
 		if err := os.RemoveAll(layout.retiredPrevious); err != nil {
 			return fmt.Errorf("remove retired TUF history: %w", err)
@@ -740,17 +924,15 @@ func rollbackPreparingPublication(
 		)
 	}
 	if stagedCandidate {
-		if _, err := repositoryReference(layout.candidate, sourceFingerprint); err != nil {
-			return combinePublicationErrors(cause, err)
-		}
+		// During cross-generation publication, the candidate may have a different
+		// source fingerprint than the active generation. We remove it regardless
+		// since we are rolling back — fingerprint validation is not required for
+		// material being discarded.
 		if err := os.RemoveAll(layout.candidate); err != nil {
 			return combinePublicationErrors(cause, fmt.Errorf("remove staged TUF candidate: %w", err))
 		}
 	}
 	if committedCandidate {
-		if _, err := repositoryReference(committedCandidatePath, sourceFingerprint); err != nil {
-			return combinePublicationErrors(cause, err)
-		}
 		if err := os.RemoveAll(committedCandidatePath); err != nil {
 			return combinePublicationErrors(cause, fmt.Errorf("remove committed TUF candidate: %w", err))
 		}
@@ -874,10 +1056,9 @@ func validateCommittedContents(
 		if pathExists(layout.previous) {
 			return errors.New("TUF history exists without publication metadata")
 		}
-	} else if err := validateReference(
+	} else if err := validateReferenceSelfConsistent(
 		layout.previous,
 		*state.Previous,
-		sourceFingerprint,
 	); err != nil {
 		return err
 	}
@@ -1033,6 +1214,44 @@ func validateReference(
 			actual,
 			expected,
 		)
+	}
+	return nil
+}
+
+// validateReferenceSelfConsistent validates a publication directory using its
+// own stored source fingerprint. This proves structural/file integrity without
+// requiring an external fingerprint — suitable for historical publications
+// that may have been committed by a different generation.
+func validateReferenceSelfConsistent(
+	path string,
+	expected publicationReference,
+) error {
+	if err := validatePublicationReference(expected); err != nil {
+		return err
+	}
+	manifestPath := filepath.Join(path, "manifest.json")
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("read manifest for self-consistent check: %w", err)
+	}
+	manifestHash := hashBytes(manifestBytes)
+	if manifestHash != expected.ManifestSHA256 {
+		return fmt.Errorf("previous publication manifest hash %s does not match expected %s", manifestHash, expected.ManifestSHA256)
+	}
+	var manifest tufManifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return fmt.Errorf("parse manifest for self-consistent check: %w", err)
+	}
+	if manifest.SchemaVersion != tufSchemaVersion {
+		return fmt.Errorf("previous publication schema %d unsupported", manifest.SchemaVersion)
+	}
+	// Validate file set using the manifest's own stored fingerprint.
+	actual, err := repositoryReference(path, manifest.SourceFingerprint)
+	if err != nil {
+		return fmt.Errorf("self-consistent validation failed: %w", err)
+	}
+	if actual.ManifestSHA256 != expected.ManifestSHA256 {
+		return fmt.Errorf("previous publication reference mismatch after self-validation")
 	}
 	return nil
 }

@@ -392,8 +392,9 @@ internal static class SigstoreStatusCommand
             || generationManifest.GenerationId != generationId
             || generationManifest.TrustDomainId
                 != trustDomain.TrustDomainId
-            || generationManifest.CreatedAtUtc
-                != trustDomain.CreatedAtUtc
+            || (generationManifest.Generation == 1
+                && generationManifest.CreatedAtUtc
+                    != trustDomain.CreatedAtUtc)
             || generationManifest.SourceSchemaVersion is not (4 or 5)
             || generationManifest.SourceSchemaVersion == 4
                 && !IsLowerHexSha256(
@@ -428,7 +429,10 @@ internal static class SigstoreStatusCommand
         if (transition.SchemaVersion != TransitionSchemaVersion
             || transition.Status is not ("committed" or "recovered")
             || transition.LastCheckpoint != "transition-finalized"
-            || transition.PriorGeneration is not null
+            || (generationManifest.Generation == 1
+                && transition.PriorGeneration is not null)
+            || (generationManifest.Generation > 1
+                && transition.PriorGeneration is null)
             || transition.Candidate is null
             || transition.TrustDomain is null
             || transition.CandidateManifest is null
@@ -1122,14 +1126,14 @@ internal static class SigstoreStatusCommand
         ValidateTufReference(
             Path.Combine(historyPath, "previous"),
             publication.Previous,
-            sourceFingerprint,
+            null,
             "previous");
     }
 
     private static void ValidateTufReference(
         string path,
         PublicationReferenceStatus reference,
-        string sourceFingerprint,
+        string? sourceFingerprint,
         string description)
     {
         var manifestBytes = ReadRequiredBytes(
@@ -1143,7 +1147,8 @@ internal static class SigstoreStatusCommand
             manifestBytes,
             $"{description} TUF manifest");
         if (manifest.SchemaVersion != TufManifestSchemaVersion
-            || manifest.SourceFingerprint != sourceFingerprint)
+            || (sourceFingerprint is not null
+                && manifest.SourceFingerprint != sourceFingerprint))
         {
             throw new SigstoreStatusException(
                 $"The {description} TUF manifest is inconsistent.");

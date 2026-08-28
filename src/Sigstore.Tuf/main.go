@@ -56,6 +56,7 @@ type bootstrapManifest struct {
 	Generation               int       `json:"-"`
 	GenerationID             string    `json:"-"`
 	GenerationManifestSHA256 string    `json:"-"`
+	StandbyRekorKeySHA256    string    `json:"-"`
 }
 
 type tufManifest struct {
@@ -103,6 +104,16 @@ func main() {
 		fatalf("SIGSTORE_STATE_PATH must identify the Sigstore state directory")
 	}
 	statePath = filepath.Clean(statePath)
+
+	publishRequest := filepath.Join(statePath, publishRequestFile)
+	if pathExists(publishRequest) {
+		action, err := dispatchPublishRequest(statePath)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		fmt.Printf("%s Sigstore TUF repository at %s.\n", action, filepath.Join(statePath, "tuf"))
+		return
+	}
 
 	rotationRequest := filepath.Join(statePath, "rotate-root.request")
 	if pathExists(rotationRequest) {

@@ -12,6 +12,7 @@ internal static class SigstoreOperationCommand
     public const string RefreshTufCommand = "refresh-tuf";
     public const string RotateTufRootCommand = "rotate-tuf-root";
     public const string RestartClientsCommand = "restart-clients";
+    public const string PublishTrustedRootCommand = "publish-trusted-root";
 
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
@@ -140,6 +141,50 @@ internal static class SigstoreOperationCommand
                 new SigstoreFileStateInspector(),
                 context.Logger)
             .ExecuteRestartClientsAsync(context.CancellationToken);
+    }
+
+    public static CommandOptions CreatePublishTrustedRootOptions(
+        SigstoreResource resource) =>
+        new()
+        {
+            Description =
+                "Publish an additive trusted-root update through TUF. Advances " +
+                "the trust generation with standby verification material, " +
+                "restarts all clients, and waits for convergence.",
+            ConfirmationMessage =
+                "Publish an additive trusted-root update? This will advance " +
+                "the trust generation, update TUF targets, and restart all " +
+                "six clients. No signer is activated. Historical verification " +
+                "material is preserved.",
+            IconName = "ShieldCheckmark",
+            IconVariant = IconVariant.Regular,
+            UpdateState = _ => GetMutationCommandState(resource),
+            Progress = new CommandProgressOptions
+            {
+                Title = "Publish trusted root",
+                Message =
+                    "Advancing trust generation and publishing additive " +
+                    "verification material through TUF.",
+                HideCancelButton = true
+            }
+        };
+
+    public static Task<ExecuteCommandResult> ExecutePublishTrustedRootAsync(
+        SigstoreResource resource,
+        ExecuteCommandContext context)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        ArgumentNullException.ThrowIfNull(context);
+
+        var runtime = new AspireSigstoreOperationRuntime(
+            resource,
+            context.Services);
+        return new SigstoreOperationExecutor(
+                resource,
+                runtime,
+                new SigstoreFileStateInspector(),
+                context.Logger)
+            .ExecutePublishTrustedRootAsync(context.CancellationToken);
     }
 
     internal static ResourceCommandState GetMutationCommandState(
@@ -319,6 +364,562 @@ internal sealed class SigstoreOperationExecutor(
             lease!.Dispose();
             await runtime.PublishParentStateAsync(resource);
         }
+    }
+
+    public async Task<ExecuteCommandResult> ExecutePublishTrustedRootAsync(
+        CancellationToken requestCancellationToken)
+    {
+        requestCancellationToken.ThrowIfCancellationRequested();
+        if (!resource.TryBeginOperation(
+                SigstoreOperationCommand.PublishTrustedRootCommand,
+                "Publishing Trusted Root",
+                out var lease,
+                out var active))
+        {
+            return CreateContentionResult(
+                SigstoreOperationCommand.PublishTrustedRootCommand,
+                active!);
+        }
+
+        var execution = new OperationExecution(
+            resource,
+            runtime,
+            logger,
+            lease!,
+            total: 12);
+        try
+        {
+            return await ExecutePublishTrustedRootCoreAsync(
+                execution,
+                requestCancellationToken);
+        }
+        catch (Exception exception)
+            when (IsExpectedOperationFailure(exception))
+        {
+            execution.AddError(
+                execution.Phase,
+                resource.Name,
+                null,
+                exception.Message);
+            return execution.Failure(
+                $"{SigstoreOperationCommand.PublishTrustedRootCommand} failed " +
+                $"during {execution.Phase}.");
+        }
+        finally
+        {
+            lease!.Dispose();
+            await runtime.PublishParentStateAsync(resource);
+        }
+    }
+
+    private async Task<ExecuteCommandResult> ExecutePublishTrustedRootCoreAsync(
+        OperationExecution execution,
+        CancellationToken requestCancellationToken)
+    {
+        await execution.ReportAsync(
+            "preflight",
+            0,
+            "Validating current trust, TUF, and resource state for trusted-root publication.");
+
+        SigstoreOperationSnapshot before;
+        SigstoreResourceInstanceSnapshot workerBefore;
+        ExecuteCommandResult workerStart;
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-publish-trusted-root-preflight"))
+        {
+            requestCancellationToken.ThrowIfCancellationRequested();
+            if (!await ValidatePreconditionsAsync(
+                    execution,
+                    requestCancellationToken))
+            {
+                return execution.Failure(
+                    "Trusted-root publication preconditions are not satisfied.");
+            }
+
+            before = await CaptureAsync(requestCancellationToken);
+            execution.Before = before;
+            if (!ValidateCapture(
+                    execution,
+                    "preflight",
+                    before))
+            {
+                return execution.Failure(
+                    "The current TUF repository is not internally consistent.");
+            }
+
+            workerBefore = runtime.GetRequiredSnapshot(
+                resource.Components.TufBootstrap.Resource);
+            if (!execution.Check(
+                    "worker-ready",
+                    IsSuccessfulTerminal(workerBefore),
+                    "a completed one-shot with exit code 0",
+                    Describe(workerBefore),
+                    "preflight",
+                    workerBefore.Resource))
+            {
+                return execution.Failure(
+                    "The TUF worker is not ready for a new one-shot run.");
+            }
+            if (!execution.Check(
+                    "worker-baseline-identity",
+                    HasContainerIdentity(workerBefore),
+                    "a non-empty container identity",
+                    workerBefore.ContainerId ?? "missing",
+                    "preflight",
+                    workerBefore.Resource))
+            {
+                return execution.Failure(
+                    "The completed TUF worker has no observable container identity.");
+            }
+
+            await execution.ReportAsync(
+                "write-signal",
+                1,
+                "Writing publish-trusted-root.request signal file for the TUF worker.");
+
+            var operationId = Guid.NewGuid().ToString("N");
+            var signalPath = Path.Combine(
+                resource.StatePath,
+                "publish-trusted-root.request");
+
+            // Use FileMode.CreateNew to atomically reject if a surviving request
+            // file exists — never overwrite replay correlation.
+            var requestContent = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                schemaVersion = 1,
+                operationId = operationId,
+                trustDomainId = before.Tuf.Trust.TrustDomainId
+            });
+            try
+            {
+                await using var fs = new FileStream(
+                    signalPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None);
+                var bytes = System.Text.Encoding.UTF8.GetBytes(requestContent);
+                await fs.WriteAsync(bytes, requestCancellationToken);
+                await fs.FlushAsync(requestCancellationToken);
+            }
+            catch (IOException ex) when (ex.HResult == unchecked((int)0x80070050) /* ERROR_FILE_EXISTS */
+                || File.Exists(signalPath))
+            {
+                execution.AddError(
+                    execution.Phase,
+                    resource.Name,
+                    null,
+                    "A publish-trusted-root.request file already exists from a prior " +
+                    "interrupted operation. The TUF worker must consume it on restart " +
+                    "before a new operation can be issued.");
+                return execution.Failure(
+                    "Cannot issue publish-trusted-root: surviving request file exists");
+            }
+
+            await execution.ReportAsync(
+                "start-worker",
+                2,
+                "Starting a new TUF one-shot while handing off state.lock.");
+
+            using var critical = new CancellationTokenSource(WorkerTimeout);
+            workerStart = await runtime.ExecuteCommandAsync(
+                resource.Components.TufBootstrap.Resource,
+                KnownResourceCommands.StartCommand,
+                critical.Token);
+        }
+
+        if (!workerStart.Success)
+        {
+            execution.AddError(
+                "start-worker",
+                resource.Components.TufBootstrap.Resource.Name,
+                null,
+                workerStart.Message
+                    ?? "Aspire rejected the TUF worker start command.");
+            return await CompleteWorkerFailureAsync(
+                execution,
+                before,
+                "The TUF worker could not be started for trusted-root publication.");
+        }
+
+        await execution.ReportAsync(
+            "wait-worker",
+            3,
+            "Waiting for the trusted-root publication worker to complete.");
+
+        SigstoreResourceInstanceSnapshot workerAfter;
+        using (var critical = new CancellationTokenSource(WorkerTimeout))
+        {
+            try
+            {
+                workerAfter = await runtime.WaitForSnapshotAsync(
+                    resource.Components.TufBootstrap.Resource,
+                    snapshot => IsNewInstance(workerBefore, snapshot)
+                        && IsTerminal(snapshot),
+                    WorkerTimeout,
+                    critical.Token);
+            }
+            catch (OperationCanceledException exception)
+            {
+                execution.AddError(
+                    "wait-worker",
+                    resource.Components.TufBootstrap.Resource.Name,
+                    null,
+                    exception.Message);
+                return await CompleteWorkerFailureAsync(
+                    execution,
+                    before,
+                    "The publication worker did not complete within the timeout.");
+            }
+        }
+
+        execution.Resources.Add(
+            CreateLifecycleResult(
+                resource.Components.TufBootstrap.Resource.Name,
+                KnownResourceCommands.StartCommand,
+                workerBefore,
+                workerAfter,
+                null));
+        if (!IsSuccessfulTerminal(workerAfter))
+        {
+            execution.AddError(
+                "wait-worker",
+                workerAfter.Resource,
+                null,
+                $"Worker completed as {Describe(workerAfter)}.");
+            return await CompleteWorkerFailureAsync(
+                execution,
+                before,
+                "The trusted-root publication worker failed.");
+        }
+
+        await execution.ReportAsync(
+            "postconditions",
+            4,
+            "Validating generation advance, additive material, and TUF target coherence.");
+
+        using var postconditionToken = new CancellationTokenSource(WorkerTimeout);
+        SigstoreOperationSnapshot after;
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-publish-trusted-root-postconditions"))
+        {
+            after = await CaptureAsync(postconditionToken.Token);
+            execution.After = after;
+            ValidatePublishPostconditions(execution, before, after, workerBefore, workerAfter);
+        }
+
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "Trusted-root published, but postconditions failed.");
+        }
+
+        // Restart all clients since none support in-process TUF refresh.
+        await execution.ReportAsync(
+            "restart-clients",
+            5,
+            "Restarting all six clients to pick up new trust material.");
+
+        var clients = resource
+            .GetRegistrations()
+            .Clients
+            .OrderBy(client => client.Resource.Name, StringComparer.Ordinal)
+            .ToArray();
+        if (!execution.Check(
+                "six-clients-registered",
+                clients.Length == 6,
+                "6",
+                clients.Length.ToString(CultureInfo.InvariantCulture),
+                "restart-clients",
+                resource.Name))
+        {
+            return execution.Failure(
+                "The Sigstore parent does not have exactly six clients.");
+        }
+
+        using var clientCritical = new CancellationTokenSource(
+            TimeSpan.FromMinutes(20));
+        var completed = 6;
+        foreach (var client in clients)
+        {
+            var clientBefore = runtime.GetRequiredSnapshot(client.Resource);
+            if (!execution.Check(
+                    $"{client.Resource.Name}-ready",
+                    IsRunningHealthy(clientBefore)
+                        && HasContainerIdentity(clientBefore),
+                    "Running/Healthy with a container identity",
+                    Describe(clientBefore),
+                    "restart-client",
+                    client.Resource.Name))
+            {
+                return execution.Failure(
+                    $"{client.Resource.Name} is not ready to restart.");
+            }
+
+            await execution.ReportAsync(
+                "restart-client",
+                completed,
+                $"Restarting {client.Resource.Name} (restart uptake - no in-process refresh).");
+            var restart = await runtime.ExecuteCommandAsync(
+                client.Resource,
+                KnownResourceCommands.RestartCommand,
+                clientCritical.Token);
+            if (!restart.Success)
+            {
+                execution.AddError(
+                    "restart-client",
+                    client.Resource.Name,
+                    null,
+                    restart.Message
+                        ?? "Aspire rejected the client restart command.");
+                return execution.Failure(
+                    $"{client.Resource.Name} could not be restarted.");
+            }
+
+            SigstoreResourceInstanceSnapshot clientAfter;
+            try
+            {
+                clientAfter = await runtime.WaitForSnapshotAsync(
+                    client.Resource,
+                    snapshot => IsNewInstance(clientBefore, snapshot)
+                        && IsRunningHealthy(snapshot),
+                    ClientTimeout,
+                    clientCritical.Token);
+            }
+            catch (OperationCanceledException exception)
+            {
+                execution.AddError(
+                    "wait-client",
+                    client.Resource.Name,
+                    null,
+                    exception.Message);
+                return execution.Failure(
+                    $"{client.Resource.Name} did not become healthy after restart.");
+            }
+
+            var trustStatus = await runtime.ReadClientStatusAsync(
+                client,
+                clientCritical.Token);
+            if (!execution.Check(
+                    $"{client.Resource.Name}-trust-status",
+                    MatchesDisk(after.Tuf.Trust, trustStatus),
+                    DescribeTrust(after.Tuf.Trust),
+                    DescribeTrust(trustStatus),
+                    "wait-client",
+                    client.Resource.Name))
+            {
+                return execution.Failure(
+                    $"{client.Resource.Name} reported inconsistent trust after " +
+                    "trusted-root publication (stale client detected).");
+            }
+
+            execution.Resources.Add(
+                CreateLifecycleResult(
+                    client.Resource.Name,
+                    KnownResourceCommands.RestartCommand,
+                    clientBefore,
+                    clientAfter,
+                    trustStatus));
+            completed++;
+        }
+
+        await execution.ReportAsync(
+            "aggregate-status",
+            10,
+            "Waiting for aggregate health and verifying all client convergence.");
+        await runtime.WaitForAggregateHealthyAsync(
+            AggregateTimeout,
+            clientCritical.Token);
+        var aggregate = await runtime.CollectStatusAsync(clientCritical.Token);
+        execution.Check(
+            "aggregate-status-ready",
+            aggregate.Ready
+                && aggregate.Clients.Count == clients.Length,
+            $"ready=true and {clients.Length} clients",
+            aggregate.Reason
+                ?? $"ready={aggregate.Ready}, clients={aggregate.Clients.Count}",
+            "aggregate-status",
+            resource.Name);
+
+        await execution.ReportAsync(
+            "final-verification",
+            11,
+            "Final TUF server identity and served metadata check.");
+        var finalServer = runtime.GetRequiredSnapshot(
+            resource.Components.Tuf.Resource);
+        execution.Check(
+            "tuf-server-final-identity",
+            SameInstance(after.TufServer, finalServer)
+                && IsRunningHealthy(finalServer),
+            Describe(after.TufServer),
+            Describe(finalServer),
+            "final-verification",
+            finalServer.Resource);
+
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "Trusted-root publication completed but one or more " +
+                "convergence checks failed.");
+        }
+
+        await execution.ReportAsync(
+            "complete",
+            12,
+            "Trusted-root published, all clients converged on new trust material.");
+        return execution.Success(
+            "Additive trusted-root update published and verified across all clients.");
+    }
+
+    private static void ValidatePublishPostconditions(
+        OperationExecution execution,
+        SigstoreOperationSnapshot before,
+        SigstoreOperationSnapshot after,
+        SigstoreResourceInstanceSnapshot workerBefore,
+        SigstoreResourceInstanceSnapshot workerAfter)
+    {
+        // Generation must advance by exactly 1.
+        execution.Check(
+            "generation-advanced",
+            after.Tuf.Trust.Generation == before.Tuf.Trust.Generation + 1
+                && after.Tuf.Trust.GenerationId != before.Tuf.Trust.GenerationId
+                && after.Tuf.Trust.GenerationManifestSha256
+                    != before.Tuf.Trust.GenerationManifestSha256,
+            $"generation {before.Tuf.Trust.Generation + 1} with changed identity",
+            $"generation {after.Tuf.Trust.Generation}, id " +
+                $"{after.Tuf.Trust.GenerationId}",
+            "postconditions",
+            "tuf-bootstrap");
+
+        // Trust domain must be preserved.
+        CheckEqual(
+            execution,
+            "trust-domain-unchanged",
+            before.Tuf.Trust.TrustDomainId,
+            after.Tuf.Trust.TrustDomainId);
+
+        // TrustedRoot must change (additive material added).
+        execution.Check(
+            "trusted-root-changed",
+            after.Tuf.Metadata.TrustedRootSha256
+                != before.Tuf.Metadata.TrustedRootSha256,
+            "a changed trusted-root hash",
+            after.Tuf.Metadata.TrustedRootSha256,
+            "postconditions",
+            "tuf-bootstrap");
+
+        // Root must be unchanged (no root rotation during publish).
+        CheckEqual(
+            execution,
+            "root-unchanged",
+            before.Tuf.Metadata.Root,
+            after.Tuf.Metadata.Root);
+
+        // Bootstrap root must be unchanged.
+        CheckEqual(
+            execution,
+            "bootstrap-root-unchanged",
+            before.Tuf.BootstrapRootSha256,
+            after.Tuf.BootstrapRootSha256);
+
+        // Targets must advance (new target content).
+        execution.Check(
+            "targets-version-advanced",
+            after.Tuf.Metadata.Targets.Version
+                > before.Tuf.Metadata.Targets.Version
+                && after.Tuf.Metadata.Targets.Sha256
+                    != before.Tuf.Metadata.Targets.Sha256,
+            $"targets version > {before.Tuf.Metadata.Targets.Version} " +
+                "with changed hash",
+            $"targets version {after.Tuf.Metadata.Targets.Version}, " +
+                $"sha256 {after.Tuf.Metadata.Targets.Sha256}",
+            "postconditions",
+            "tuf-bootstrap");
+
+        // Snapshot and timestamp must advance.
+        CheckAdvanced(
+            execution,
+            "snapshot-advanced",
+            before.Tuf.Metadata.Snapshot,
+            after.Tuf.Metadata.Snapshot);
+        CheckAdvanced(
+            execution,
+            "timestamp-advanced",
+            before.Tuf.Metadata.Timestamp,
+            after.Tuf.Metadata.Timestamp);
+
+        // Publication must advance.
+        execution.Check(
+            "publication-advanced",
+            before.Tuf.Trust.PublicationId
+                    != after.Tuf.Trust.PublicationId
+                && before.Tuf.Trust.PublicationManifestSha256
+                    != after.Tuf.Trust.PublicationManifestSha256,
+            DescribePublication(before.Tuf.Trust),
+            DescribePublication(after.Tuf.Trust),
+            "postconditions",
+            "tuf-bootstrap");
+
+        // History must retain prior publication.
+        execution.Check(
+            "history-retains-prior-active",
+            after.Tuf.PreviousPublicationId
+                    == before.Tuf.Trust.PublicationId
+                && after.Tuf.PreviousPublicationManifestSha256
+                    == before.Tuf.Trust.PublicationManifestSha256,
+            DescribePublication(before.Tuf.Trust),
+            $"{after.Tuf.PreviousPublicationId}/" +
+                after.Tuf.PreviousPublicationManifestSha256,
+            "postconditions",
+            "tuf-bootstrap");
+
+        // Trust state must have changed.
+        execution.Check(
+            "trust-state-changed",
+            before.TrustStateSha256 != after.TrustStateSha256,
+            "a changed trust-state fingerprint",
+            after.TrustStateSha256,
+            "postconditions",
+            "tuf-bootstrap");
+
+        // Trust material must have changed (new key added).
+        execution.Check(
+            "trust-material-changed",
+            before.TrustMaterialSha256 != after.TrustMaterialSha256,
+            "changed trust material (additive)",
+            after.TrustMaterialSha256,
+            "postconditions",
+            "tuf-bootstrap");
+
+        // Disk/served must be consistent.
+        execution.Check(
+            "disk-served-after-publish",
+            MatchesServed(after.Tuf, after.Served),
+            Describe(after.Tuf),
+            Describe(after.Served),
+            "postconditions",
+            after.TufServer.Resource);
+
+        // TUF server not restarted.
+        execution.Check(
+            "tuf-server-not-restarted",
+            SameInstance(before.TufServer, after.TufServer)
+                && IsRunningHealthy(after.TufServer),
+            Describe(before.TufServer),
+            Describe(after.TufServer),
+            "postconditions",
+            after.TufServer.Resource);
+
+        // Worker ran once.
+        execution.Check(
+            "worker-ran-once",
+            IsNewInstance(workerBefore, workerAfter)
+                && IsSuccessfulTerminal(workerAfter),
+            Describe(workerBefore),
+            Describe(workerAfter),
+            "postconditions",
+            workerAfter.Resource);
     }
 
     private async Task<ExecuteCommandResult> ExecuteRefreshTufCoreAsync(

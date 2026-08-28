@@ -108,9 +108,11 @@ func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
 			journal.LastCheckpoint,
 		)
 	}
-	if journal.PriorGeneration != nil {
-		return bootstrapManifest{}, errors.New(
-			"Step 4 does not support a prior trust generation or live rotation",
+	if journal.PriorGeneration != nil && journal.Candidate.Generation <= journal.PriorGeneration.Generation {
+		return bootstrapManifest{}, fmt.Errorf(
+			"candidate generation %d must be greater than prior generation %d",
+			journal.Candidate.Generation,
+			journal.PriorGeneration.Generation,
 		)
 	}
 	if journal.TrustDomainManifestSHA256 != hashBytes(domainBytes) {
@@ -118,7 +120,7 @@ func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
 			"trust-domain manifest does not match the transition journal",
 		)
 	}
-	if !reflect.DeepEqual(journal.TrustDomain, domain) {
+	if !trustDomainEqual(journal.TrustDomain, domain) {
 		return bootstrapManifest{}, errors.New(
 			"journaled trust-domain identity does not match the immutable manifest",
 		)
@@ -182,6 +184,43 @@ func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
 	}, nil
 }
 
+// loadBootstrapFromGeneration constructs a bootstrapManifest from a generation
+// directory for fingerprint computation. Used for prior-generation fingerprint
+// derivation during recovery validation.
+func loadBootstrapFromGeneration(statePath, generationPath, generationID string) (bootstrapManifest, error) {
+	manifestPath := filepath.Join(generationPath, "manifest.json")
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return bootstrapManifest{}, err
+	}
+	var gen generationManifest
+	if err := json.Unmarshal(manifestBytes, &gen); err != nil {
+		return bootstrapManifest{}, err
+	}
+	domainPath := filepath.Join(statePath, "trust-domain.json")
+	domainBytes, err := os.ReadFile(domainPath)
+	if err != nil {
+		return bootstrapManifest{}, err
+	}
+	var domain trustDomainManifest
+	if err := json.Unmarshal(domainBytes, &domain); err != nil {
+		return bootstrapManifest{}, err
+	}
+	return bootstrapManifest{
+		SchemaVersion:        4,
+		CreatedAtUTC:         gen.CreatedAtUTC,
+		FulcioRootSHA256:     gen.FulcioRootSHA256,
+		CtLogPublicKeySHA256: gen.CtLogPublicKeySHA256,
+		RekorPublicKeySHA256: gen.RekorPublicKeySHA256,
+		TsaRootSHA256:        gen.TsaRootSHA256,
+		TsaLeafSHA256:        gen.TsaLeafSHA256,
+		OIDCKeyID:            gen.OIDCKeyID,
+		TrustDomainID:        domain.TrustDomainID,
+		Generation:           gen.Generation,
+		GenerationID:         generationID,
+	}, nil
+}
+
 func validateGenerationState(
 	statePath string,
 	generationPath string,
@@ -195,16 +234,17 @@ func validateGenerationState(
 			trustStateSchemaVersion,
 		)
 	}
-	if generation.Generation != initialGeneration ||
-		generation.GenerationID != initialGenerationID {
-		return errors.New(
-			"Step 4 supports only generation 1; rotation is not implemented",
+	if generation.Generation < initialGeneration {
+		return fmt.Errorf(
+			"generation %d is invalid; must be >= %d",
+			generation.Generation,
+			initialGeneration,
 		)
 	}
 	if generation.TrustDomainID != domain.TrustDomainID {
 		return errors.New("generation trust-domain identity does not match")
 	}
-	if !generation.CreatedAtUTC.Equal(domain.CreatedAtUTC) {
+	if generation.Generation == initialGeneration && !generation.CreatedAtUTC.Equal(domain.CreatedAtUTC) {
 		return errors.New("initial generation creation time does not match trust-domain identity")
 	}
 	if generation.SourceSchemaVersion != 4 &&
@@ -294,9 +334,11 @@ func readActiveGeneration(path string) (string, error) {
 		return "", fmt.Errorf("active generation link has unsafe target %q", target)
 	}
 	directory, generationID := filepath.Split(target)
-	if strings.TrimSuffix(filepath.Clean(directory), string(filepath.Separator)) != "generations" ||
-		generationID != initialGenerationID {
+	if strings.TrimSuffix(filepath.Clean(directory), string(filepath.Separator)) != "generations" {
 		return "", fmt.Errorf("active generation link has unsafe target %q", target)
+	}
+	if !strings.HasPrefix(generationID, "generation-") {
+		return "", fmt.Errorf("active generation link has unexpected ID format %q", generationID)
 	}
 	return generationID, nil
 }
@@ -308,4 +350,16 @@ func hashBytes(data []byte) string {
 
 func sha256Bytes(data []byte) [32]byte {
 	return sha256.Sum256(data)
+}
+
+// trustDomainEqual compares two trustDomainManifest values semantically.
+// Unlike reflect.DeepEqual, it uses time.Equal() for CreatedAtUTC so that
+// equivalent timestamps with different timezone representations (e.g., "Z"
+// vs "+00:00") are treated as equal.
+func trustDomainEqual(a, b trustDomainManifest) bool {
+	return a.SchemaVersion == b.SchemaVersion &&
+		a.TrustDomainID == b.TrustDomainID &&
+		a.CreatedAtUTC.Equal(b.CreatedAtUTC) &&
+		a.CtLogStateID == b.CtLogStateID &&
+		a.RekorStateID == b.RekorStateID
 }

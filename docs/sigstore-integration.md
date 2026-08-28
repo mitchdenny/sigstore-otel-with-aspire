@@ -835,6 +835,74 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 - Wait until every client reports the new target version and fingerprint.
 - Retain historical verification material by default.
 
+### Implementation
+
+**Command**: `publish-trusted-root` via `aspire resource sigstore publish-trusted-root`.
+Uses `ResourceCommandService` with explicit confirmation, contention rejection,
+non-cancelable progress, and structured schema-versioned results.
+
+**Additive material**: An ECDSA P-256 standby Rekor verification key
+(`public/rekor/rekor-standby.pub`) is added to TrustedRoot.Tlogs with a future
+`ValidFor.Start` (+1 year) and `/standby` base URL. SigningConfig remains
+unchanged — no routing to the standby key. The material is genuine cryptographic
+content suitable for demonstrating an additive update without activating a signer
+or preempting Steps 9-13.
+
+**Transaction ordering**:
+1. `advanceTrustGeneration` creates generation N+1 directory with standby key +
+   manifest. NO symlink or journal change.
+2. `publishNewTargets` builds targets from gen N+1, performs TUF
+   prepare→commit→active-switch→finalize using gen N+1's fingerprint and gen N's
+   fingerprint for the prior publication.
+3. `switchActiveGeneration` updates the transition journal (with PriorGeneration
+   reference) and atomically switches the active-generation symlink, only after
+   step 2 fully succeeds.
+
+**Cross-generation recovery** (automatic, deterministic):
+- Crash after step 1 only (orphaned gen dir, TUF committed with gen N):
+  Cleaned up on next `ensureTUFRepository` in the committed validation path.
+- Crash during step 2 (before TUF active switch): `recoverPreparingPublication`
+  rolls back the candidate (without fingerprint validation on cross-gen
+  candidate) and restores committed state. Orphaned gen dir cleaned up.
+- Crash during step 2 (after TUF active switch to candidate, before finalize):
+  `recoverPreparingPublication` detects active→candidate, loads gen N+1's
+  fingerprint, calls `finalizePublishPublication` with both fingerprints, then
+  completes the generation switch.
+- Crash between steps 2 and 3 (TUF committed with gen N+1, symlink still gen N):
+  `tryForwardCompleteGeneration` detects the orphaned gen N+1 directory, computes
+  its fingerprint, validates the active TUF publication matches, and completes
+  `switchActiveGeneration`.
+- No manual intervention required for any checkpoint. Repeated invocations are
+  idempotent and converge to one coherent generation.
+
+**Request/replay protocol**: The C# command writes a schema-versioned JSON
+request file containing a unique `operationId` (GUID). The Go worker uses
+`dispatchPublishRequest` which:
+1. Checks a durable `publishCompletion` journal for same-ID (crash-after-success).
+2. Calls `recoverTUFState` (recovery-only — no refresh or new publication).
+3. Detects recovery-forward-completed state vs genuinely new second request.
+4. Writes completion journal BEFORE removing request (crash-safe ordering).
+
+**Repeated invocation contract**: `publish-trusted-root` is explicitly one-shot
+per trust domain. A second invocation (different operation ID after a prior
+completion) is rejected pre-mutation with a clear error. This prevents silent
+removal of prior standby verification material and upholds "retain historical
+verification material by default." Accumulating multiple standby keys with
+stable unique identities is deferred to Steps 9-13 which introduce real
+rotating keys.
+
+**Client uptake**: All six language clients (Go cosign, Python sigstore, Rust
+sigstore, Java sigstore, TypeScript sigstore, .NET sigstore) require
+restart-based uptake via `ResourceCommandService`. None support in-process TUF
+trust refresh. The command restarts all clients, waits for Running/Healthy
+status, and validates `/trust/status` reports the new generation, targets
+version, and TrustedRoot fingerprint.
+
+**Stale-client detection**: The command polls every client's `/trust/status`
+endpoint and will not report success until all clients agree with the committed
+disk state. A stale client is identified by target-version/fingerprint mismatch
+and prevents the command from completing.
+
 ### Validation gate
 
 - Artifacts created before publication still validate.
@@ -842,6 +910,15 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 - Every client reports the new trusted-root fingerprint.
 - A client that has not refreshed is detectable and prevents command success.
 - Removal of historical verification keys is not part of this command.
+
+### Evidence
+
+- All Go tests pass (33 tests including 5 dispatch-path, 3 cross-gen recovery, 2 tampered-domain tests).
+- All C# hosting tests pass (22 tests including command registration).
+- `git diff --check` clean from base commit.
+- Live validation: generation 1→2, all 6 clients converged, 14/14 healthy.
+- Cross-generation recovery tested at every boundary: orphaned dir cleanup,
+  preparing rollback, preparing forward-complete, committed forward-complete.
 
 ## Step 9: Implement OIDC signing-key rotation
 
