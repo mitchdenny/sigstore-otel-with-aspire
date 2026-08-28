@@ -278,7 +278,8 @@ public sealed class SigstoreRekorShardTests
     /// signing the body (through the blank line) with a standard note
     /// ECDSA key hash (the low four bytes of the SHA-256 fingerprint of the
     /// signer's SubjectPublicKeyInfo) followed by an ASN.1 DER-encoded
-    /// ECDSA P-256/SHA-256 signature.
+    /// ECDSA P-256/SHA-256 signature. The body includes its terminating
+    /// newline; the unsigned second newline separates the signature block.
     /// </summary>
     private static byte[] BuildSignedCheckpoint(
         string origin,
@@ -290,7 +291,7 @@ public sealed class SigstoreRekorShardTests
             $"{origin}\n" +
             $"{treeSize.ToString(CultureInfo.InvariantCulture)}\n" +
             $"{Convert.ToBase64String(rootHash)}\n";
-        var signedMessage = body + "\n";
+        var signedMessage = body;
         var signature = signer.SignData(
             Encoding.UTF8.GetBytes(signedMessage),
             HashAlgorithmName.SHA256,
@@ -302,7 +303,8 @@ public sealed class SigstoreRekorShardTests
         var signatureLine =
             $"\u2014 {origin} " +
             $"{Convert.ToBase64String(noteSignature)}\n";
-        return Encoding.UTF8.GetBytes(signedMessage + signatureLine);
+        return Encoding.UTF8.GetBytes(
+            signedMessage + "\n" + signatureLine);
     }
 
     [Fact]

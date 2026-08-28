@@ -247,7 +247,8 @@ internal static class SigstoreRekorShard
     /// checkpoint (the C2SP <c>tlog-checkpoint</c>/"signed note" format):
     /// an origin line, a decimal tree size, a base64 root hash, a blank
     /// line, and one or more <c>— name signature</c> lines. The signature
-    /// covers every byte up to and including the blank line; its first four
+    /// covers the note body through its terminating newline, excluding the
+    /// additional newline that separates the signature block; its first four
     /// bytes are the standard note key hash — the low four bytes of the
     /// SHA-256 fingerprint of the signer's SubjectPublicKeyInfo — and the
     /// remainder is an ASN.1 DER-encoded ECDSA P-256/SHA-256 signature. This
@@ -276,7 +277,7 @@ internal static class SigstoreRekorShard
         }
 
         var body = text[..separatorIndex];
-        var signedMessage = text[..(separatorIndex + 2)];
+        var signedMessage = text[..(separatorIndex + 1)];
         var bodyLines = body.Split('\n');
         if (bodyLines.Length != 3)
         {
@@ -690,4 +691,3 @@ internal static class SigstoreRekorShard
         Convert.ToHexString(SHA256.HashData(value))
             .ToLowerInvariant();
 }
-
