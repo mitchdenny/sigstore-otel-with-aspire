@@ -163,7 +163,9 @@ func ensureTUFRepositoryWithHooks(
 		}
 		// After successful rollback/recovery, clean up any orphaned generation
 		// directory that was created during the failed cross-generation publish.
-		_ = cleanupOrphanedGeneration(statePath, bootstrap)
+		if cleanErr := cleanupOrphanedGeneration(statePath, bootstrap); cleanErr != nil {
+			return "", fmt.Errorf("orphaned generation cleanup after rollback: %w", cleanErr)
+		}
 		if initial {
 			return repositoryActionCreated, nil
 		}
@@ -191,7 +193,9 @@ func ensureTUFRepositoryWithHooks(
 	}
 	// Clean up any orphaned generation directory from an incomplete publish
 	// that crashed before TUF publication started.
-	_ = cleanupOrphanedGeneration(statePath, bootstrap)
+	if cleanErr := cleanupOrphanedGeneration(statePath, bootstrap); cleanErr != nil {
+		return "", fmt.Errorf("orphaned generation cleanup: %w", cleanErr)
+	}
 	if err := refreshPublication(layout, state, sourceFingerprint, hooks); err != nil {
 		return "", err
 	}
@@ -555,45 +559,22 @@ func recoverPreparingPublication(
 			return nil
 		}
 		// Cross-generation forward-complete: the candidate was published with
-		// generation N+1's fingerprint. Try computing the next-gen fingerprint
-		// and finalize with that.
+		// generation N+1's fingerprint. Validate the next-gen directory strictly
+		// against the immutable trust-domain before proceeding.
 		nextGenID := fmt.Sprintf("generation-%08d", activeBootstrap.Generation+1)
 		nextGenPath := filepath.Join(statePath, "generations", nextGenID)
 		if !pathExists(nextGenPath) {
 			return err // Not a cross-gen issue.
 		}
-		nextManifestBytes, readErr := os.ReadFile(filepath.Join(nextGenPath, "manifest.json"))
-		if readErr != nil {
-			return err
-		}
-		var nextManifest generationManifest
-		if jsonErr := json.Unmarshal(nextManifestBytes, &nextManifest); jsonErr != nil {
-			return err
-		}
-		nextManifestHash := hashBytes(nextManifestBytes)
-		nextBootstrap := bootstrapManifest{
-			SchemaVersion:            4,
-			CreatedAtUTC:             nextManifest.CreatedAtUTC,
-			CtLogPublicKeySHA256:     nextManifest.CtLogPublicKeySHA256,
-			RekorPublicKeySHA256:     nextManifest.RekorPublicKeySHA256,
-			FulcioRootSHA256:         nextManifest.FulcioRootSHA256,
-			TsaRootSHA256:            nextManifest.TsaRootSHA256,
-			TsaLeafSHA256:            nextManifest.TsaLeafSHA256,
-			OIDCKeyID:                nextManifest.OIDCKeyID,
-			TrustDomainID:            nextManifest.TrustDomainID,
-			Generation:               nextManifest.Generation,
-			GenerationID:             nextGenID,
-			GenerationManifestSHA256: nextManifestHash,
-		}
-		nextFingerprint, fpErr := fingerprintSource(nextBootstrap)
-		if fpErr != nil {
-			return err
+		_, nextBootstrap, nextFingerprint, validErr := validateNextGenerationForRecovery(statePath, activeBootstrap)
+		if validErr != nil {
+			return err // Validation failed; return original finalize error.
 		}
 		if fwdErr := finalizePublishPublication(layout, state, sourceFingerprint, nextFingerprint, hooks); fwdErr != nil {
 			return err // Still can't finalize — return original error.
 		}
 		// Forward-complete: finalize succeeded with next-gen fingerprint, switch generation.
-		return switchActiveGeneration(statePath, activeBootstrap, nextBootstrap, nextManifestHash)
+		return switchActiveGeneration(statePath, activeBootstrap, nextBootstrap, nextBootstrap.GenerationManifestSHA256)
 	default:
 		return fmt.Errorf(
 			"active TUF publication %q matches neither the prior %q nor candidate %q",

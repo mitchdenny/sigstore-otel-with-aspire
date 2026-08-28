@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	commonv1 "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
@@ -779,10 +780,108 @@ func newStandbyTransparencyLog(activeDER, standbyDER []byte, standbyStart time.T
 	}
 }
 
+// validateNextGenerationForRecovery performs strict validation of a candidate
+// generation N+1 directory against the immutable trust-domain state and active
+// generation. This MUST be called before any forward-complete or cleanup action
+// on a generation directory to prevent operating on tampered/ambiguous state.
+func validateNextGenerationForRecovery(
+	statePath string,
+	activeBootstrap bootstrapManifest,
+) (generationManifest, bootstrapManifest, string, error) {
+	// Load immutable trust-domain manifest.
+	domainPath := filepath.Join(statePath, "trust-domain.json")
+	domainBytes, err := os.ReadFile(domainPath)
+	if err != nil {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf("read trust-domain for recovery validation: %w", err)
+	}
+	var domain trustDomainManifest
+	if err := json.Unmarshal(domainBytes, &domain); err != nil {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf("parse trust-domain for recovery validation: %w", err)
+	}
+
+	expectedGen := activeBootstrap.Generation + 1
+	expectedGenID := fmt.Sprintf("generation-%08d", expectedGen)
+	nextGenPath := filepath.Join(statePath, "generations", expectedGenID)
+
+	// Read and parse the generation manifest.
+	nextManifestPath := filepath.Join(nextGenPath, "manifest.json")
+	nextManifestBytes, err := os.ReadFile(nextManifestPath)
+	if err != nil {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf("read next-gen manifest: %w", err)
+	}
+	var nextManifest generationManifest
+	if err := json.Unmarshal(nextManifestBytes, &nextManifest); err != nil {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf("parse next-gen manifest: %w", err)
+	}
+	nextManifestHash := hashBytes(nextManifestBytes)
+
+	// Strict validation against immutable trust-domain identity.
+	if nextManifest.TrustDomainID != domain.TrustDomainID {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf(
+			"next-generation trust-domain ID %q does not match immutable domain %q",
+			nextManifest.TrustDomainID, domain.TrustDomainID,
+		)
+	}
+	if nextManifest.TrustDomainID != activeBootstrap.TrustDomainID {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf(
+			"next-generation trust-domain ID %q does not match active bootstrap %q",
+			nextManifest.TrustDomainID, activeBootstrap.TrustDomainID,
+		)
+	}
+
+	// Validate exact generation sequence.
+	if nextManifest.Generation != expectedGen {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf(
+			"next-generation number %d does not match expected %d",
+			nextManifest.Generation, expectedGen,
+		)
+	}
+	if nextManifest.GenerationID != expectedGenID {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf(
+			"next-generation ID %q does not match expected %q",
+			nextManifest.GenerationID, expectedGenID,
+		)
+	}
+
+	// Validate file set matches manifest exactly.
+	actualFiles, err := collectGenerationFileHashes(nextGenPath)
+	if err != nil {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf("collect next-gen files: %w", err)
+	}
+	if !reflect.DeepEqual(actualFiles, nextManifest.Files) {
+		return generationManifest{}, bootstrapManifest{}, "", errors.New(
+			"next-generation file set or hashes do not match its manifest",
+		)
+	}
+
+	// Build validated bootstrap for fingerprint computation.
+	nextBootstrap := bootstrapManifest{
+		SchemaVersion:            4,
+		CreatedAtUTC:             nextManifest.CreatedAtUTC,
+		FulcioRootSHA256:         nextManifest.FulcioRootSHA256,
+		CtLogPublicKeySHA256:     nextManifest.CtLogPublicKeySHA256,
+		RekorPublicKeySHA256:     nextManifest.RekorPublicKeySHA256,
+		TsaRootSHA256:            nextManifest.TsaRootSHA256,
+		TsaLeafSHA256:            nextManifest.TsaLeafSHA256,
+		OIDCKeyID:                nextManifest.OIDCKeyID,
+		TrustDomainID:            nextManifest.TrustDomainID,
+		Generation:               nextManifest.Generation,
+		GenerationID:             expectedGenID,
+		GenerationManifestSHA256: nextManifestHash,
+	}
+	nextFingerprint, err := fingerprintSource(nextBootstrap)
+	if err != nil {
+		return generationManifest{}, bootstrapManifest{}, "", err
+	}
+
+	return nextManifest, nextBootstrap, nextFingerprint, nil
+}
+
 // cleanupOrphanedGeneration removes a generation directory that was created
 // during a cross-generation publish attempt that failed before completion.
-// The orphaned directory is any generation N+1 directory that exists but is
-// not the active generation (symlink target) and not in the transition journal.
+// Only removes a directory that passes strict validation against the immutable
+// trust-domain identity and expected sequence. Ambiguous or tampered state is
+// rejected loudly rather than silently deleted.
 func cleanupOrphanedGeneration(statePath string, activeBootstrap bootstrapManifest) error {
 	nextGenID := fmt.Sprintf("generation-%08d", activeBootstrap.Generation+1)
 	nextGenPath := filepath.Join(statePath, "generations", nextGenID)
@@ -792,12 +891,23 @@ func cleanupOrphanedGeneration(statePath string, activeBootstrap bootstrapManife
 	// The active symlink should NOT point here (it points to the current gen).
 	activeGenID, err := readActiveGeneration(filepath.Join(statePath, "active-generation"))
 	if err != nil {
-		return nil // Can't determine; leave it.
+		return fmt.Errorf("cannot determine active generation during orphan cleanup: %w", err)
 	}
 	if activeGenID == nextGenID {
 		return nil // It IS the active generation; not orphaned.
 	}
-	// Remove the orphaned generation directory.
+
+	// Strict validation: only remove if it matches the immutable trust-domain
+	// and expected generation sequence. If validation fails (tampered/ambiguous),
+	// return an error rather than silently deleting unknown state.
+	_, _, _, validErr := validateNextGenerationForRecovery(statePath, activeBootstrap)
+	if validErr != nil {
+		return fmt.Errorf(
+			"orphaned generation %s failed validation and cannot be safely removed: %w",
+			nextGenID, validErr,
+		)
+	}
+
 	return os.RemoveAll(nextGenPath)
 }
 
@@ -819,37 +929,12 @@ func tryForwardCompleteGeneration(
 		return false, nil
 	}
 
-	// Read the next generation's manifest and compute its fingerprint.
-	nextManifestPath := filepath.Join(nextGenPath, "manifest.json")
-	nextManifestBytes, err := os.ReadFile(nextManifestPath)
+	// Strict validation against immutable trust-domain and expected sequence.
+	_, nextBootstrap, nextFingerprint, err := validateNextGenerationForRecovery(statePath, activeBootstrap)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("cross-gen recovery validation failed: %w", err)
 	}
-	var nextManifest generationManifest
-	if err := json.Unmarshal(nextManifestBytes, &nextManifest); err != nil {
-		return false, err
-	}
-	nextManifestHash := hashBytes(nextManifestBytes)
-
-	// Build a bootstrap from the next generation to compute its fingerprint.
-	nextBootstrap := bootstrapManifest{
-		SchemaVersion:            4,
-		CreatedAtUTC:             nextManifest.CreatedAtUTC,
-		FulcioRootSHA256:         nextManifest.FulcioRootSHA256,
-		CtLogPublicKeySHA256:     nextManifest.CtLogPublicKeySHA256,
-		RekorPublicKeySHA256:     nextManifest.RekorPublicKeySHA256,
-		TsaRootSHA256:            nextManifest.TsaRootSHA256,
-		TsaLeafSHA256:            nextManifest.TsaLeafSHA256,
-		OIDCKeyID:                nextManifest.OIDCKeyID,
-		TrustDomainID:            nextManifest.TrustDomainID,
-		Generation:               nextManifest.Generation,
-		GenerationID:             nextGenID,
-		GenerationManifestSHA256: nextManifestHash,
-	}
-	nextFingerprint, err := fingerprintSource(nextBootstrap)
-	if err != nil {
-		return false, err
-	}
+	nextManifestHash := nextBootstrap.GenerationManifestSHA256
 
 	// Validate that the committed TUF active publication matches the next generation.
 	// We only check the active reference (not previous, which has the old gen's fingerprint).

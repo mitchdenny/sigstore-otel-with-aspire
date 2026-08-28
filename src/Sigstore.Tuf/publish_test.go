@@ -542,3 +542,132 @@ func TestCrossGenRecoverPreparingActiveSwitched(t *testing.T) {
 		t.Fatalf("expected symlink at gen 2 after recovery, got %s", activeGenID)
 	}
 }
+
+// TestCrossGenRejectsTamperedDomainInCommittedForward proves that a tampered
+// TrustDomainID in the next-generation manifest is rejected during
+// committed-state forward-complete recovery.
+func TestCrossGenRejectsTamperedDomainInCommittedForward(t *testing.T) {
+	statePath := newTestState(t)
+
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance generation normally.
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBootstrap, newGenPath, err := advanceTrustGeneration(statePath, bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sourceFingerprint, _ := fingerprintSource(bootstrap)
+	newSourceFingerprint, _ := fingerprintSource(newBootstrap)
+
+	// Publish normally (TUF commits with gen 2's fingerprint).
+	layout := newTUFLayout(statePath)
+	state := readTestPublicationState(t, layout)
+	err = publishNewTargets(layout, state, newGenPath, newBootstrap, sourceFingerprint, newSourceFingerprint, publicationHooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now tamper: rewrite gen 2's manifest with a different TrustDomainID.
+	gen2ManifestPath := filepath.Join(statePath, "generations", "generation-00000002", "manifest.json")
+	manifestBytes, err := os.ReadFile(gen2ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest generationManifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.TrustDomainID = "tampered-domain-id"
+	tamperedBytes, _ := json.Marshal(manifest)
+	if err := os.WriteFile(gen2ManifestPath, tamperedBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recovery should FAIL (not forward-complete with tampered domain).
+	_, err = ensureTUFRepository(statePath)
+	if err == nil {
+		t.Fatal("expected error for tampered domain ID in next-gen, got nil")
+	}
+	t.Logf("correctly rejected tampered domain: %v", err)
+
+	// Verify active generation is still gen 1.
+	activeGenID, _ := readActiveGeneration(filepath.Join(statePath, "active-generation"))
+	if activeGenID != "generation-00000001" {
+		t.Fatalf("expected gen 1 preserved, got %s", activeGenID)
+	}
+}
+
+// TestCrossGenRejectsTamperedDomainInPreparingForward proves that a tampered
+// TrustDomainID in the next-generation manifest is rejected during
+// preparing-state forward-complete recovery (TUF active→candidate).
+func TestCrossGenRejectsTamperedDomainInPreparingForward(t *testing.T) {
+	statePath := newTestState(t)
+
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance generation and publish with crash after active switch.
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBootstrap, newGenPath, err := advanceTrustGeneration(statePath, bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sourceFingerprint, _ := fingerprintSource(bootstrap)
+	newSourceFingerprint, _ := fingerprintSource(newBootstrap)
+
+	layout := newTUFLayout(statePath)
+	state := readTestPublicationState(t, layout)
+
+	hooks := publicationHooks{
+		checkpoint: func(name publicationCheckpoint) error {
+			if name == checkpointActiveSwitched {
+				return &testError{msg: "crash after active switch"}
+			}
+			return nil
+		},
+	}
+	_ = publishNewTargets(layout, state, newGenPath, newBootstrap, sourceFingerprint, newSourceFingerprint, hooks)
+
+	// Tamper the gen 2 manifest.
+	gen2ManifestPath := filepath.Join(statePath, "generations", "generation-00000002", "manifest.json")
+	manifestBytes, err := os.ReadFile(gen2ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest generationManifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.TrustDomainID = "tampered-domain-id"
+	tamperedBytes, _ := json.Marshal(manifest)
+	if err := os.WriteFile(gen2ManifestPath, tamperedBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recovery should FAIL.
+	_, err = ensureTUFRepository(statePath)
+	if err == nil {
+		t.Fatal("expected error for tampered domain in preparing-forward, got nil")
+	}
+	t.Logf("correctly rejected tampered domain: %v", err)
+
+	// Gen 1 preserved.
+	activeGenID, _ := readActiveGeneration(filepath.Join(statePath, "active-generation"))
+	if activeGenID != "generation-00000001" {
+		t.Fatalf("expected gen 1 preserved, got %s", activeGenID)
+	}
+}
