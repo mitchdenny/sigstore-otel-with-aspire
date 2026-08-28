@@ -139,12 +139,14 @@ func dispatchOidcRotationWithHooks(statePath string, hooks publicationHooks) (re
 		return "", fmt.Errorf("rotate OIDC generation: %w", err)
 	}
 
-	// Update TUF trust_status target with new generation info.
-	if err := updateTrustStatusForOidcRotation(statePath, newBootstrap); err != nil {
-		return "", fmt.Errorf("update TUF trust status: %w", err)
+	// Publish updated TUF trust_status through proper candidate→commit lifecycle.
+	// This must happen BEFORE switching the active-generation symlink so that
+	// the active publication's fingerprint remains valid during the switch.
+	if err := publishOidcTrustStatusUpdate(statePath, bootstrap, newBootstrap, hooks); err != nil {
+		return "", fmt.Errorf("publish OIDC trust status update: %w", err)
 	}
 
-	// Switch active-generation symlink.
+	// Switch active-generation symlink now that TUF publication succeeded.
 	if err := switchActiveGeneration(statePath, bootstrap, newBootstrap, newBootstrap.GenerationManifestSHA256); err != nil {
 		return "", fmt.Errorf("switch active generation: %w", err)
 	}
@@ -224,8 +226,8 @@ func rotateOidcGeneration(statePath string, current bootstrapManifest) (bootstra
 	newKid := base64.RawURLEncoding.EncodeToString(newKidHash[:])
 
 	// Copy all files from current generation to new generation.
-	if err := os.MkdirAll(filepath.Dir(newGenerationPath), 0o755); err != nil {
-		return bootstrapManifest{}, fmt.Errorf("create generations directory: %w", err)
+	if err := os.MkdirAll(newGenerationPath, 0o755); err != nil {
+		return bootstrapManifest{}, fmt.Errorf("create new generation directory: %w", err)
 	}
 	if err := copyDirectory(currentGenerationPath, newGenerationPath); err != nil {
 		_ = os.RemoveAll(newGenerationPath)
@@ -428,76 +430,219 @@ func validateAndReuseOidcGeneration(
 	}, nil
 }
 
-// updateTrustStatusForOidcRotation updates the trust_status.v1.json target
-// in TUF with the new generation information. TrustedRoot and SigningConfig
-// bytes remain unchanged (OIDC keys are not in TrustedRoot).
-func updateTrustStatusForOidcRotation(statePath string, newBootstrap bootstrapManifest) error {
-	tufPath := filepath.Join(statePath, "tuf")
+// publishOidcTrustStatusUpdate updates TUF with the new generation's
+// trust_status.v1.json using the proper candidate→commit publication lifecycle.
+// TrustedRoot, SigningConfig, and all other targets remain byte-identical.
+func publishOidcTrustStatusUpdate(
+	statePath string,
+	oldBootstrap bootstrapManifest,
+	newBootstrap bootstrapManifest,
+	hooks publicationHooks,
+) error {
+	oldFingerprint, err := fingerprintSource(oldBootstrap)
+	if err != nil {
+		return fmt.Errorf("compute old source fingerprint: %w", err)
+	}
+	newFingerprint, err := fingerprintSource(newBootstrap)
+	if err != nil {
+		return fmt.Errorf("compute new source fingerprint: %w", err)
+	}
+
 	layout := newTUFLayout(statePath)
+	if err := ensureTUFLayout(layout); err != nil {
+		return err
+	}
 	state, err := loadPublicationState(layout)
 	if err != nil {
 		return fmt.Errorf("load TUF publication state: %w", err)
 	}
+	if state.Status != publicationStatusCommitted {
+		return fmt.Errorf("OIDC rotation requires committed publication, found %q", state.Status)
+	}
 	if state.Active == nil {
-		return fmt.Errorf("no active TUF publication for OIDC rotation trust status update")
+		return fmt.Errorf("no active TUF publication for OIDC rotation")
+	}
+	if err := cleanupPublicationTemps(layout); err != nil {
+		return err
+	}
+	if err := cleanupUnjournaledCandidate(layout); err != nil {
+		return err
 	}
 
 	activePath := committedPath(layout, state.Active.ID)
-	statusPath := filepath.Join(activePath, "targets", trustStatusTargetName)
+	if _, _, err := validateExistingRepository(activePath, oldFingerprint); err != nil {
+		return fmt.Errorf("validate active publication before OIDC rotation: %w", err)
+	}
+
+	// Copy active publication to candidate.
+	if err := os.Mkdir(layout.candidate, 0o755); err != nil {
+		return fmt.Errorf("create OIDC rotation candidate directory: %w", err)
+	}
+	if err := copyDirectory(activePath, layout.candidate); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return err
+	}
+
+	// Read and update trust_status in candidate.
+	statusPath := filepath.Join(layout.candidate, "targets", trustStatusTargetName)
 	statusData, err := os.ReadFile(statusPath)
 	if err != nil {
-		return fmt.Errorf("read existing trust status target: %w", err)
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("read trust status from candidate: %w", err)
 	}
 	var status trustStatusTarget
 	if err := json.Unmarshal(statusData, &status); err != nil {
-		return fmt.Errorf("parse existing trust status target: %w", err)
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("parse trust status: %w", err)
 	}
 
-	// Update generation info (TrustedRoot/SigningConfig unchanged).
 	status.Generation = newBootstrap.Generation
 	status.GenerationID = newBootstrap.GenerationID
 	status.GenerationManifestSHA256 = newBootstrap.GenerationManifestSHA256
-	status.TUFTargetsVersion = status.TUFTargetsVersion + 1
 
 	updatedStatus, err := json.MarshalIndent(status, "", "  ")
 	if err != nil {
+		_ = os.RemoveAll(layout.candidate)
 		return fmt.Errorf("marshal updated trust status: %w", err)
 	}
 	updatedStatusBytes := append(updatedStatus, '\n')
 
-	// Write to both TUF repository targets and public targets.
-	store := tuf.FileSystemStore(tufPath, nil)
+	// Write updated target to candidate staged + public.
+	if err := os.WriteFile(statusPath, updatedStatusBytes, 0o644); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("write candidate trust status target: %w", err)
+	}
+	stagedPath := filepath.Join(layout.candidate, "staged", "targets", trustStatusTargetName)
+	if err := os.MkdirAll(filepath.Dir(stagedPath), 0o755); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("create candidate staged targets dir: %w", err)
+	}
+	if err := os.WriteFile(stagedPath, updatedStatusBytes, 0o644); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("write candidate staged trust status: %w", err)
+	}
+
+	// Re-sign TUF metadata in candidate with updated target.
+	store := tuf.FileSystemStore(layout.candidate, nil)
 	repository, err := tuf.NewRepoIndent(store, "", "  ")
 	if err != nil {
-		return fmt.Errorf("open TUF repository for OIDC rotation: %w", err)
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("open candidate TUF repository: %w", err)
 	}
+	rootVersion, err := repository.RootVersion()
+	if err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("read candidate root version: %w", err)
+	}
+	targetsVersion, err := repository.TargetsVersion()
+	if err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("read candidate targets version: %w", err)
+	}
+	newTargetsVersion := int(targetsVersion) + 1
 
-	stagedStatusPath := filepath.Join(tufPath, "staged", "targets", trustStatusTargetName)
-	if err := os.MkdirAll(filepath.Dir(stagedStatusPath), 0o755); err != nil {
-		return fmt.Errorf("create staged targets directory: %w", err)
+	// Patch trust_status with correct TUF versions.
+	status.TUFRootVersion = int(rootVersion)
+	status.TUFTargetsVersion = newTargetsVersion
+	updatedStatus, err = json.MarshalIndent(status, "", "  ")
+	if err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("re-marshal trust status with versions: %w", err)
 	}
-	if err := os.WriteFile(stagedStatusPath, updatedStatusBytes, 0o644); err != nil {
-		return fmt.Errorf("write staged trust status: %w", err)
-	}
-	// Update in active publication targets too.
+	updatedStatusBytes = append(updatedStatus, '\n')
 	if err := os.WriteFile(statusPath, updatedStatusBytes, 0o644); err != nil {
-		return fmt.Errorf("write active trust status: %w", err)
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("rewrite candidate trust status with versions: %w", err)
+	}
+	if err := os.WriteFile(stagedPath, updatedStatusBytes, 0o644); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("rewrite staged trust status with versions: %w", err)
 	}
 
-	rootExpires := time.Now().UTC().AddDate(1, 0, 0)
-	if err := repository.AddTargetWithExpires(trustStatusTargetName, nil, rootExpires); err != nil {
-		return fmt.Errorf("re-add trust status target: %w", err)
+	rootAndTargetsExpires := time.Now().UTC().AddDate(1, 0, 0)
+	if err := repository.AddTargetWithExpires(trustStatusTargetName, nil, rootAndTargetsExpires); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("add updated trust status target: %w", err)
 	}
 	if err := repository.SnapshotWithExpires(time.Now().UTC().Add(30 * 24 * time.Hour)); err != nil {
-		return fmt.Errorf("create OIDC rotation TUF snapshot: %w", err)
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("OIDC rotation TUF snapshot: %w", err)
 	}
 	if err := repository.TimestampWithExpires(time.Now().UTC().Add(24 * time.Hour)); err != nil {
-		return fmt.Errorf("create OIDC rotation TUF timestamp: %w", err)
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("OIDC rotation TUF timestamp: %w", err)
 	}
 	if err := repository.Commit(); err != nil {
-		return fmt.Errorf("commit OIDC rotation TUF update: %w", err)
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("commit OIDC rotation TUF: %w", err)
 	}
-	return nil
+
+	// Write repository manifest with new source fingerprint.
+	manifest := tufManifest{
+		SchemaVersion:     tufSchemaVersion,
+		CreatedAtUTC:      time.Now().UTC(),
+		UpdatedAtUTC:      time.Now().UTC(),
+		SourceFingerprint: newFingerprint,
+	}
+	if err := writeRepositoryManifest(layout.candidate, manifest); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("write OIDC rotation manifest: %w", err)
+	}
+
+	// Compute candidate reference and validate uniqueness.
+	candidate, err := repositoryReference(layout.candidate, newFingerprint)
+	if err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("compute OIDC rotation candidate reference: %w", err)
+	}
+	if candidate.ID == state.Active.ID {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("OIDC rotation candidate is identical to active publication")
+	}
+	if pathExists(committedPath(layout, candidate.ID)) {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("OIDC rotation candidate %s already committed", candidate.ID)
+	}
+
+	// Begin transactional publication lifecycle.
+	preparing := state
+	preparing.Status = publicationStatusPreparing
+	preparing.UpdatedAtUTC = time.Now().UTC()
+	preparing.Candidate = &candidate
+	if err := writePublicationState(layout, preparing); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return err
+	}
+	if err := runCheckpoint(hooks, checkpointCandidatePrepared); err != nil {
+		return rollbackPreparingPublication(layout, preparing, oldFingerprint, err)
+	}
+
+	if state.Previous != nil {
+		if err := os.Rename(layout.previous, layout.retiredPrevious); err != nil {
+			return rollbackPreparingPublication(layout, preparing, oldFingerprint,
+				fmt.Errorf("park previous publication: %w", err))
+		}
+	}
+	if err := runCheckpoint(hooks, checkpointHistoryParked); err != nil {
+		return rollbackPreparingPublication(layout, preparing, oldFingerprint, err)
+	}
+
+	candidatePath := committedPath(layout, candidate.ID)
+	if err := os.Rename(layout.candidate, candidatePath); err != nil {
+		return rollbackPreparingPublication(layout, preparing, oldFingerprint,
+			fmt.Errorf("commit OIDC rotation candidate: %w", err))
+	}
+	if err := runCheckpoint(hooks, checkpointCandidateCommitted); err != nil {
+		return rollbackPreparingPublication(layout, preparing, oldFingerprint, err)
+	}
+	if err := switchActivePublication(layout, candidate.ID, hooks); err != nil {
+		return rollbackPreparingPublication(layout, preparing, oldFingerprint, err)
+	}
+	if err := runCheckpoint(hooks, checkpointActiveSwitched); err != nil {
+		return err
+	}
+
+	return finalizePublishPublication(layout, preparing, oldFingerprint, newFingerprint, hooks)
 }
 
 // loadOidcRotationCompletion reads the OIDC rotation completion file.

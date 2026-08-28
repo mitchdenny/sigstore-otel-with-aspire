@@ -892,6 +892,11 @@ internal sealed class SigstoreOperationExecutor(
             using var ecdsa = System.Security.Cryptography.ECDsa.Create(
                 System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
             var publicKeyDer = ecdsa.ExportSubjectPublicKeyInfo();
+            // Fulcio expects PEM-encoded public key.
+            var pemContent = "-----BEGIN PUBLIC KEY-----\n"
+                + Convert.ToBase64String(publicKeyDer)
+                + "\n-----END PUBLIC KEY-----\n";
+            // Fulcio PoP requires signing the subject/email from the token.
             var body = new
             {
                 publicKeyRequest = new
@@ -899,11 +904,11 @@ internal sealed class SigstoreOperationExecutor(
                     publicKey = new
                     {
                         algorithm = "ECDSA",
-                        content = Convert.ToBase64String(publicKeyDer)
+                        content = pemContent
                     },
                     proofOfPossession = Convert.ToBase64String(
                         ecdsa.SignData(
-                            System.Text.Encoding.UTF8.GetBytes("sigstore"),
+                            System.Text.Encoding.UTF8.GetBytes("demo@sigstore.local"),
                             System.Security.Cryptography.HashAlgorithmName.SHA256))
                 }
             };
