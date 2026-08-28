@@ -28,10 +28,16 @@ internal static partial class SigstoreStateBootstrapper
     private const string BootstrapOperation = "bootstrap";
     private const string MigrationOperation = "migrate-schema-4";
     private const string OidcRotationOperation = "oidc-rotation";
+    private const string TsaRotationOperation = "tsa-rotation";
     private const string GenerationAdvanceOperation = "generation-advance";
     private const string OidcRotationDirectoryName = "oidc-rotation";
+    private const string TsaRotationDirectoryName = "tsa-rotation";
     private const string OidcRotationCompletionFileName =
         "rotate-oidc-signing-key.completed";
+    private const string TsaRotationCompletionFileName =
+        "rotate-timestamp-authority.completed";
+    private const string TsaRotationRequestFileName =
+        "rotate-timestamp-authority.request";
 
     private static readonly string[] GenerationMaterialFiles =
         LegacyRequiredStateFiles
@@ -609,6 +615,7 @@ internal static partial class SigstoreStateBootstrapper
             BootstrapOperation
             or MigrationOperation
             or OidcRotationOperation
+            or TsaRotationOperation
             or GenerationAdvanceOperation))
         {
             throw new InvalidDataException(
@@ -630,7 +637,9 @@ internal static partial class SigstoreStateBootstrapper
             throw new InvalidDataException(
                 "Initial trust transitions cannot reference a prior generation.");
         }
-        if (journal.Operation is OidcRotationOperation or GenerationAdvanceOperation)
+        if (journal.Operation is OidcRotationOperation
+            or TsaRotationOperation
+            or GenerationAdvanceOperation)
         {
             if (journal.PriorGeneration is null)
             {
@@ -1018,6 +1027,11 @@ internal static partial class SigstoreStateBootstrapper
             null,
             null,
             null,
+            null,
+            0,
+            null,
+            null,
+            null,
             files);
 
     private static void ValidateTrustDomain(
@@ -1113,8 +1127,9 @@ internal static partial class SigstoreStateBootstrapper
             throw new InvalidDataException(
                 "A fresh generation cannot reference a schema-4 manifest.");
         }
-        ValidateGenerationFileMap(generation.Files);
+        ValidateGenerationFileMap(generation);
         ValidateOidcRotationMetadata(generation);
+        ValidateTsaRotationMetadata(generation);
     }
 
     private static void ValidateGenerationCryptography(
@@ -1141,6 +1156,14 @@ internal static partial class SigstoreStateBootstrapper
                 RekorPrivateKeyPath,
                 RekorPublicKeyPath));
         var tsa = ValidateTimestampAuthority(generationPath);
+        if (tsa.HasRootPrivateKey
+            == (generation.TsaRotationOperationId is not null))
+        {
+            throw new InvalidDataException(
+                generation.TsaRotationOperationId is null
+                    ? "A non-rotated generation is missing its TSA root key."
+                    : "A rotated generation must not retain its TSA root key.");
+        }
         EnsureEqual(
             "TSA root certificate",
             generation.TsaRootSha256,
@@ -1337,10 +1360,14 @@ internal static partial class SigstoreStateBootstrapper
     }
 
     private static void ValidateGenerationFileMap(
-        SortedDictionary<string, string> files)
+        GenerationManifest generation)
     {
         var required = GenerationMaterialFiles.ToHashSet(StringComparer.Ordinal);
-        var actual = files.Keys.ToHashSet(StringComparer.Ordinal);
+        if (generation.TsaRotationOperationId is not null)
+        {
+            required.Remove(TsaRootPrivateKeyPath);
+        }
+        var actual = generation.Files.Keys.ToHashSet(StringComparer.Ordinal);
         if (!required.IsSubsetOf(actual))
         {
             throw new InvalidDataException(
@@ -1354,11 +1381,54 @@ internal static partial class SigstoreStateBootstrapper
                     $"The generation manifest contains unexpected file '{path}'.");
             }
         }
-        foreach (var pair in files)
+        foreach (var pair in generation.Files)
         {
             ValidateSha256(
                 pair.Value,
                 $"generation file '{pair.Key}'");
+        }
+    }
+
+    private static void ValidateTsaRotationMetadata(
+        GenerationManifest generation)
+    {
+        if (generation.TsaRotationOperationId is null)
+        {
+            if (generation.TsaPriorGeneration != 0
+                || generation.TsaPriorGenerationId is not null
+                || generation.TsaPriorRootSha256 is not null
+                || generation.TsaPriorLeafSha256 is not null)
+            {
+                throw new InvalidDataException(
+                    "Generation contains partial TSA rotation metadata.");
+            }
+            return;
+        }
+
+        if (!Guid.TryParseExact(
+                generation.TsaRotationOperationId,
+                "N",
+                out _)
+            || generation.TsaRotationOperationId.Any(char.IsUpper)
+            || generation.TsaPriorGeneration < InitialGeneration
+            || generation.TsaPriorGeneration >= generation.Generation
+            || generation.TsaPriorGenerationId
+                != GenerationId(generation.TsaPriorGeneration))
+        {
+            throw new InvalidDataException(
+                "Generation contains invalid TSA rotation identity metadata.");
+        }
+        ValidateSha256(
+            generation.TsaPriorRootSha256,
+            "prior TSA root");
+        ValidateSha256(
+            generation.TsaPriorLeafSha256,
+            "prior TSA leaf");
+        if (generation.TsaPriorRootSha256 == generation.TsaRootSha256
+            || generation.TsaPriorLeafSha256 == generation.TsaLeafSha256)
+        {
+            throw new InvalidDataException(
+                "TSA rotation did not replace both chain certificates.");
         }
     }
 
@@ -1559,6 +1629,18 @@ internal static partial class SigstoreStateBootstrapper
         if (File.Exists(Path.Combine(layout.Root, OidcRotationCompletionFileName)))
         {
             allowed.Add(OidcRotationCompletionFileName);
+        }
+        if (Directory.Exists(Path.Combine(layout.Root, TsaRotationDirectoryName)))
+        {
+            allowed.Add(TsaRotationDirectoryName);
+        }
+        if (File.Exists(Path.Combine(layout.Root, TsaRotationCompletionFileName)))
+        {
+            allowed.Add(TsaRotationCompletionFileName);
+        }
+        if (File.Exists(Path.Combine(layout.Root, TsaRotationRequestFileName)))
+        {
+            allowed.Add(TsaRotationRequestFileName);
         }
         EnsureOnlyEntries(
             layout.Root,

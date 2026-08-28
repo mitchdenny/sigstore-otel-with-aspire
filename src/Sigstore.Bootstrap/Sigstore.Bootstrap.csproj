@@ -11,6 +11,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Sigstore.Bootstrap.Tests" />
     <InternalsVisibleTo Include="Sigstore.Aspire.Hosting" />
+    <InternalsVisibleTo Include="Sigstore.Aspire.Hosting.Tests" />
   </ItemGroup>
 
 </Project>

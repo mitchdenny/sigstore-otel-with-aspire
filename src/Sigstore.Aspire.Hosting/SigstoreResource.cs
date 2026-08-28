@@ -14,6 +14,7 @@ public sealed class SigstoreResource(
     private SigstoreRuntimeHealthSnapshot _runtimeHealth =
         SigstoreRuntimeHealthSnapshot.Starting([]);
     private SigstoreOperationState? _operation;
+    private SigstoreOperationRecoveryState? _recovery;
 
     public string StatePath { get; } = statePath;
 
@@ -202,7 +203,36 @@ public sealed class SigstoreResource(
         {
             return new SigstoreParentPresentationSnapshot(
                 _runtimeHealth,
-                _operation);
+                _operation,
+                _recovery);
+        }
+    }
+
+    internal void SetOperationRecovery(
+        string command,
+        string phase,
+        string displayState,
+        string message)
+    {
+        lock (_sync)
+        {
+            _recovery = new SigstoreOperationRecoveryState(
+                command,
+                phase,
+                displayState,
+                message,
+                DateTimeOffset.UtcNow);
+        }
+    }
+
+    internal void ClearOperationRecovery(string command)
+    {
+        lock (_sync)
+        {
+            if (_recovery?.Command == command)
+            {
+                _recovery = null;
+            }
         }
     }
 
@@ -277,4 +307,12 @@ internal sealed record SigstoreOperationState(
 
 internal sealed record SigstoreParentPresentationSnapshot(
     SigstoreRuntimeHealthSnapshot RuntimeHealth,
-    SigstoreOperationState? Operation);
+    SigstoreOperationState? Operation,
+    SigstoreOperationRecoveryState? Recovery);
+
+internal sealed record SigstoreOperationRecoveryState(
+    string Command,
+    string Phase,
+    string DisplayState,
+    string Message,
+    DateTimeOffset UpdatedAtUtc);

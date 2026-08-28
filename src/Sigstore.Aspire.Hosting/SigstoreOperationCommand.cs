@@ -20,6 +20,8 @@ internal static class SigstoreOperationCommand
     public const string RestartClientsCommand = "restart-clients";
     public const string PublishTrustedRootCommand = "publish-trusted-root";
     public const string RotateOidcSigningKeyCommand = "rotate-oidc-signing-key";
+    public const string RotateTimestampAuthorityCommand =
+        "rotate-timestamp-authority";
 
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
@@ -199,7 +201,22 @@ internal static class SigstoreOperationCommand
     {
         var presentation = resource.GetPresentation();
         return presentation.Operation is null
+            && presentation.Recovery is null
             && presentation.RuntimeHealth.State == "Healthy"
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
+    internal static ResourceCommandState
+        GetTimestampAuthorityRotationCommandState(
+            SigstoreResource resource)
+    {
+        var presentation = resource.GetPresentation();
+        return presentation.Operation is null
+            && presentation.RuntimeHealth.State == "Healthy"
+            && (presentation.Recovery is null
+                || presentation.Recovery.Command
+                    == RotateTimestampAuthorityCommand)
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
@@ -235,6 +252,16 @@ internal sealed class SigstoreOperationExecutor(
     private const string OidcRotationStatusOidcRestarted =
         "oidc-restarted";
     private const string OidcRotationStatusCompleted = "completed";
+    private const string TsaRotationStatusRequested = "requested";
+    private const string TsaRotationStatusCandidateGenerated =
+        "candidate-generated";
+    private const string TsaRotationStatusWorkerCommitted =
+        "worker-committed";
+    private const string TsaRotationStatusClientsConverged =
+        "clients-converged";
+    private const string TsaRotationStatusTimestampRestarted =
+        "timestamp-restarted";
+    private const string TsaRotationStatusCompleted = "completed";
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
         {
@@ -476,6 +503,1706 @@ internal sealed class SigstoreOperationExecutor(
             await runtime.PublishParentStateAsync(resource);
         }
     }
+
+    public async Task<ExecuteCommandResult>
+        ExecuteRotateTimestampAuthorityAsync(
+            CancellationToken requestCancellationToken)
+    {
+        requestCancellationToken.ThrowIfCancellationRequested();
+        if (!resource.TryBeginOperation(
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+                "Rotating Timestamp Authority",
+                out var lease,
+                out var active))
+        {
+            return CreateContentionResult(
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+                active!);
+        }
+
+        var execution = new OperationExecution(
+            resource,
+            runtime,
+            logger,
+            lease!,
+            total: 18);
+        try
+        {
+            return await ExecuteRotateTimestampAuthorityCoreAsync(
+                execution,
+                requestCancellationToken);
+        }
+        catch (Exception exception)
+            when (IsExpectedOperationFailure(exception)
+                || exception is CryptographicException)
+        {
+            execution.AddError(
+                execution.Phase,
+                resource.Name,
+                null,
+                exception.Message);
+            return execution.Failure(
+                $"{SigstoreOperationCommand.RotateTimestampAuthorityCommand} " +
+                $"failed during {execution.Phase}.");
+        }
+        finally
+        {
+            lease!.Dispose();
+            await runtime.PublishParentStateAsync(resource);
+        }
+    }
+
+    private async Task<ExecuteCommandResult>
+        ExecuteRotateTimestampAuthorityCoreAsync(
+            OperationExecution execution,
+            CancellationToken requestCancellationToken)
+    {
+        await execution.ReportAsync(
+            "preflight",
+            0,
+            "Validating durable trust, TUF, resource, and TSA signer state.");
+
+        TimestampAuthorityRotationCommandJournal operation;
+        SigstoreOperationSnapshot before;
+        SigstoreResourceInstanceSnapshot workerBefore;
+        var workerStarted = false;
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-rotate-timestamp-authority-preflight"))
+        {
+            requestCancellationToken.ThrowIfCancellationRequested();
+            workerBefore = runtime.GetRequiredSnapshot(
+                resource.Components.TufBootstrap.Resource);
+            var timestampBefore = runtime.GetRequiredSnapshot(
+                resource.Components.Timestamp.Resource);
+            if (!execution.Check(
+                    "worker-restartable",
+                    IsTerminal(workerBefore)
+                        && HasContainerIdentity(workerBefore),
+                    "terminal with container identity",
+                    Describe(workerBefore),
+                    "preflight",
+                    workerBefore.Resource)
+                || !execution.Check(
+                    "timestamp-running",
+                    IsRunningHealthy(timestampBefore)
+                        && HasContainerIdentity(timestampBefore),
+                    "Running/Healthy with container identity",
+                    Describe(timestampBefore),
+                    "preflight",
+                    timestampBefore.Resource))
+            {
+                return execution.Failure(
+                    "Timestamp rotation resource preconditions are not satisfied.");
+            }
+
+            var incomplete = LoadIncompleteTimestampAuthorityRotation(
+                resource.StatePath);
+            var recovering = incomplete is not null;
+            if (incomplete is null
+                && !await ValidatePreconditionsAsync(
+                    execution,
+                    requestCancellationToken))
+            {
+                return execution.Failure(
+                    "Timestamp rotation preconditions are not satisfied.");
+            }
+            operation = incomplete
+                ?? await CreateTimestampAuthorityRotationOperationAsync(
+                    timestampBefore,
+                    requestCancellationToken);
+            before = operation.StartingSnapshot;
+            execution.Before = before;
+            execution.TimestampAuthorityRotation =
+                CreateTimestampAuthorityRotationResult(
+                    operation,
+                    recovered: operation.Status
+                        != TsaRotationStatusRequested);
+
+            if (operation.TrustDomainId
+                    != before.Tuf.Trust.TrustDomainId
+                || operation.StartingGenerationId
+                    != $"generation-{operation.StartingGeneration:D8}"
+                || operation.StartingGenerationDirectorySha256
+                    != ReadGenerationDirectoryFingerprint(
+                        resource.StatePath,
+                        operation.StartingGenerationId)
+                || operation.StartingNonTsaMaterialSha256
+                    != ReadGenerationNonTsaFingerprint(
+                        resource.StatePath,
+                        operation.StartingGenerationId))
+            {
+                execution.AddError(
+                    "preflight",
+                    resource.Name,
+                    null,
+                    "Durable TSA rotation state does not match its immutable " +
+                    "starting generation.");
+                return execution.Failure(
+                    "Timestamp rotation recovery validation failed.");
+            }
+            if (recovering
+                && !ValidateProtectedResources(
+                    execution,
+                    operation.ProtectedResources,
+                    "preflight"))
+            {
+                return execution.Failure(
+                    "A protected Sigstore service changed during TSA rotation.");
+            }
+
+            var active = ReadActiveTimestampGeneration(resource.StatePath);
+            if (active.Generation == operation.StartingGeneration)
+            {
+                if (active.GenerationId != operation.StartingGenerationId
+                    || active.TsaRootSha256
+                        != operation.StartingTsaRootSha256
+                    || active.TsaLeafSha256
+                        != operation.StartingTsaLeafSha256
+                    || !SameInstance(
+                        new SigstoreResourceInstanceSnapshot(
+                            resource.Components.Timestamp.Resource.Name,
+                            operation.TimestampResourceId,
+                            KnownResourceStates.Running,
+                            nameof(HealthStatus.Healthy),
+                            null,
+                            null,
+                            operation.TimestampStartTimeUtc,
+                            null,
+                            operation.TimestampContainerId),
+                        timestampBefore))
+                {
+                    execution.AddError(
+                        "preflight",
+                        resource.Components.Timestamp.Resource.Name,
+                        null,
+                        "The old TSA generation or running timestamp instance " +
+                        "changed before additive trust publication.");
+                    return execution.Failure(
+                        "The old timestamp signer is not safely recoverable.");
+                }
+
+                await execution.ReportAsync(
+                    "generate-candidate",
+                    2,
+                    "Generating or validating the operation-bound TSA chain.");
+                var candidatePath = TimestampAuthorityCandidatePath(
+                    resource.StatePath,
+                    operation.OperationId);
+                var candidate =
+                    SigstoreStateBootstrapper
+                        .EnsureTimestampAuthorityRotationCandidate(
+                            candidatePath);
+                if (operation.CandidateTsaRootSha256 is not null
+                    && (operation.CandidateTsaRootSha256
+                            != candidate.RootSha256
+                        || operation.CandidateTsaLeafSha256
+                            != candidate.LeafSha256))
+                {
+                    throw new InvalidDataException(
+                        "The TSA rotation candidate changed during replay.");
+                }
+                operation = operation with
+                {
+                    Status = TsaRotationStatusCandidateGenerated,
+                    CandidateTsaRootSha256 = candidate.RootSha256,
+                    CandidateTsaLeafSha256 = candidate.LeafSha256
+                };
+                WriteTimestampAuthorityRotationJournal(
+                    resource.StatePath,
+                    operation);
+
+                await execution.ReportAsync(
+                    "write-signal",
+                    3,
+                    "Writing the operation-bound TSA rotation worker request.");
+                WriteTimestampAuthorityRotationRequest(
+                    resource.StatePath,
+                    operation);
+                resource.SetOperationRecovery(
+                    SigstoreOperationCommand
+                        .RotateTimestampAuthorityCommand,
+                    "request-written",
+                    "TSA Recovery Pending",
+                    "The operation-bound worker request must be completed " +
+                    "before other trust mutations.");
+                workerStarted = true;
+            }
+            else if (active.Generation
+                    != operation.StartingGeneration + 1
+                || active.TsaRotationOperationId
+                    != operation.OperationId)
+            {
+                execution.AddError(
+                    "preflight",
+                    resource.Name,
+                    null,
+                    "The active generation is not bound to this incomplete " +
+                    "TSA rotation.");
+                return execution.Failure(
+                    "Timestamp rotation cannot be resumed safely.");
+            }
+        }
+
+        if (workerStarted)
+        {
+            await execution.ReportAsync(
+                "start-worker",
+                4,
+                "Starting the dedicated TUF worker for the TSA generation.");
+            ExecuteCommandResult workerStart;
+            using (var workerCritical =
+                new CancellationTokenSource(WorkerTimeout))
+            {
+                workerStart = await runtime.ExecuteCommandAsync(
+                    resource.Components.TufBootstrap.Resource,
+                    KnownResourceCommands.StartCommand,
+                    workerCritical.Token);
+            }
+            if (!workerStart.Success)
+            {
+                resource.SetOperationRecovery(
+                    SigstoreOperationCommand
+                        .RotateTimestampAuthorityCommand,
+                    "start-worker",
+                    "TSA Recovery Pending",
+                    "The durable TSA request exists and must be replayed.");
+                await runtime.PublishParentStateAsync(resource);
+                execution.AddError(
+                    "start-worker",
+                    resource.Components.TufBootstrap.Resource.Name,
+                    null,
+                    workerStart.Message
+                        ?? "Aspire rejected the TUF worker start.");
+                return execution.Failure(
+                    "The TSA rotation worker could not be started.");
+            }
+
+            await execution.ReportAsync(
+                "wait-worker",
+                5,
+                "Waiting for additive TUF publication and generation switch.");
+            SigstoreResourceInstanceSnapshot workerAfter;
+            using (var workerWait =
+                new CancellationTokenSource(WorkerTimeout))
+            {
+                workerAfter = await runtime.WaitForSnapshotAsync(
+                    resource.Components.TufBootstrap.Resource,
+                    snapshot => IsNewInstance(workerBefore, snapshot)
+                        && IsTerminal(snapshot),
+                    WorkerTimeout,
+                    workerWait.Token);
+            }
+            execution.Resources.Add(
+                CreateLifecycleResult(
+                    workerAfter.Resource,
+                    KnownResourceCommands.StartCommand,
+                    workerBefore,
+                    workerAfter,
+                    null));
+            if (!IsSuccessfulTerminal(workerAfter))
+            {
+                resource.SetOperationRecovery(
+                    SigstoreOperationCommand
+                        .RotateTimestampAuthorityCommand,
+                    "worker-failed",
+                    "TSA Recovery Pending",
+                    "The durable TSA request must be replayed before other " +
+                    "trust mutations.");
+                await runtime.PublishParentStateAsync(resource);
+                execution.AddError(
+                    "wait-worker",
+                    workerAfter.Resource,
+                    null,
+                    $"Worker completed as {Describe(workerAfter)}. Reinvoke " +
+                    "the command to replay the durable request.");
+                return execution.Failure(
+                    "The TSA rotation worker did not complete successfully.");
+            }
+        }
+
+        await execution.ReportAsync(
+            "additive-postconditions",
+            6,
+            "Validating additive trust, immutable generations, and TUF commit.");
+        resource.SetOperationRecovery(
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+            "worker-completion-validation",
+            "TSA Recovery Pending",
+            "The durable worker result must be validated before activation.");
+        await runtime.PublishParentStateAsync(resource);
+        SigstoreOperationSnapshot after;
+        IReadOnlyList<SigstoreTimestampAuthorityTrustEntry>
+            trustedAuthorities;
+        TimestampAuthorityMaterialInfo newMaterial;
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-rotate-timestamp-authority-postconditions"))
+        {
+            using var postToken =
+                new CancellationTokenSource(WorkerTimeout);
+            after = await CaptureAsync(postToken.Token);
+            execution.After = after;
+            var completion = ReadTimestampAuthorityWorkerCompletion(
+                resource.StatePath)
+                ?? throw new InvalidDataException(
+                    "The TSA worker completion record is missing.");
+            ValidateTimestampAuthorityCompletion(
+                completion,
+                operation,
+                after);
+            newMaterial = SigstoreTimestampAuthority.ReadActiveMaterial(
+                resource.StatePath);
+            trustedAuthorities =
+                SigstoreTimestampAuthority.ReadTrustedAuthorities(
+                    resource.StatePath);
+            operation = operation with
+            {
+                Status = TsaRotationStatusWorkerCommitted,
+                WorkerCompletion = completion
+            };
+            WriteTimestampAuthorityRotationJournal(
+                resource.StatePath,
+                operation);
+        }
+        resource.SetOperationRecovery(
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+            "worker-committed",
+            "TSA Activation Pending",
+            "Additive TSA trust is committed; all clients must converge " +
+            "before the timestamp service can restart.");
+        await runtime.PublishParentStateAsync(resource);
+
+        ValidateTimestampAuthorityPublicationPostconditions(
+            execution,
+            resource.StatePath,
+            operation,
+            before,
+            after,
+            newMaterial,
+            trustedAuthorities);
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "Additive TSA trust was published, but postconditions failed.");
+        }
+
+        await execution.ReportAsync(
+            "prove-old-signer",
+            7,
+            "Proving the old in-memory TSA signer remains active.");
+        var timestampBeforeClients = runtime.GetRequiredSnapshot(
+            resource.Components.Timestamp.Resource);
+        var oldLiveProbe = await runtime.ProbeTimestampAuthorityAsync(
+            trustedAuthorities,
+            requestCancellationToken);
+        var activationAlreadySafe =
+            oldLiveProbe.Evidence.RootSha256
+                == operation.WorkerCompletion!.NewTsaRootSha256
+            && oldLiveProbe.Evidence.LeafSha256
+                == operation.WorkerCompletion.NewTsaLeafSha256
+            && IsNewInstance(
+                new SigstoreResourceInstanceSnapshot(
+                    timestampBeforeClients.Resource,
+                    operation.TimestampResourceId,
+                    KnownResourceStates.Running,
+                    nameof(HealthStatus.Healthy),
+                    null,
+                    null,
+                    operation.TimestampStartTimeUtc,
+                    null,
+                    operation.TimestampContainerId),
+                timestampBeforeClients)
+            && operation.Clients.Count == 6
+            && operation.Clients.All(
+                client => client.StartTimeUtc is null
+                    || timestampBeforeClients.StartTimeUtc
+                        > client.StartTimeUtc);
+        execution.Check(
+            "old-signer-still-running",
+            activationAlreadySafe
+                || oldLiveProbe.Evidence.RootSha256
+                        == operation.StartingTsaRootSha256
+                    && oldLiveProbe.Evidence.LeafSha256
+                        == operation.StartingTsaLeafSha256
+                    && timestampBeforeClients.ContainerId
+                        == operation.TimestampContainerId
+                    && timestampBeforeClients.StartTimeUtc
+                        == operation.TimestampStartTimeUtc,
+            "the original signer or a safely ordered recovered activation",
+            $"{oldLiveProbe.Evidence.RootSha256}/" +
+                $"{oldLiveProbe.Evidence.LeafSha256} on " +
+                $"{timestampBeforeClients.ContainerId}",
+            "prove-old-signer",
+            timestampBeforeClients.Resource);
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "The old TSA signer did not remain stable before client uptake.");
+        }
+
+        await execution.ReportAsync(
+            "restart-clients",
+            8,
+            "Converging all six clients before TSA activation.");
+        var clients = resource.GetRegistrations().Clients
+            .OrderBy(
+                client => client.Resource.Name,
+                StringComparer.Ordinal)
+            .ToArray();
+        if (!execution.Check(
+                "six-clients-registered",
+                clients.Length == 6,
+                "6",
+                clients.Length.ToString(CultureInfo.InvariantCulture),
+                "restart-clients",
+                resource.Name))
+        {
+            return execution.Failure(
+                "The Sigstore parent does not have exactly six clients.");
+        }
+
+        using var clientCritical = new CancellationTokenSource(
+            TimeSpan.FromMinutes(20));
+        foreach (var (client, index) in clients.Select(
+            (client, index) => (client, index)))
+        {
+            var clientBefore = runtime.GetRequiredSnapshot(client.Resource);
+            if (!execution.Check(
+                    $"{client.Resource.Name}-ready",
+                    IsRunningHealthy(clientBefore)
+                        && HasContainerIdentity(clientBefore),
+                    "Running/Healthy with container identity",
+                    Describe(clientBefore),
+                    "restart-client",
+                    client.Resource.Name))
+            {
+                return execution.Failure(
+                    $"{client.Resource.Name} is not ready for convergence.");
+            }
+
+            SigstoreClientTrustStatus? currentStatus = null;
+            try
+            {
+                currentStatus = await runtime.ReadClientStatusAsync(
+                    client,
+                    clientCritical.Token);
+            }
+            catch (Exception exception)
+                when (IsExpectedOperationFailure(exception))
+            {
+                logger.LogInformation(
+                    exception,
+                    "{Client} requires restart before TSA trust convergence.",
+                    client.Resource.Name);
+            }
+
+            SigstoreResourceInstanceSnapshot clientAfter;
+            string lifecycleCommand;
+            if (currentStatus is not null
+                && MatchesDisk(after.Tuf.Trust, currentStatus))
+            {
+                clientAfter = clientBefore;
+                lifecycleCommand = "already-converged";
+            }
+            else
+            {
+                await execution.ReportAsync(
+                    "restart-client",
+                    8 + index,
+                    $"Restarting {client.Resource.Name} before TSA activation.");
+                var restart = await runtime.ExecuteCommandAsync(
+                    client.Resource,
+                    KnownResourceCommands.RestartCommand,
+                    clientCritical.Token);
+                if (!restart.Success)
+                {
+                    execution.AddError(
+                        "restart-client",
+                        client.Resource.Name,
+                        null,
+                        restart.Message
+                            ?? "Aspire rejected the client restart.");
+                    return execution.Failure(
+                        $"{client.Resource.Name} could not be restarted.");
+                }
+                clientAfter = await runtime.WaitForSnapshotAsync(
+                    client.Resource,
+                    snapshot => IsNewInstance(clientBefore, snapshot)
+                        && IsRunningHealthy(snapshot),
+                    ClientTimeout,
+                    clientCritical.Token);
+                currentStatus = await runtime.ReadClientStatusAsync(
+                    client,
+                    clientCritical.Token);
+                lifecycleCommand = KnownResourceCommands.RestartCommand;
+            }
+
+            if (!execution.Check(
+                    $"{client.Resource.Name}-trust-status",
+                    currentStatus is not null
+                        && MatchesDisk(after.Tuf.Trust, currentStatus),
+                    DescribeTrust(after.Tuf.Trust),
+                    currentStatus is null
+                        ? "unavailable"
+                        : DescribeTrust(currentStatus),
+                    "restart-client",
+                    client.Resource.Name))
+            {
+                return execution.Failure(
+                    $"{client.Resource.Name} did not converge on additive TSA trust.");
+            }
+            execution.Resources.Add(
+                CreateLifecycleResult(
+                    client.Resource.Name,
+                    lifecycleCommand,
+                    clientBefore,
+                    clientAfter,
+                    currentStatus));
+            operation = operation with
+            {
+                Clients = UpsertClientConvergence(
+                    operation.Clients,
+                    new TimestampAuthorityClientConvergence(
+                        client.Resource.Name,
+                        clientAfter.ContainerId!,
+                        clientAfter.StartTimeUtc,
+                        DateTimeOffset.UtcNow,
+                        currentStatus!))
+            };
+            WriteTimestampAuthorityRotationJournal(
+                resource.StatePath,
+                operation);
+            resource.SetOperationRecovery(
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+                "client-convergence",
+                "TSA Activation Pending",
+                "Client convergence is incomplete; the timestamp signer " +
+                "remains on the old chain.");
+            await runtime.PublishParentStateAsync(resource);
+        }
+
+        operation = operation with
+        {
+            Status = TsaRotationStatusClientsConverged,
+            ClientsConvergedAtUtc = DateTimeOffset.UtcNow
+        };
+        WriteTimestampAuthorityRotationJournal(
+            resource.StatePath,
+            operation);
+        resource.SetOperationRecovery(
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+            "clients-converged",
+            "TSA Activation Pending",
+            "All clients trust both TSA chains; timestamp signer restart " +
+            "and RFC3161 proof remain pending.");
+        await runtime.PublishParentStateAsync(resource);
+        await execution.ReportAsync(
+            "clients-converged",
+            14,
+            "All clients trust both TSA generations; activation is now safe.");
+
+        var historicalEvidence =
+            await runtime.ValidateStoredTimestampAuthorityResponseAsync(
+                File.ReadAllBytes(
+                    TimestampAuthorityOldRequestPath(
+                        resource.StatePath,
+                        operation.OperationId)),
+                File.ReadAllBytes(
+                    TimestampAuthorityOldResponsePath(
+                        resource.StatePath,
+                        operation.OperationId)),
+                trustedAuthorities,
+                clientCritical.Token);
+        execution.Check(
+            "historical-old-timestamp-valid",
+            historicalEvidence == operation.OldTimestamp,
+            $"{operation.OldTimestamp.RootSha256}/" +
+                operation.OldTimestamp.LeafSha256,
+            $"{historicalEvidence.RootSha256}/" +
+                historicalEvidence.LeafSha256,
+            "clients-converged",
+            resource.Name);
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "The retained old timestamp did not validate under additive trust.");
+        }
+
+        await execution.ReportAsync(
+            "restart-timestamp",
+            15,
+            "Restarting only the timestamp authority exactly once.");
+        var timestampCurrent = runtime.GetRequiredSnapshot(
+            resource.Components.Timestamp.Resource);
+        var currentProbe = await runtime.ProbeTimestampAuthorityAsync(
+            trustedAuthorities,
+            clientCritical.Token);
+        SigstoreResourceInstanceSnapshot timestampAfter;
+        var newRoot = operation.WorkerCompletion!.NewTsaRootSha256;
+        var newLeaf = operation.WorkerCompletion.NewTsaLeafSha256;
+        if (currentProbe.Evidence.RootSha256
+                == operation.StartingTsaRootSha256
+            && currentProbe.Evidence.LeafSha256
+                == operation.StartingTsaLeafSha256)
+        {
+            if (timestampCurrent.ContainerId
+                    != operation.TimestampContainerId
+                || timestampCurrent.StartTimeUtc
+                    != operation.TimestampStartTimeUtc)
+            {
+                throw new InvalidDataException(
+                    "Timestamp instance changed but still serves the old signer.");
+            }
+            var restart = await runtime.ExecuteCommandAsync(
+                resource.Components.Timestamp.Resource,
+                KnownResourceCommands.RestartCommand,
+                clientCritical.Token);
+            if (!restart.Success)
+            {
+                execution.AddError(
+                    "restart-timestamp",
+                    timestampCurrent.Resource,
+                    null,
+                    restart.Message
+                        ?? "Aspire rejected the timestamp restart.");
+                return execution.Failure(
+                    "The timestamp authority could not be restarted.");
+            }
+            timestampAfter = await runtime.WaitForSnapshotAsync(
+                resource.Components.Timestamp.Resource,
+                snapshot => IsNewInstance(timestampCurrent, snapshot)
+                    && IsRunningHealthy(snapshot),
+                ClientTimeout,
+                clientCritical.Token);
+            execution.Resources.Add(
+                CreateLifecycleResult(
+                    timestampAfter.Resource,
+                    KnownResourceCommands.RestartCommand,
+                    timestampCurrent,
+                    timestampAfter,
+                    null));
+        }
+        else if (currentProbe.Evidence.RootSha256 == newRoot
+            && currentProbe.Evidence.LeafSha256 == newLeaf
+            && IsNewInstance(
+                new SigstoreResourceInstanceSnapshot(
+                    timestampCurrent.Resource,
+                    operation.TimestampResourceId,
+                    KnownResourceStates.Running,
+                    nameof(HealthStatus.Healthy),
+                    null,
+                    null,
+                    operation.TimestampStartTimeUtc,
+                    null,
+                    operation.TimestampContainerId),
+                timestampCurrent)
+            && operation.Clients.All(
+                client => client.StartTimeUtc is null
+                    || timestampCurrent.StartTimeUtc
+                        > client.StartTimeUtc))
+        {
+            timestampAfter = timestampCurrent;
+        }
+        else
+        {
+            throw new InvalidDataException(
+                "The running timestamp signer cannot be ordered safely after " +
+                "client convergence.");
+        }
+
+        await execution.ReportAsync(
+            "prove-new-signer",
+            16,
+            "Validating a real RFC3161 response from the new TSA chain.");
+        var newProbe = await runtime.ProbeTimestampAuthorityAsync(
+            trustedAuthorities,
+            clientCritical.Token);
+        execution.Check(
+            "new-timestamp-uses-new-chain",
+            newProbe.Evidence.RootSha256 == newRoot
+                && newProbe.Evidence.LeafSha256 == newLeaf,
+            $"{newRoot}/{newLeaf}",
+            $"{newProbe.Evidence.RootSha256}/" +
+                newProbe.Evidence.LeafSha256,
+            "prove-new-signer",
+            timestampAfter.Resource);
+        operation = operation with
+        {
+            Status = TsaRotationStatusTimestampRestarted,
+            TimestampAfterContainerId = timestampAfter.ContainerId,
+            TimestampAfterStartTimeUtc = timestampAfter.StartTimeUtc,
+            NewTimestamp = newProbe.Evidence,
+            HistoricalTimestampValidated = true
+        };
+        WriteTimestampAuthorityRotationJournal(
+            resource.StatePath,
+            operation);
+        resource.SetOperationRecovery(
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+            "timestamp-restarted",
+            "TSA Verification Pending",
+            "The new signer is active; aggregate trust and lifecycle " +
+            "postconditions remain pending.");
+        await runtime.PublishParentStateAsync(resource);
+
+        await execution.ReportAsync(
+            "aggregate-status",
+            17,
+            "Verifying disk, served TUF, clients, and running TSA agreement.");
+        await runtime.WaitForAggregateHealthyAsync(
+            AggregateTimeout,
+            clientCritical.Token);
+        var aggregate = await runtime.CollectStatusAsync(
+            clientCritical.Token);
+        execution.Check(
+            "aggregate-status-ready",
+            aggregate.Ready
+                && aggregate.Clients.Count == clients.Length,
+            $"ready=true and {clients.Length} converged clients",
+            aggregate.Reason
+                ?? $"ready={aggregate.Ready}, clients={aggregate.Clients.Count}",
+            "aggregate-status",
+            resource.Name);
+        execution.Check(
+            "protected-services-not-restarted",
+            ValidateProtectedResources(
+                execution,
+                operation.ProtectedResources,
+                "final-verification"),
+            "all protected service container identities unchanged",
+            "see per-resource postconditions",
+            "final-verification",
+            resource.Name);
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "TSA activation completed, but final convergence checks failed.");
+        }
+
+        operation = operation with
+        {
+            Status = TsaRotationStatusCompleted,
+            CompletedAtUtc = DateTimeOffset.UtcNow
+        };
+        WriteTimestampAuthorityRotationJournal(
+            resource.StatePath,
+            operation);
+        resource.ClearOperationRecovery(
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand);
+        execution.TimestampAuthorityRotation =
+            CreateTimestampAuthorityRotationResult(
+                operation,
+                recovered: operation.StartedAtUtc
+                    < execution.Progress[0].ObservedAtUtc);
+        await execution.ReportAsync(
+            "complete",
+            18,
+            "Timestamp authority rotated with additive historical trust.");
+        return execution.Success(
+            $"Timestamp authority rotated: " +
+            $"{operation.StartingTsaLeafSha256} -> {newLeaf} " +
+            $"(generation {operation.StartingGeneration} -> " +
+            $"{operation.WorkerCompletion.NewGeneration}).");
+    }
+
+    private async Task<TimestampAuthorityRotationCommandJournal>
+        CreateTimestampAuthorityRotationOperationAsync(
+            SigstoreResourceInstanceSnapshot timestamp,
+            CancellationToken cancellationToken)
+    {
+        var starting = await CaptureAsync(cancellationToken);
+        if (!MatchesServed(starting.Tuf, starting.Served))
+        {
+            throw new InvalidDataException(
+                "Disk and served TUF state differ before TSA rotation.");
+        }
+        var active = SigstoreTimestampAuthority.ReadActiveMaterial(
+            resource.StatePath);
+        var trusted = SigstoreTimestampAuthority.ReadTrustedAuthorities(
+            resource.StatePath);
+        if (!trusted.Any(
+                authority =>
+                    authority.RootSha256 == active.RootSha256
+                    && authority.LeafSha256 == active.LeafSha256))
+        {
+            throw new InvalidDataException(
+                "TrustedRoot does not contain the running TSA generation.");
+        }
+        if (trusted.Any(
+                authority => authority.Uri
+                    != SigstoreDefaults.TimestampAuthorityUrl))
+        {
+            throw new InvalidDataException(
+                "TrustedRoot timestamp-authority routing does not match the " +
+                "canonical SigningConfig service.");
+        }
+        var probe = await runtime.ProbeTimestampAuthorityAsync(
+            trusted,
+            cancellationToken);
+        if (probe.Evidence.RootSha256 != active.RootSha256
+            || probe.Evidence.LeafSha256 != active.LeafSha256)
+        {
+            throw new InvalidDataException(
+                "The running timestamp signer does not match the active " +
+                "generation before rotation.");
+        }
+
+        var operationId = Guid.NewGuid().ToString("N");
+        var operationPath = TimestampAuthorityOperationPath(
+            resource.StatePath,
+            operationId);
+        Directory.CreateDirectory(operationPath);
+        WriteCreateNewBytes(
+            TimestampAuthorityOldRequestPath(
+                resource.StatePath,
+                operationId),
+            probe.Request);
+        WriteCreateNewBytes(
+            TimestampAuthorityOldResponsePath(
+                resource.StatePath,
+                operationId),
+            probe.Response);
+
+        var protectedResources = CaptureProtectedResources();
+        var operation = new TimestampAuthorityRotationCommandJournal(
+            1,
+            operationId,
+            TsaRotationStatusRequested,
+            DateTimeOffset.UtcNow,
+            null,
+            starting.Tuf.Trust.TrustDomainId,
+            starting.Tuf.Trust.Generation,
+            starting.Tuf.Trust.GenerationId,
+            active.RootSha256,
+            active.LeafSha256,
+            ReadGenerationDirectoryFingerprint(
+                resource.StatePath,
+                starting.Tuf.Trust.GenerationId),
+            ReadGenerationNonTsaFingerprint(
+                resource.StatePath,
+                starting.Tuf.Trust.GenerationId),
+            starting,
+            timestamp.ResourceId,
+            timestamp.ContainerId!,
+            timestamp.StartTimeUtc,
+            protectedResources,
+            trusted
+                .Select(
+                    authority => new TimestampAuthorityTrustIdentity(
+                        authority.Index,
+                        authority.Uri,
+                        authority.RootSha256,
+                        authority.LeafSha256))
+                .ToArray(),
+            probe.Evidence,
+            null,
+            null,
+            null,
+            [],
+            null,
+            null,
+            null,
+            null,
+            false);
+        WriteTimestampAuthorityRotationJournal(
+            resource.StatePath,
+            operation);
+        resource.SetOperationRecovery(
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+            "requested",
+            "TSA Recovery Pending",
+            "The durable timestamp proof is captured; candidate generation " +
+            "or replay must complete before other trust mutations.");
+        return operation;
+    }
+
+    private static TimestampAuthorityRotationCommandJournal?
+        LoadIncompleteTimestampAuthorityRotation(string statePath)
+    {
+        var root = Path.Combine(statePath, "tsa-rotation");
+        if (!Directory.Exists(root))
+        {
+            return null;
+        }
+        foreach (var directory in Directory.EnumerateDirectories(root))
+        {
+            var operationId = Path.GetFileName(directory);
+            if (!Guid.TryParseExact(operationId, "N", out _)
+                || operationId.Any(char.IsUpper))
+            {
+                throw new InvalidDataException(
+                    $"Unexpected TSA operation directory '{directory}'.");
+            }
+            if (File.Exists(Path.Combine(directory, "command.json")))
+            {
+                continue;
+            }
+            var entries = Directory.EnumerateFileSystemEntries(directory)
+                .Select(Path.GetFileName)
+                .ToHashSet(StringComparer.Ordinal);
+            if (!entries.IsSubsetOf(
+                    new HashSet<string>(
+                        ["old-request.tsq", "old-response.tsr"],
+                        StringComparer.Ordinal)))
+            {
+                throw new InvalidDataException(
+                    $"Unjournaled TSA operation directory '{directory}' " +
+                    "contains ambiguous state.");
+            }
+            Directory.Delete(directory, recursive: true);
+        }
+        var journals = Directory
+            .EnumerateFiles(root, "command.json", SearchOption.AllDirectories)
+            .Select(
+                path =>
+                {
+                    var journal = JsonSerializer.Deserialize<
+                        TimestampAuthorityRotationCommandJournal>(
+                            File.ReadAllText(path),
+                            JsonOptions)
+                        ?? throw new InvalidDataException(
+                            $"TSA command journal '{path}' is empty.");
+                    if (journal.SchemaVersion != 1
+                        || !Guid.TryParseExact(
+                            journal.OperationId,
+                            "N",
+                            out _)
+                        || journal.OperationId.Any(char.IsUpper)
+                        || Path.GetFileName(
+                            Path.GetDirectoryName(path))
+                            != journal.OperationId
+                        || journal.Status is not (
+                            TsaRotationStatusRequested
+                            or TsaRotationStatusCandidateGenerated
+                            or TsaRotationStatusWorkerCommitted
+                            or TsaRotationStatusClientsConverged
+                            or TsaRotationStatusTimestampRestarted
+                            or TsaRotationStatusCompleted)
+                        || journal.StartingGeneration < 1
+                        || journal.StartingGenerationId
+                            != $"generation-{journal.StartingGeneration:D8}"
+                        || !IsLowerHexSha256(
+                            journal.StartingTsaRootSha256)
+                        || !IsLowerHexSha256(
+                            journal.StartingTsaLeafSha256)
+                        || journal.StartingSnapshot.Tuf.Trust.TrustDomainId
+                            != journal.TrustDomainId
+                        || journal.StartingSnapshot.Tuf.Trust.Generation
+                            != journal.StartingGeneration
+                        || journal.StartingSnapshot.Tuf.Trust.GenerationId
+                            != journal.StartingGenerationId
+                        || journal.Clients
+                            .Select(client => client.Resource)
+                            .Distinct(StringComparer.Ordinal)
+                            .Count() != journal.Clients.Count)
+                    {
+                        throw new InvalidDataException(
+                            $"TSA command journal '{path}' has invalid state.");
+                    }
+
+                    var requestPath =
+                        TimestampAuthorityOldRequestPath(
+                            statePath,
+                            journal.OperationId);
+                    var responsePath =
+                        TimestampAuthorityOldResponsePath(
+                            statePath,
+                            journal.OperationId);
+                    if (!File.Exists(requestPath)
+                        || !File.Exists(responsePath)
+                        || Hash(File.ReadAllBytes(requestPath))
+                            != journal.OldTimestamp.RequestSha256
+                        || Hash(File.ReadAllBytes(responsePath))
+                            != journal.OldTimestamp.ResponseSha256)
+                    {
+                        throw new InvalidDataException(
+                            $"TSA command journal '{path}' has invalid " +
+                            "historical RFC3161 evidence.");
+                    }
+                    if (journal.Status is TsaRotationStatusWorkerCommitted
+                            or TsaRotationStatusClientsConverged
+                            or TsaRotationStatusTimestampRestarted
+                        && journal.WorkerCompletion is null)
+                    {
+                        throw new InvalidDataException(
+                            $"TSA command journal '{path}' omits worker state.");
+                    }
+                    if (journal.Status
+                            == TsaRotationStatusTimestampRestarted
+                        && (journal.NewTimestamp is null
+                            || string.IsNullOrWhiteSpace(
+                                journal.TimestampAfterContainerId)
+                            || !journal.HistoricalTimestampValidated))
+                    {
+                        throw new InvalidDataException(
+                            $"TSA command journal '{path}' omits activation proof.");
+                    }
+                    return journal;
+                })
+            .Where(
+                journal => journal.Status
+                    != TsaRotationStatusCompleted)
+            .ToArray();
+        return journals.Length switch
+        {
+            0 => null,
+            1 => journals[0],
+            _ => throw new InvalidDataException(
+                "Multiple incomplete TSA rotation operations exist.")
+        };
+    }
+
+    private static void WriteTimestampAuthorityRotationRequest(
+        string statePath,
+        TimestampAuthorityRotationCommandJournal operation)
+    {
+        var request = new TimestampAuthorityRotationWorkerRequest(
+            1,
+            operation.OperationId,
+            operation.TrustDomainId,
+            operation.StartingGeneration,
+            operation.StartingGenerationId,
+            operation.StartingTsaRootSha256,
+            operation.StartingTsaLeafSha256,
+            operation.CandidateTsaRootSha256
+                ?? throw new InvalidDataException(
+                    "TSA candidate root fingerprint is missing."),
+            operation.CandidateTsaLeafSha256
+                ?? throw new InvalidDataException(
+                    "TSA candidate leaf fingerprint is missing."));
+        var path = Path.Combine(
+            statePath,
+            "rotate-timestamp-authority.request");
+        if (File.Exists(path))
+        {
+            var existing = JsonSerializer.Deserialize<
+                TimestampAuthorityRotationWorkerRequest>(
+                    File.ReadAllText(path),
+                    JsonOptions);
+            if (existing != request)
+            {
+                throw new InvalidDataException(
+                    "The surviving TSA worker request belongs to another " +
+                    "operation or candidate.");
+            }
+            return;
+        }
+        WriteCreateNewJson(path, request);
+    }
+
+    private static TimestampAuthorityRotationWorkerCompletion?
+        ReadTimestampAuthorityWorkerCompletion(string statePath)
+    {
+        var path = Path.Combine(
+            statePath,
+            "rotate-timestamp-authority.completed");
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+        var completion = JsonSerializer.Deserialize<
+            TimestampAuthorityRotationWorkerCompletion>(
+                File.ReadAllText(path),
+                JsonOptions)
+            ?? throw new InvalidDataException(
+                "The TSA worker completion is empty.");
+        if (completion.SchemaVersion != 1
+            || !Guid.TryParseExact(completion.OperationId, "N", out _)
+            || completion.OperationId.Any(char.IsUpper)
+            || completion.PriorGeneration < 1
+            || completion.NewGeneration
+                != completion.PriorGeneration + 1
+            || completion.PriorGenerationId
+                != $"generation-{completion.PriorGeneration:D8}"
+            || completion.NewGenerationId
+                != $"generation-{completion.NewGeneration:D8}"
+            || !IsLowerHexSha256(completion.PriorTsaRootSha256)
+            || !IsLowerHexSha256(completion.PriorTsaLeafSha256)
+            || !IsLowerHexSha256(completion.NewTsaRootSha256)
+            || !IsLowerHexSha256(completion.NewTsaLeafSha256)
+            || !IsLowerHexSha256(completion.ManifestSha256)
+            || !IsLowerHexSha256(
+                completion.PublicationManifestSha256)
+            || !IsLowerHexSha256(completion.TrustedRootSha256)
+            || !IsLowerHexSha256(completion.SigningConfigSha256)
+            || completion.PublicationId
+                != $"sha256-{completion.PublicationManifestSha256}"
+            || completion.TsaTrustEntryCount < 2)
+        {
+            throw new InvalidDataException(
+                "The TSA worker completion is invalid.");
+        }
+        return completion;
+    }
+
+    private static void ValidateTimestampAuthorityCompletion(
+        TimestampAuthorityRotationWorkerCompletion completion,
+        TimestampAuthorityRotationCommandJournal operation,
+        SigstoreOperationSnapshot after)
+    {
+        if (completion.OperationId != operation.OperationId
+            || completion.TrustDomainId != operation.TrustDomainId
+            || completion.PriorGeneration
+                != operation.StartingGeneration
+            || completion.PriorGenerationId
+                != operation.StartingGenerationId
+            || completion.PriorTsaRootSha256
+                != operation.StartingTsaRootSha256
+            || completion.PriorTsaLeafSha256
+                != operation.StartingTsaLeafSha256
+            || completion.NewGeneration
+                != operation.StartingGeneration + 1
+            || completion.NewGenerationId
+                != after.Tuf.Trust.GenerationId
+            || completion.NewTsaRootSha256
+                != operation.CandidateTsaRootSha256
+            || completion.NewTsaLeafSha256
+                != operation.CandidateTsaLeafSha256
+            || completion.ManifestSha256
+                != after.Tuf.Trust.GenerationManifestSha256
+            || completion.PublicationId
+                != after.Tuf.Trust.PublicationId
+            || completion.PublicationManifestSha256
+                != after.Tuf.Trust.PublicationManifestSha256
+            || completion.TrustedRootSha256
+                != after.Tuf.Trust.TrustedRootSha256
+            || completion.SigningConfigSha256
+                != after.Tuf.Trust.SigningConfigSha256)
+        {
+            throw new InvalidDataException(
+                "The TSA worker completion does not match the durable " +
+                "operation or committed trust state.");
+        }
+    }
+
+    private static void WriteTimestampAuthorityRotationJournal(
+        string statePath,
+        TimestampAuthorityRotationCommandJournal operation)
+    {
+        var directory = TimestampAuthorityOperationPath(
+            statePath,
+            operation.OperationId);
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "command.json");
+        var temporary = Path.Combine(
+            directory,
+            $".command.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+        var data = JsonSerializer.Serialize(operation, JsonOptions) + "\n";
+        using (var stream = new FileStream(
+            temporary,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            4096,
+            FileOptions.WriteThrough))
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(
+                    temporary,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+            var bytes = Encoding.UTF8.GetBytes(data);
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+        }
+        File.Move(temporary, path, overwrite: true);
+        SyncParentDirectory(path);
+    }
+
+    private IReadOnlyList<SigstoreResourceInstanceSnapshot>
+        CaptureProtectedResources()
+    {
+        var clients = resource.GetRegistrations().Clients
+            .Select(client => client.Resource.Name)
+            .ToHashSet(StringComparer.Ordinal);
+        return resource.GetRegistrations().RequiredResources
+            .Where(
+                required =>
+                    required.Name
+                        != resource.Components.Timestamp.Resource.Name
+                    && !clients.Contains(required.Name))
+            .OrderBy(required => required.Name, StringComparer.Ordinal)
+            .Select(
+                required =>
+                {
+                    var snapshot = runtime.GetRequiredSnapshot(required);
+                    if (!IsRunningHealthy(snapshot)
+                        || !HasContainerIdentity(snapshot))
+                    {
+                        throw new InvalidOperationException(
+                            $"Protected resource '{required.Name}' is " +
+                            $"{Describe(snapshot)}.");
+                    }
+                    return snapshot;
+                })
+            .ToArray();
+    }
+
+    private bool ValidateProtectedResources(
+        OperationExecution execution,
+        IReadOnlyList<SigstoreResourceInstanceSnapshot> expected,
+        string phase)
+    {
+        var registrations = resource.GetRegistrations().RequiredResources
+            .ToDictionary(item => item.Name, StringComparer.Ordinal);
+        var valid = true;
+        foreach (var prior in expected.OrderBy(
+            item => item.Resource,
+            StringComparer.Ordinal))
+        {
+            if (!registrations.TryGetValue(
+                    prior.Resource,
+                    out var registered))
+            {
+                execution.AddError(
+                    phase,
+                    prior.Resource,
+                    "protected-resource-registered",
+                    "The protected resource is no longer registered.");
+                valid = false;
+                continue;
+            }
+            var current = runtime.GetRequiredSnapshot(registered);
+            valid &= execution.Check(
+                $"{prior.Resource}-not-restarted",
+                SameInstance(prior, current)
+                    && IsRunningHealthy(current),
+                Describe(prior),
+                Describe(current),
+                phase,
+                prior.Resource);
+        }
+        return valid;
+    }
+
+    private static void ValidateTimestampAuthorityPublicationPostconditions(
+        OperationExecution execution,
+        string statePath,
+        TimestampAuthorityRotationCommandJournal operation,
+        SigstoreOperationSnapshot before,
+        SigstoreOperationSnapshot after,
+        TimestampAuthorityMaterialInfo newMaterial,
+        IReadOnlyList<SigstoreTimestampAuthorityTrustEntry>
+            trustedAuthorities)
+    {
+        var completion = operation.WorkerCompletion
+            ?? throw new InvalidDataException(
+                "TSA worker completion is missing.");
+        execution.Check(
+            "generation-advanced",
+            after.Tuf.Trust.Generation
+                    == before.Tuf.Trust.Generation + 1
+                && after.Tuf.Trust.GenerationId
+                    != before.Tuf.Trust.GenerationId,
+            $"generation {before.Tuf.Trust.Generation + 1}",
+            $"generation {after.Tuf.Trust.Generation}",
+            "additive-postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "tsa-chain-changed",
+            newMaterial.RootSha256 == completion.NewTsaRootSha256
+                && newMaterial.LeafSha256
+                    == completion.NewTsaLeafSha256
+                && newMaterial.RootSha256
+                    != operation.StartingTsaRootSha256
+                && newMaterial.LeafSha256
+                    != operation.StartingTsaLeafSha256,
+            $"{completion.NewTsaRootSha256}/" +
+                completion.NewTsaLeafSha256,
+            $"{newMaterial.RootSha256}/{newMaterial.LeafSha256}",
+            "additive-postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "active-tsa-secret-set-bounded",
+            !newMaterial.HasRootPrivateKey
+                && HasBoundedActiveTimestampSecrets(statePath),
+            "only signer.key and password in active private/tsa",
+            newMaterial.HasRootPrivateKey
+                ? "root private key retained"
+                : "bounded signer material",
+            "additive-postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "operation-private-candidate-retired",
+            !Directory.Exists(
+                Path.Combine(
+                    TimestampAuthorityCandidatePath(
+                        statePath,
+                        operation.OperationId),
+                    "private")),
+            "no operation candidate private material after worker completion",
+            Directory.Exists(
+                Path.Combine(
+                    TimestampAuthorityCandidatePath(
+                        statePath,
+                        operation.OperationId),
+                    "private"))
+                ? "candidate private directory remains"
+                : "retired",
+            "additive-postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "prior-generation-immutable",
+            ReadGenerationDirectoryFingerprint(
+                    statePath,
+                    operation.StartingGenerationId)
+                == operation.StartingGenerationDirectorySha256,
+            operation.StartingGenerationDirectorySha256,
+            ReadGenerationDirectoryFingerprint(
+                statePath,
+                operation.StartingGenerationId),
+            "additive-postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "non-tsa-generation-material-unchanged",
+            ReadGenerationNonTsaFingerprint(
+                    statePath,
+                    after.Tuf.Trust.GenerationId)
+                == operation.StartingNonTsaMaterialSha256,
+            operation.StartingNonTsaMaterialSha256,
+            ReadGenerationNonTsaFingerprint(
+                statePath,
+                after.Tuf.Trust.GenerationId),
+            "additive-postconditions",
+            "tuf-bootstrap");
+        CheckEqual(
+            execution,
+            "trust-domain-unchanged",
+            before.Tuf.Trust.TrustDomainId,
+            after.Tuf.Trust.TrustDomainId);
+        CheckEqual(
+            execution,
+            "tuf-root-unchanged",
+            before.Tuf.Metadata.Root,
+            after.Tuf.Metadata.Root);
+        CheckEqual(
+            execution,
+            "bootstrap-root-unchanged",
+            before.Tuf.BootstrapRootSha256,
+            after.Tuf.BootstrapRootSha256);
+        CheckEqual(
+            execution,
+            "signing-config-routing-unchanged",
+            before.Tuf.Trust.SigningConfigSha256,
+            after.Tuf.Trust.SigningConfigSha256);
+        execution.Check(
+            "trusted-root-additive-change",
+            before.Tuf.Trust.TrustedRootSha256
+                != after.Tuf.Trust.TrustedRootSha256,
+            "changed TrustedRoot hash",
+            after.Tuf.Trust.TrustedRootSha256,
+            "additive-postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "publication-advanced-with-prior-history",
+            after.Tuf.Trust.PublicationId
+                    != before.Tuf.Trust.PublicationId
+                && after.Tuf.PreviousPublicationId
+                    == before.Tuf.Trust.PublicationId
+                && after.Tuf.PreviousPublicationManifestSha256
+                    == before.Tuf.Trust.PublicationManifestSha256,
+            DescribePublication(before.Tuf.Trust),
+            DescribePublication(after.Tuf.Trust) +
+                $" previous={after.Tuf.PreviousPublicationId}/" +
+                after.Tuf.PreviousPublicationManifestSha256,
+            "additive-postconditions",
+            "tuf-bootstrap");
+        CheckAdvanced(
+            execution,
+            "targets-advanced",
+            before.Tuf.Metadata.Targets,
+            after.Tuf.Metadata.Targets);
+        CheckAdvanced(
+            execution,
+            "snapshot-advanced",
+            before.Tuf.Metadata.Snapshot,
+            after.Tuf.Metadata.Snapshot);
+        CheckAdvanced(
+            execution,
+            "timestamp-metadata-advanced",
+            before.Tuf.Metadata.Timestamp,
+            after.Tuf.Metadata.Timestamp);
+
+        var expectedOld = operation.StartingTrustedAuthorities
+            .OrderBy(item => item.Index)
+            .ToArray();
+        var actualOld = trustedAuthorities
+            .Take(expectedOld.Length)
+            .Select(
+                item => new TimestampAuthorityTrustIdentity(
+                    item.Index,
+                    item.Uri,
+                    item.RootSha256,
+                    item.LeafSha256))
+            .ToArray();
+        execution.Check(
+            "old-tsa-trust-preserved",
+            expectedOld.SequenceEqual(actualOld),
+            string.Join(
+                ",",
+                expectedOld.Select(
+                    item => $"{item.RootSha256}/{item.LeafSha256}")),
+            string.Join(
+                ",",
+                actualOld.Select(
+                    item => $"{item.RootSha256}/{item.LeafSha256}")),
+            "additive-postconditions",
+            "trusted_root.json");
+        execution.Check(
+            "new-tsa-trust-appended",
+            trustedAuthorities.Count
+                    == expectedOld.Length + 1
+                && trustedAuthorities[^1].RootSha256
+                    == completion.NewTsaRootSha256
+                && trustedAuthorities[^1].LeafSha256
+                    == completion.NewTsaLeafSha256
+                && trustedAuthorities.Count
+                    == completion.TsaTrustEntryCount,
+            $"{expectedOld.Length + 1} entries ending in the new chain",
+            $"{trustedAuthorities.Count} entries ending in " +
+                $"{trustedAuthorities[^1].RootSha256}/" +
+                trustedAuthorities[^1].LeafSha256,
+            "additive-postconditions",
+            "trusted_root.json");
+        execution.Check(
+            "disk-served-after-tsa-publish",
+            MatchesServed(after.Tuf, after.Served),
+            Describe(after.Tuf),
+            Describe(after.Served),
+            "additive-postconditions",
+            after.TufServer.Resource);
+        execution.Check(
+            "tuf-server-not-restarted",
+            SameInstance(before.TufServer, after.TufServer)
+                && IsRunningHealthy(after.TufServer),
+            Describe(before.TufServer),
+            Describe(after.TufServer),
+            "additive-postconditions",
+            after.TufServer.Resource);
+    }
+
+    private static IReadOnlyList<TimestampAuthorityClientConvergence>
+        UpsertClientConvergence(
+            IReadOnlyList<TimestampAuthorityClientConvergence> existing,
+            TimestampAuthorityClientConvergence current) =>
+        existing
+            .Where(
+                item => item.Resource != current.Resource)
+            .Append(current)
+            .OrderBy(item => item.Resource, StringComparer.Ordinal)
+            .ToArray();
+
+    private static TimestampAuthorityRotationEvidence
+        CreateTimestampAuthorityRotationResult(
+            TimestampAuthorityRotationCommandJournal operation,
+            bool recovered) =>
+        new(
+            operation.OperationId,
+            operation.Status,
+            recovered,
+            operation.StartingGeneration,
+            operation.StartingGenerationId,
+            operation.WorkerCompletion?.NewGeneration,
+            operation.WorkerCompletion?.NewGenerationId,
+            operation.StartingTsaRootSha256,
+            operation.StartingTsaLeafSha256,
+            operation.WorkerCompletion?.NewTsaRootSha256,
+            operation.WorkerCompletion?.NewTsaLeafSha256,
+            operation.WorkerCompletion?.PublicationId,
+            operation.WorkerCompletion?.ManifestSha256,
+            operation.WorkerCompletion?.TsaTrustEntryCount,
+            operation.OldTimestamp,
+            operation.NewTimestamp,
+            operation.HistoricalTimestampValidated,
+            operation.TimestampContainerId,
+            operation.TimestampAfterContainerId,
+            operation.Clients);
+
+    private static ActiveTimestampGeneration
+        ReadActiveTimestampGeneration(string statePath)
+    {
+        var link = new DirectoryInfo(
+            Path.Combine(statePath, "active-generation"));
+        var target = link.LinkTarget
+            ?? throw new InvalidDataException(
+                "The active generation reference is missing.");
+        var generationId = Path.GetFileName(target);
+        using var manifest = JsonDocument.Parse(
+            File.ReadAllBytes(
+                Path.Combine(
+                    statePath,
+                    "generations",
+                    generationId,
+                    "manifest.json")));
+        var root = manifest.RootElement;
+        return new ActiveTimestampGeneration(
+            root.GetProperty("generation").GetInt32(),
+            root.GetProperty("generationId").GetString()
+                ?? throw new InvalidDataException(
+                    "Generation ID is missing."),
+            root.GetProperty("tsaRootSha256").GetString()
+                ?? throw new InvalidDataException(
+                    "TSA root fingerprint is missing."),
+            root.GetProperty("tsaLeafSha256").GetString()
+                ?? throw new InvalidDataException(
+                    "TSA leaf fingerprint is missing."),
+            root.TryGetProperty(
+                "tsaRotationOperationId",
+                out var operation)
+                ? operation.GetString()
+                : null);
+    }
+
+    private static string ReadGenerationDirectoryFingerprint(
+        string statePath,
+        string generationId) =>
+        ReadGenerationFingerprint(
+            statePath,
+            generationId,
+            includeTsa: true,
+            includeManifest: true);
+
+    private static string ReadGenerationNonTsaFingerprint(
+        string statePath,
+        string generationId) =>
+        ReadGenerationFingerprint(
+            statePath,
+            generationId,
+            includeTsa: false,
+            includeManifest: false);
+
+    private static string ReadGenerationFingerprint(
+        string statePath,
+        string generationId,
+        bool includeTsa,
+        bool includeManifest)
+    {
+        var generationPath = Path.Combine(
+            statePath,
+            "generations",
+            generationId);
+        var entries = Directory.EnumerateFiles(
+                generationPath,
+                "*",
+                SearchOption.AllDirectories)
+            .Select(
+                path => new
+                {
+                    Path = Path.GetRelativePath(generationPath, path)
+                        .Replace(Path.DirectorySeparatorChar, '/'),
+                    FullPath = path
+                })
+            .Where(
+                item =>
+                    (includeManifest || item.Path != "manifest.json")
+                    && (includeTsa
+                        || !item.Path.StartsWith(
+                            "private/tsa/",
+                            StringComparison.Ordinal)
+                            && !item.Path.StartsWith(
+                                "public/tsa/",
+                                StringComparison.Ordinal)))
+            .OrderBy(item => item.Path, StringComparer.Ordinal)
+            .Select(
+                item => $"{item.Path}\t" +
+                    $"{Hash(File.ReadAllBytes(item.FullPath))}\n");
+        return Hash(Encoding.UTF8.GetBytes(string.Concat(entries)));
+    }
+
+    private static bool HasBoundedActiveTimestampSecrets(
+        string statePath)
+    {
+        var path = Path.Combine(
+            statePath,
+            "active-generation",
+            "private",
+            "tsa");
+        var files = Directory.EnumerateFiles(
+                path,
+                "*",
+                SearchOption.AllDirectories)
+            .Select(file => Path.GetRelativePath(path, file)
+                .Replace(Path.DirectorySeparatorChar, '/'))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        return files.SequenceEqual(
+            new[] { "password", "signer.key" },
+            StringComparer.Ordinal);
+    }
+
+    private static string TimestampAuthorityOperationPath(
+        string statePath,
+        string operationId) =>
+        Path.Combine(
+            statePath,
+            "tsa-rotation",
+            operationId);
+
+    private static string TimestampAuthorityCandidatePath(
+        string statePath,
+        string operationId) =>
+        Path.Combine(
+            TimestampAuthorityOperationPath(statePath, operationId),
+            "candidate");
+
+    private static string TimestampAuthorityOldRequestPath(
+        string statePath,
+        string operationId) =>
+        Path.Combine(
+            TimestampAuthorityOperationPath(statePath, operationId),
+            "old-request.tsq");
+
+    private static string TimestampAuthorityOldResponsePath(
+        string statePath,
+        string operationId) =>
+        Path.Combine(
+            TimestampAuthorityOperationPath(statePath, operationId),
+            "old-response.tsr");
+
+    private static void WriteCreateNewBytes(
+        string path,
+        ReadOnlySpan<byte> value)
+    {
+        if (File.Exists(path))
+        {
+            if (!File.ReadAllBytes(path).AsSpan().SequenceEqual(value))
+            {
+                throw new InvalidDataException(
+                    $"Durable operation file '{path}' changed.");
+            }
+            return;
+        }
+        using (var stream = new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            4096,
+            FileOptions.WriteThrough))
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(
+                    path,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+            stream.Write(value);
+            stream.Flush(flushToDisk: true);
+        }
+        SyncParentDirectory(path);
+    }
+
+    private static bool IsLowerHexSha256(string value) =>
+        value is { Length: 64 }
+        && value.All(
+            character => character is >= '0' and <= '9'
+                or >= 'a' and <= 'f');
+
+    private static string Hash(ReadOnlySpan<byte> value) =>
+        Convert.ToHexString(SHA256.HashData(value))
+            .ToLowerInvariant();
 
     private async Task<ExecuteCommandResult> ExecuteRotateOidcSigningKeyCoreAsync(
         OperationExecution execution,
@@ -3324,6 +5051,7 @@ internal sealed class SigstoreOperationExecutor(
 
     internal static bool IsExpectedOperationFailure(Exception exception) =>
         exception is SigstoreStatusException
+            or InvalidDataException
             or IOException
             or UnauthorizedAccessException
             or HttpRequestException
@@ -3411,6 +5139,12 @@ internal sealed class SigstoreOperationExecutor(
         public bool? CommittedStatePreserved { get; set; }
 
         public OidcRotationEvidence? OidcRotation { get; set; }
+
+        public TimestampAuthorityRotationEvidence? TimestampAuthorityRotation
+        {
+            get;
+            set;
+        }
 
         public bool HasFailures => Errors.Count != 0;
 
@@ -3505,7 +5239,8 @@ internal sealed class SigstoreOperationExecutor(
                     Checks,
                     CommittedStatePreserved,
                     Errors,
-                    OidcRotation));
+                    OidcRotation,
+                    TimestampAuthorityRotation));
     }
 }
 
@@ -3603,6 +5338,109 @@ internal sealed record OidcRotationEvidence(
     string FulcioContainerId,
     DateTimeOffset? FulcioStartTimeUtc);
 
+internal sealed record TimestampAuthorityRotationWorkerRequest(
+    int SchemaVersion,
+    string OperationId,
+    string TrustDomainId,
+    int StartingGeneration,
+    string StartingGenerationId,
+    string StartingTsaRootSha256,
+    string StartingTsaLeafSha256,
+    string CandidateTsaRootSha256,
+    string CandidateTsaLeafSha256);
+
+internal sealed record TimestampAuthorityRotationWorkerCompletion(
+    int SchemaVersion,
+    string OperationId,
+    string TrustDomainId,
+    DateTimeOffset CompletedAtUtc,
+    int PriorGeneration,
+    string PriorGenerationId,
+    string PriorTsaRootSha256,
+    string PriorTsaLeafSha256,
+    int NewGeneration,
+    string NewGenerationId,
+    string NewTsaRootSha256,
+    string NewTsaLeafSha256,
+    string ManifestSha256,
+    string PublicationId,
+    string PublicationManifestSha256,
+    string TrustedRootSha256,
+    string SigningConfigSha256,
+    int TsaTrustEntryCount);
+
+internal sealed record TimestampAuthorityTrustIdentity(
+    int Index,
+    string Uri,
+    string RootSha256,
+    string LeafSha256);
+
+internal sealed record TimestampAuthorityClientConvergence(
+    string Resource,
+    string ContainerId,
+    DateTime? StartTimeUtc,
+    DateTimeOffset ConvergedAtUtc,
+    SigstoreClientTrustStatus TrustStatus);
+
+internal sealed record TimestampAuthorityRotationCommandJournal(
+    int SchemaVersion,
+    string OperationId,
+    string Status,
+    DateTimeOffset StartedAtUtc,
+    DateTimeOffset? CompletedAtUtc,
+    string TrustDomainId,
+    int StartingGeneration,
+    string StartingGenerationId,
+    string StartingTsaRootSha256,
+    string StartingTsaLeafSha256,
+    string StartingGenerationDirectorySha256,
+    string StartingNonTsaMaterialSha256,
+    SigstoreOperationSnapshot StartingSnapshot,
+    string TimestampResourceId,
+    string TimestampContainerId,
+    DateTime? TimestampStartTimeUtc,
+    IReadOnlyList<SigstoreResourceInstanceSnapshot> ProtectedResources,
+    IReadOnlyList<TimestampAuthorityTrustIdentity> StartingTrustedAuthorities,
+    SigstoreTimestampAuthorityProbeEvidence OldTimestamp,
+    string? CandidateTsaRootSha256,
+    string? CandidateTsaLeafSha256,
+    TimestampAuthorityRotationWorkerCompletion? WorkerCompletion,
+    IReadOnlyList<TimestampAuthorityClientConvergence> Clients,
+    DateTimeOffset? ClientsConvergedAtUtc,
+    string? TimestampAfterContainerId,
+    DateTime? TimestampAfterStartTimeUtc,
+    SigstoreTimestampAuthorityProbeEvidence? NewTimestamp,
+    bool HistoricalTimestampValidated);
+
+internal sealed record TimestampAuthorityRotationEvidence(
+    string OperationId,
+    string Status,
+    bool Recovered,
+    int StartingGeneration,
+    string StartingGenerationId,
+    int? NewGeneration,
+    string? NewGenerationId,
+    string OldRootSha256,
+    string OldLeafSha256,
+    string? NewRootSha256,
+    string? NewLeafSha256,
+    string? TufPublicationId,
+    string? GenerationManifestSha256,
+    int? TrustedAuthorityCount,
+    SigstoreTimestampAuthorityProbeEvidence OldTimestamp,
+    SigstoreTimestampAuthorityProbeEvidence? NewTimestamp,
+    bool HistoricalTimestampValidated,
+    string TimestampBeforeContainerId,
+    string? TimestampAfterContainerId,
+    IReadOnlyList<TimestampAuthorityClientConvergence> Clients);
+
+internal sealed record ActiveTimestampGeneration(
+    int Generation,
+    string GenerationId,
+    string TsaRootSha256,
+    string TsaLeafSha256,
+    string? TsaRotationOperationId);
+
 internal interface ISigstoreOperationRuntime
 {
     SigstoreResourceInstanceSnapshot GetRequiredSnapshot(IResource resource);
@@ -3639,6 +5477,18 @@ internal interface ISigstoreOperationRuntime
         string oidcToken,
         string subject,
         CancellationToken cancellationToken);
+
+    Task<SigstoreTimestampAuthorityProbe> ProbeTimestampAuthorityAsync(
+        IReadOnlyList<SigstoreTimestampAuthorityTrustEntry> trustedAuthorities,
+        CancellationToken cancellationToken);
+
+    Task<SigstoreTimestampAuthorityProbeEvidence>
+        ValidateStoredTimestampAuthorityResponseAsync(
+            ReadOnlyMemory<byte> request,
+            ReadOnlyMemory<byte> response,
+            IReadOnlyList<SigstoreTimestampAuthorityTrustEntry>
+                trustedAuthorities,
+            CancellationToken cancellationToken);
 
     Task PublishParentStateAsync(SigstoreResource resource);
 }
@@ -3696,6 +5546,41 @@ internal sealed class AspireSigstoreOperationRuntime
             oidcToken,
             subject,
             cancellationToken);
+
+    public async Task<SigstoreTimestampAuthorityProbe>
+        ProbeTimestampAuthorityAsync(
+            IReadOnlyList<SigstoreTimestampAuthorityTrustEntry>
+                trustedAuthorities,
+            CancellationToken cancellationToken)
+    {
+        var endpoint = await _resource.Components.Timestamp
+            .GetEndpoint("http")
+            .GetValueAsync(cancellationToken)
+            ?? throw new InvalidOperationException(
+                "The timestamp authority endpoint is not allocated.");
+        return await SigstoreTimestampAuthority.ProbeAsync(
+            new Uri(
+                new Uri(endpoint, UriKind.Absolute),
+                "api/v1/timestamp"),
+            trustedAuthorities,
+            cancellationToken);
+    }
+
+    public Task<SigstoreTimestampAuthorityProbeEvidence>
+        ValidateStoredTimestampAuthorityResponseAsync(
+            ReadOnlyMemory<byte> request,
+            ReadOnlyMemory<byte> response,
+            IReadOnlyList<SigstoreTimestampAuthorityTrustEntry>
+                trustedAuthorities,
+            CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(
+            SigstoreTimestampAuthority.ValidateStoredResponse(
+                request,
+                response,
+                trustedAuthorities));
+    }
 
     public async Task<SigstoreResourceInstanceSnapshot> WaitForSnapshotAsync(
         IResource resource,
@@ -3880,4 +5765,5 @@ internal sealed record SigstoreOperationResult(
     IReadOnlyList<SigstoreOperationCheck> Postconditions,
     bool? CommittedStatePreserved,
     IReadOnlyList<SigstoreOperationError> Errors,
-    OidcRotationEvidence? OidcRotation = null);
+    OidcRotationEvidence? OidcRotation = null,
+    TimestampAuthorityRotationEvidence? TimestampAuthorityRotation = null);

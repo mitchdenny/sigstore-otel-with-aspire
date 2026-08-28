@@ -107,7 +107,10 @@ internal static class SigstoreParentHealthMonitor
         var presentation = resource.GetPresentation();
         var health = presentation.RuntimeHealth;
         var operation = presentation.Operation;
-        var state = operation?.DisplayState ?? health.State;
+        var recovery = presentation.Recovery;
+        var state = operation?.DisplayState
+            ?? recovery?.DisplayState
+            ?? health.State;
         var properties = new List<ResourcePropertySnapshot>
         {
             new(
@@ -128,6 +131,12 @@ internal static class SigstoreParentHealthMonitor
                     $"{operation.Completed}/{operation.Total}: " +
                     operation.Message));
         }
+        else if (recovery is not null)
+        {
+            properties.Add(new("Recovery operation", recovery.Command));
+            properties.Add(new("Recovery phase", recovery.Phase));
+            properties.Add(new("Recovery required", recovery.Message));
+        }
 
         return snapshot with
         {
@@ -135,6 +144,8 @@ internal static class SigstoreParentHealthMonitor
                 state,
                 operation is not null
                     ? KnownResourceStateStyles.Info
+                    : recovery is not null
+                        ? KnownResourceStateStyles.Warn
                     : health.State switch
                     {
                         "Healthy" => KnownResourceStateStyles.Success,

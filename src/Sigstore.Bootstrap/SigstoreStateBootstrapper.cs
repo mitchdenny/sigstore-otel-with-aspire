@@ -56,6 +56,15 @@ internal static partial class SigstoreStateBootstrapper
         RekorStateMarkerPath
     ];
 
+    private static readonly string[] TimestampRotationCandidateFiles =
+    [
+        TsaSignerPrivateKeyPath,
+        TsaPrivateKeyPasswordPath,
+        TsaRootCertificatePath,
+        TsaLeafCertificatePath,
+        TsaCertificateChainPath
+    ];
+
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
         {
@@ -385,6 +394,61 @@ internal static partial class SigstoreStateBootstrapper
             isPrivate: false);
     }
 
+    internal static TimestampAuthorityMaterialInfo
+        EnsureTimestampAuthorityRotationCandidate(string candidatePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidatePath);
+        candidatePath = Path.GetFullPath(candidatePath);
+        var parentPath = Directory.GetParent(candidatePath)?.FullName
+            ?? throw new InvalidOperationException(
+                $"Cannot determine the parent directory for '{candidatePath}'.");
+        Directory.CreateDirectory(parentPath);
+
+        if (Directory.Exists(candidatePath))
+        {
+            ValidateTimestampRotationCandidateFileSet(candidatePath);
+            return ValidateTimestampAuthority(candidatePath);
+        }
+        if (File.Exists(candidatePath))
+        {
+            throw new InvalidDataException(
+                $"TSA rotation candidate '{candidatePath}' is not a directory.");
+        }
+
+        var stagingPath = candidatePath + ".staging";
+        if (Directory.Exists(stagingPath))
+        {
+            Directory.Delete(stagingPath, recursive: true);
+        }
+        else if (File.Exists(stagingPath))
+        {
+            throw new InvalidDataException(
+                $"TSA rotation staging path '{stagingPath}' is not a directory.");
+        }
+
+        try
+        {
+            Directory.CreateDirectory(stagingPath);
+            GenerateTimestampAuthority(stagingPath);
+            _ = ValidateTimestampAuthority(stagingPath);
+            File.Delete(Resolve(stagingPath, TsaRootPrivateKeyPath));
+            ValidateTimestampRotationCandidateFileSet(stagingPath);
+            _ = ValidateTimestampAuthority(stagingPath);
+            Directory.Move(stagingPath, candidatePath);
+        }
+        catch
+        {
+            if (Directory.Exists(stagingPath))
+            {
+                Directory.Delete(stagingPath, recursive: true);
+            }
+            throw;
+        }
+
+        ValidateTimestampRotationCandidateFileSet(candidatePath);
+        return ValidateTimestampAuthority(candidatePath);
+    }
+
     private static BootstrapManifest ValidateLegacyState(string rootPath)
     {
         foreach (var relativePath in LegacyRequiredStateFiles)
@@ -463,12 +527,15 @@ internal static partial class SigstoreStateBootstrapper
         return manifest;
     }
 
-    private static (string RootSha256, string LeafSha256)
+    internal static TimestampAuthorityMaterialInfo
         ValidateTimestampAuthority(string rootPath)
     {
-        using var rootKey = LoadEncryptedEcdsaKey(
-            Resolve(rootPath, TsaRootPrivateKeyPath),
-            Resolve(rootPath, TsaPrivateKeyPasswordPath));
+        var rootKeyPath = Resolve(rootPath, TsaRootPrivateKeyPath);
+        using var rootKey = File.Exists(rootKeyPath)
+            ? LoadEncryptedEcdsaKey(
+                rootKeyPath,
+                Resolve(rootPath, TsaPrivateKeyPasswordPath))
+            : null;
         using var signerKey = LoadEncryptedEcdsaKey(
             Resolve(rootPath, TsaSignerPrivateKeyPath),
             Resolve(rootPath, TsaPrivateKeyPasswordPath));
@@ -479,14 +546,33 @@ internal static partial class SigstoreStateBootstrapper
             File.ReadAllText(
                 Resolve(rootPath, TsaLeafCertificatePath)));
 
-        EnsureCertificateMatchesKey(
-            "TSA root certificate",
-            rootCertificate,
-            rootKey);
+        if (rootKey is not null)
+        {
+            EnsureCertificateMatchesKey(
+                "TSA root certificate",
+                rootCertificate,
+                rootKey);
+        }
         EnsureCertificateMatchesKey(
             "TSA leaf certificate",
             leafCertificate,
             signerKey);
+        using var rootPublicKey = rootCertificate.GetECDsaPublicKey()
+            ?? throw new InvalidDataException(
+                "The TSA root certificate does not contain an ECDSA key.");
+        using var leafPublicKey = leafCertificate.GetECDsaPublicKey()
+            ?? throw new InvalidDataException(
+                "The TSA leaf certificate does not contain an ECDSA key.");
+        if (rootPublicKey.KeySize != 256
+            || leafPublicKey.KeySize != 256
+            || rootCertificate.SignatureAlgorithm.Value
+                != "1.2.840.10045.4.3.2"
+            || leafCertificate.SignatureAlgorithm.Value
+                != "1.2.840.10045.4.3.2")
+        {
+            throw new InvalidDataException(
+                "The TSA chain must use ECDSA P-256 with SHA-256.");
+        }
 
         var rootConstraints = rootCertificate.Extensions
             .OfType<X509BasicConstraintsExtension>()
@@ -497,6 +583,18 @@ internal static partial class SigstoreStateBootstrapper
             throw new InvalidDataException(
                 "The TSA root is not a certificate authority.");
         }
+        var rootKeyUsage = rootCertificate.Extensions
+            .OfType<X509KeyUsageExtension>()
+            .SingleOrDefault();
+        if (rootKeyUsage is null
+            || !rootKeyUsage.Critical
+            || rootKeyUsage.KeyUsages
+                != (X509KeyUsageFlags.KeyCertSign
+                    | X509KeyUsageFlags.CrlSign))
+        {
+            throw new InvalidDataException(
+                "The TSA root has invalid key usage.");
+        }
 
         var leafConstraints = leafCertificate.Extensions
             .OfType<X509BasicConstraintsExtension>()
@@ -506,6 +604,17 @@ internal static partial class SigstoreStateBootstrapper
         {
             throw new InvalidDataException(
                 "The TSA leaf must be an end-entity certificate.");
+        }
+        var leafKeyUsage = leafCertificate.Extensions
+            .OfType<X509KeyUsageExtension>()
+            .SingleOrDefault();
+        if (leafKeyUsage is null
+            || !leafKeyUsage.Critical
+            || leafKeyUsage.KeyUsages
+                != X509KeyUsageFlags.DigitalSignature)
+        {
+            throw new InvalidDataException(
+                "The TSA leaf has invalid key usage.");
         }
 
         var enhancedKeyUsage = leafCertificate.Extensions
@@ -519,6 +628,15 @@ internal static partial class SigstoreStateBootstrapper
         {
             throw new InvalidDataException(
                 "The TSA leaf must contain only a critical timestamping EKU.");
+        }
+        var now = DateTimeOffset.UtcNow;
+        if (now < rootCertificate.NotBefore
+            || now >= rootCertificate.NotAfter
+            || now < leafCertificate.NotBefore
+            || now >= leafCertificate.NotAfter)
+        {
+            throw new InvalidDataException(
+                "The TSA certificate chain is not currently valid.");
         }
 
         using var chain = new X509Chain();
@@ -553,9 +671,46 @@ internal static partial class SigstoreStateBootstrapper
                 "The TSA certificate chain must contain leaf then root.");
         }
 
-        return (
+        var notBefore = new[]
+        {
+            rootCertificate.NotBefore.ToUniversalTime(),
+            leafCertificate.NotBefore.ToUniversalTime()
+        }.Max();
+        var notAfter = new[]
+        {
+            rootCertificate.NotAfter.ToUniversalTime(),
+            leafCertificate.NotAfter.ToUniversalTime()
+        }.Min();
+        return new TimestampAuthorityMaterialInfo(
             Fingerprint(rootCertificate.RawData),
-            Fingerprint(leafCertificate.RawData));
+            Fingerprint(leafCertificate.RawData),
+            Fingerprint(signerKey.ExportSubjectPublicKeyInfo()),
+            Fingerprint(
+                File.ReadAllBytes(
+                    Resolve(rootPath, TsaCertificateChainPath))),
+            rootKey is not null,
+            notBefore,
+            notAfter);
+    }
+
+    private static void ValidateTimestampRotationCandidateFileSet(
+        string rootPath)
+    {
+        var actual = Directory.EnumerateFiles(
+                rootPath,
+                "*",
+                SearchOption.AllDirectories)
+            .Select(path => Path.GetRelativePath(rootPath, path)
+                .Replace(Path.DirectorySeparatorChar, '/'))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (!actual.SequenceEqual(
+                TimestampRotationCandidateFiles.Order(StringComparer.Ordinal),
+                StringComparer.Ordinal))
+        {
+            throw new InvalidDataException(
+                "The TSA rotation candidate has an unexpected file set.");
+        }
     }
 
     private static void ValidateCtLogRuntimeState(string rootPath)
@@ -847,6 +1002,8 @@ internal static partial class SigstoreStateBootstrapper
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
         {
             writer.Write(contents);
+            writer.Flush();
+            stream.Flush(flushToDisk: true);
         }
 
         if (!OperatingSystem.IsWindows())

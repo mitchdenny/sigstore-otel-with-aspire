@@ -1,9 +1,12 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging.Abstractions;
+using Sigstore.Bootstrap;
 using Xunit;
 
 namespace Sigstore.Aspire.Hosting.Tests;
@@ -33,7 +36,8 @@ public sealed class SigstoreOperationTests
                 SigstoreOperationCommand.RotateTufRootCommand,
                 SigstoreOperationCommand.RestartClientsCommand,
                 SigstoreOperationCommand.PublishTrustedRootCommand,
-                SigstoreOperationCommand.RotateOidcSigningKeyCommand
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand
             ],
             annotations.Keys);
 
@@ -43,7 +47,8 @@ public sealed class SigstoreOperationTests
             SigstoreOperationCommand.RotateTufRootCommand,
             SigstoreOperationCommand.RestartClientsCommand,
             SigstoreOperationCommand.PublishTrustedRootCommand,
-            SigstoreOperationCommand.RotateOidcSigningKeyCommand
+            SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand
         })
         {
             var annotation = annotations[name];
@@ -106,6 +111,27 @@ public sealed class SigstoreOperationTests
         Assert.DoesNotContain(
             snapshot.Properties,
             property => property.Name == "Operation");
+
+        model.Parent.Resource.SetOperationRecovery(
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+            "clients-converged",
+            "TSA Activation Pending",
+            "Timestamp restart remains pending.");
+        snapshot = SigstoreParentHealthMonitor.CreateParentSnapshot(
+            model.Parent.Resource,
+            snapshot);
+        Assert.Equal("TSA Activation Pending", snapshot.State?.Text);
+        Assert.Equal(
+            ResourceCommandState.Disabled,
+            annotations[SigstoreOperationCommand.RestartClientsCommand]
+                .UpdateState(NewUpdateContext()));
+        Assert.Equal(
+            ResourceCommandState.Enabled,
+            annotations[
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand]
+                .UpdateState(NewUpdateContext()));
+        model.Parent.Resource.ClearOperationRecovery(
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand);
     }
 
     [Fact]
@@ -233,7 +259,12 @@ public sealed class SigstoreOperationTests
             .ExecuteRotateOidcSigningKeyAsync(CancellationToken.None);
         var output = ReadResult(result);
 
-        Assert.True(result.Success, output.Message);
+        Assert.True(
+            result.Success,
+            output.Message + ": " + string.Join(
+                "; ",
+                output.Errors.Select(
+                    error => $"{error.Postcondition}: {error.Message}")));
         Assert.NotNull(output.OidcRotation);
         Assert.Equal(oldKid, output.OidcRotation.OldKid);
         Assert.Equal(newKid, output.OidcRotation.NewKid);
@@ -266,6 +297,405 @@ public sealed class SigstoreOperationTests
                 output.OidcRotation.OperationId,
                 "command.json"))
             .Contains(CreateOidcJwt(oldKid), StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task TimestampRotationConvergesClientsBeforeOneServiceRestart()
+    {
+        using var model = new OperationModelFixture();
+        var statePath = model.Parent.Resource.StatePath;
+        var bootstrap = SigstoreStateBootstrapper.EnsureInitialized(
+            statePath);
+        var oldMaterial =
+            SigstoreStateBootstrapper.ValidateTimestampAuthority(
+                System.IO.Path.Combine(
+                    statePath,
+                    "active-generation"));
+        WriteTrustedRoot(
+            statePath,
+            [
+                ReadTsaCertificates(
+                    System.IO.Path.Combine(
+                        statePath,
+                        "active-generation"))
+            ]);
+
+        var before = NewTufState();
+        var after = NewTsaRotationTufState(before);
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events);
+        inspector.TufStates.Enqueue(before);
+        inspector.TufStates.Enqueue(after);
+        inspector.TrustFingerprints.Enqueue(Hash('1'));
+        inspector.TrustFingerprints.Enqueue(Hash('2'));
+        inspector.MaterialFingerprints.Enqueue(Hash('3'));
+        inspector.MaterialFingerprints.Enqueue(Hash('4'));
+        var runtime = NewRuntime(model, events, inspector);
+        runtime.ServedStates.Enqueue(NewServed(before));
+        runtime.ServedStates.Enqueue(NewServed(after));
+        runtime.Statuses.Enqueue(NewAggregate(model, before));
+        runtime.Statuses.Enqueue(NewAggregate(model, after));
+
+        var oldProof = NewTimestampProof(
+            oldMaterial.RootSha256,
+            oldMaterial.LeafSha256,
+            'a') with
+        {
+            RequestSha256 = HashBytes([1, 2, 3]),
+            ResponseSha256 = HashBytes([4, 5, 6])
+        };
+        var newRoot = string.Empty;
+        var newLeaf = string.Empty;
+        runtime.TimestampProbes.Enqueue(
+            new SigstoreTimestampAuthorityProbe(
+                [1, 2, 3],
+                [4, 5, 6],
+                oldProof));
+        runtime.TimestampProbes.Enqueue(
+            new SigstoreTimestampAuthorityProbe(
+                [7],
+                [8],
+                oldProof));
+        runtime.TimestampProbes.Enqueue(
+            new SigstoreTimestampAuthorityProbe(
+                [9],
+                [10],
+                oldProof));
+        runtime.StoredTimestampProofs.Enqueue(oldProof);
+
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.TufBootstrap.Resource,
+            Exited("tuf-bootstrap", "worker-before", 0));
+        runtime.WaitResults["tuf-bootstrap"] =
+            Exited(
+                "tuf-bootstrap",
+                "worker-after",
+                0,
+                offsetSeconds: 10);
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Timestamp.Resource,
+            Running("timestamp", "timestamp-before"),
+            Running("timestamp", "timestamp-before"),
+            Running("timestamp", "timestamp-before"));
+        runtime.WaitResults["timestamp"] =
+            Running(
+                "timestamp",
+                "timestamp-after",
+                offsetSeconds: 30);
+
+        foreach (var protectedResource in model.Parent.Resource
+            .GetRegistrations()
+            .RequiredResources
+            .Where(
+                item =>
+                    item.Name != "timestamp"
+                    && !item.Name.EndsWith(
+                        "-client",
+                        StringComparison.Ordinal)))
+        {
+            var snapshot = Running(
+                protectedResource.Name,
+                $"{protectedResource.Name}-stable");
+            runtime.SetSnapshotSequence(
+                protectedResource,
+                snapshot,
+                snapshot);
+        }
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Tuf.Resource,
+            Running("tuf", "tuf-stable"),
+            Running("tuf", "tuf-stable"),
+            Running("tuf", "tuf-stable"),
+            Running("tuf", "tuf-stable"));
+
+        var clients = model.Parent.Resource.GetRegistrations().Clients
+            .OrderBy(
+                client => client.Resource.Name,
+                StringComparer.Ordinal)
+            .ToArray();
+        foreach (var client in clients)
+        {
+            var clientBefore = Running(
+                client.Resource.Name,
+                $"{client.Resource.Name}-before");
+            var clientAfter = Running(
+                client.Resource.Name,
+                $"{client.Resource.Name}-after",
+                offsetSeconds: 20);
+            runtime.SetSnapshotSequence(
+                client.Resource,
+                clientBefore);
+            runtime.WaitResults[client.Resource.Name] = clientAfter;
+            runtime.ClientStatusSequences[client.Resource.Name] =
+                new Queue<SigstoreClientTrustStatus>(
+                    [
+                        NewClientStatus(client, before.Trust),
+                        NewClientStatus(client, after.Trust)
+                    ]);
+        }
+
+        runtime.OnExecuteCommand = (target, command) =>
+        {
+            if (target.Name != "tuf-bootstrap"
+                || command != KnownResourceCommands.StartCommand)
+            {
+                return;
+            }
+            using var request = JsonDocument.Parse(
+                File.ReadAllBytes(
+                    System.IO.Path.Combine(
+                        statePath,
+                        "rotate-timestamp-authority.request")));
+            var operationId = request.RootElement
+                .GetProperty("operationId")
+                .GetString()!;
+            var candidatePath = System.IO.Path.Combine(
+                statePath,
+                "tsa-rotation",
+                operationId,
+                "candidate");
+            var candidate =
+                SigstoreStateBootstrapper.ValidateTimestampAuthority(
+                    candidatePath);
+            newRoot = candidate.RootSha256;
+            newLeaf = candidate.LeafSha256;
+
+            var priorPath = System.IO.Path.Combine(
+                statePath,
+                "generations",
+                bootstrap.Generation.GenerationId);
+            var nextId = "generation-00000002";
+            var nextPath = System.IO.Path.Combine(
+                statePath,
+                "generations",
+                nextId);
+            CopyDirectory(priorPath, nextPath);
+            File.Delete(
+                System.IO.Path.Combine(nextPath, "manifest.json"));
+            Directory.Delete(
+                System.IO.Path.Combine(nextPath, "private", "tsa"),
+                recursive: true);
+            Directory.Delete(
+                System.IO.Path.Combine(nextPath, "public", "tsa"),
+                recursive: true);
+            CopyDirectory(candidatePath, nextPath);
+            File.WriteAllText(
+                System.IO.Path.Combine(nextPath, "manifest.json"),
+                JsonSerializer.Serialize(
+                    new
+                    {
+                        generation = 2,
+                        generationId = nextId,
+                        tsaRootSha256 = newRoot,
+                        tsaLeafSha256 = newLeaf,
+                        tsaRotationOperationId = operationId
+                    }));
+            Directory.Delete(
+                System.IO.Path.Combine(
+                    statePath,
+                    "active-generation"));
+            Directory.CreateSymbolicLink(
+                System.IO.Path.Combine(
+                    statePath,
+                    "active-generation"),
+                System.IO.Path.Combine("generations", nextId));
+            WriteTrustedRoot(
+                statePath,
+                [
+                    ReadTsaCertificates(priorPath),
+                    ReadTsaCertificates(nextPath)
+                ]);
+            File.WriteAllText(
+                System.IO.Path.Combine(
+                    statePath,
+                    "rotate-timestamp-authority.completed"),
+                JsonSerializer.Serialize(
+                    new
+                    {
+                        schemaVersion = 1,
+                        operationId,
+                        trustDomainId = before.Trust.TrustDomainId,
+                        completedAtUtc = DateTimeOffset.UtcNow,
+                        priorGeneration = 1,
+                        priorGenerationId = "generation-00000001",
+                        priorTsaRootSha256 = oldMaterial.RootSha256,
+                        priorTsaLeafSha256 = oldMaterial.LeafSha256,
+                        newGeneration = 2,
+                        newGenerationId = nextId,
+                        newTsaRootSha256 = newRoot,
+                        newTsaLeafSha256 = newLeaf,
+                        manifestSha256 =
+                            after.Trust.GenerationManifestSha256,
+                        publicationId = after.Trust.PublicationId,
+                        publicationManifestSha256 =
+                            after.Trust.PublicationManifestSha256,
+                        trustedRootSha256 =
+                            after.Trust.TrustedRootSha256,
+                        signingConfigSha256 =
+                            after.Trust.SigningConfigSha256,
+                        tsaTrustEntryCount = 2
+                    }));
+            File.Delete(
+                System.IO.Path.Combine(
+                    statePath,
+                    "rotate-timestamp-authority.request"));
+            Directory.Delete(candidatePath, recursive: true);
+            runtime.TimestampProbes.Enqueue(
+                new SigstoreTimestampAuthorityProbe(
+                    [11],
+                    [12],
+                    NewTimestampProof(newRoot, newLeaf, 'b')));
+        };
+
+        var result = await NewExecutor(model, runtime, inspector)
+            .ExecuteRotateTimestampAuthorityAsync(
+                CancellationToken.None);
+        var output = ReadResult(result);
+
+        Assert.True(
+            result.Success,
+            output.Message + ": " + string.Join(
+                "; ",
+                output.Errors.Select(
+                    error => $"{error.Postcondition}: {error.Message}")));
+        Assert.NotNull(output.TimestampAuthorityRotation);
+        Assert.Equal(
+            oldMaterial.LeafSha256,
+            output.TimestampAuthorityRotation.OldLeafSha256);
+        Assert.Equal(
+            newLeaf,
+            output.TimestampAuthorityRotation.NewLeafSha256);
+        Assert.True(
+            output.TimestampAuthorityRotation
+                .HistoricalTimestampValidated);
+        Assert.Equal(6, output.TimestampAuthorityRotation.Clients.Count);
+        Assert.Equal(8, output.Resources.Count);
+        Assert.False(runtime.WorkerStartedWhileLockHeld);
+        Assert.Equal(
+            1,
+            runtime.ExecutedCommands.Count(
+                call => call.Resource == "timestamp"
+                    && call.Command
+                        == KnownResourceCommands.RestartCommand));
+        Assert.DoesNotContain(
+            runtime.ExecutedCommands,
+            call => call.Resource is "oidc"
+                or "fulcio"
+                or "tesseract"
+                or "rekor"
+                or "rekor-server"
+                or "tuf"
+                or "shady-blob-store");
+        var timestampRestart = runtime.ExecutedCommands.FindIndex(
+            call => call.Resource == "timestamp");
+        Assert.Equal(
+            6,
+            runtime.ExecutedCommands
+                .Take(timestampRestart)
+                .Count(
+                    call => call.Resource.EndsWith(
+                        "-client",
+                        StringComparison.Ordinal)));
+        Assert.All(
+            output.Postconditions,
+            check => Assert.True(check.Passed, check.Name));
+        Assert.Null(model.Parent.Resource.GetPresentation().Recovery);
+
+        var journalPath = System.IO.Path.Combine(
+            statePath,
+            "tsa-rotation",
+            output.TimestampAuthorityRotation.OperationId,
+            "command.json");
+        var completedJournal = JsonSerializer.Deserialize<
+            TimestampAuthorityRotationCommandJournal>(
+                File.ReadAllText(journalPath),
+                JsonOptions)!;
+        File.WriteAllText(
+            journalPath,
+            JsonSerializer.Serialize(
+                completedJournal with
+                {
+                    Status = "timestamp-restarted",
+                    CompletedAtUtc = null
+                },
+                JsonOptions));
+
+        var replayEvents = new ConcurrentQueue<string>();
+        var replayInspector = new FakeStateInspector(replayEvents);
+        replayInspector.TufStates.Enqueue(after);
+        replayInspector.TrustFingerprints.Enqueue(Hash('2'));
+        replayInspector.MaterialFingerprints.Enqueue(Hash('4'));
+        var replayRuntime = NewRuntime(
+            model,
+            replayEvents,
+            replayInspector);
+        replayRuntime.ServedStates.Enqueue(NewServed(after));
+        replayRuntime.Statuses.Enqueue(NewAggregate(model, after));
+        replayRuntime.SetSnapshotSequence(
+            model.Parent.Resource.Components.TufBootstrap.Resource,
+            Exited("tuf-bootstrap", "worker-after", 0));
+        replayRuntime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Timestamp.Resource,
+            Running("timestamp", "timestamp-after", offsetSeconds: 30),
+            Running("timestamp", "timestamp-after", offsetSeconds: 30),
+            Running("timestamp", "timestamp-after", offsetSeconds: 30));
+        foreach (var protectedResource in model.Parent.Resource
+            .GetRegistrations()
+            .RequiredResources
+            .Where(
+                item =>
+                    item.Name != "timestamp"
+                    && !item.Name.EndsWith(
+                        "-client",
+                        StringComparison.Ordinal)))
+        {
+            var snapshot = Running(
+                protectedResource.Name,
+                $"{protectedResource.Name}-stable");
+            replayRuntime.SetSnapshotSequence(
+                protectedResource,
+                snapshot,
+                snapshot);
+        }
+        replayRuntime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Tuf.Resource,
+            Running("tuf", "tuf-stable"),
+            Running("tuf", "tuf-stable"),
+            Running("tuf", "tuf-stable"));
+        foreach (var client in clients)
+        {
+            replayRuntime.SetSnapshotSequence(
+                client.Resource,
+                Running(
+                    client.Resource.Name,
+                    $"{client.Resource.Name}-after",
+                    offsetSeconds: 20));
+            replayRuntime.ClientStatuses[client.Resource.Name] =
+                NewClientStatus(client, after.Trust);
+        }
+        var replayProof = NewTimestampProof(newRoot, newLeaf, 'b');
+        replayRuntime.TimestampProbes.Enqueue(
+            new SigstoreTimestampAuthorityProbe([13], [14], replayProof));
+        replayRuntime.TimestampProbes.Enqueue(
+            new SigstoreTimestampAuthorityProbe([15], [16], replayProof));
+        replayRuntime.TimestampProbes.Enqueue(
+            new SigstoreTimestampAuthorityProbe([17], [18], replayProof));
+        replayRuntime.StoredTimestampProofs.Enqueue(oldProof);
+
+        var replayResult =
+            await NewExecutor(model, replayRuntime, replayInspector)
+                .ExecuteRotateTimestampAuthorityAsync(
+                    CancellationToken.None);
+        var replayOutput = ReadResult(replayResult);
+
+        Assert.True(replayResult.Success, replayOutput.Message);
+        Assert.True(replayOutput.TimestampAuthorityRotation!.Recovered);
+        Assert.DoesNotContain(
+            replayRuntime.ExecutedCommands,
+            call => call.Resource == "timestamp"
+                || call.Resource.EndsWith(
+                    "-client",
+                    StringComparison.Ordinal));
     }
 
     [Fact]
@@ -394,6 +824,46 @@ public sealed class SigstoreOperationTests
             ResourceCommandState.Enabled,
             SigstoreOperationCommand.GetMutationCommandState(
                 model.Parent.Resource));
+    }
+
+    [Fact]
+    public async Task TimestampRotationContentionIsRejectedByGate()
+    {
+        using var model = new OperationModelFixture();
+        Assert.True(
+            model.Parent.Resource.TryBeginOperation(
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+                "Rotating Timestamp Authority",
+                out var lease,
+                out _));
+        try
+        {
+            var executor = NewExecutor(
+                model,
+                NewRuntime(
+                    model,
+                    new ConcurrentQueue<string>(),
+                    new FakeStateInspector(
+                        new ConcurrentQueue<string>())),
+                new FakeStateInspector(
+                    new ConcurrentQueue<string>()));
+
+            var result =
+                await executor.ExecuteRotateTimestampAuthorityAsync(
+                    CancellationToken.None);
+            var output = ReadResult(result);
+
+            Assert.False(result.Success);
+            Assert.Equal("contention", output.Phase);
+            Assert.Contains(
+                "rotate-timestamp-authority is already active",
+                output.Message,
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            lease!.Dispose();
+        }
     }
 
     [Fact]
@@ -1109,6 +1579,152 @@ public sealed class SigstoreOperationTests
         };
     }
 
+    private static SigstoreTufStateSnapshot NewTsaRotationTufState(
+        SigstoreTufStateSnapshot prior)
+    {
+        var trust = prior.Trust with
+        {
+            Generation = prior.Trust.Generation + 1,
+            GenerationId = "generation-00000002",
+            GenerationManifestSha256 = Hash('5'),
+            TufTargetsVersion = prior.Trust.TufTargetsVersion + 1,
+            TrustedRootSha256 = Hash('8'),
+            PublicationId = "sha256-" + Hash('9'),
+            PublicationManifestSha256 = Hash('9')
+        };
+        var metadata = prior.Metadata with
+        {
+            Targets = new SigstoreTufMetadataRoleStatus(
+                prior.Metadata.Targets.Version + 1,
+                Hash('e'),
+                prior.Metadata.Targets.ExpiresAtUtc.AddDays(1)),
+            Snapshot = new SigstoreTufMetadataRoleStatus(
+                prior.Metadata.Snapshot.Version + 1,
+                Hash('f'),
+                prior.Metadata.Snapshot.ExpiresAtUtc.AddMinutes(1)),
+            Timestamp = new SigstoreTufMetadataRoleStatus(
+                prior.Metadata.Timestamp.Version + 1,
+                Hash('a'),
+                prior.Metadata.Timestamp.ExpiresAtUtc.AddMinutes(1)),
+            TrustedRootSha256 = trust.TrustedRootSha256
+        };
+        return prior with
+        {
+            Trust = trust,
+            Metadata = metadata,
+            PreviousPublicationId = prior.Trust.PublicationId,
+            PreviousPublicationManifestSha256 =
+                prior.Trust.PublicationManifestSha256
+        };
+    }
+
+    private static SigstoreTimestampAuthorityProbeEvidence
+        NewTimestampProof(
+            string rootSha256,
+            string leafSha256,
+            char marker) =>
+        new(
+            rootSha256,
+            leafSha256,
+            "CN=Timestamp Authority",
+            "CN=Timestamp Authority Root",
+            Hash(marker),
+            Hash(marker),
+            Hash(marker),
+            DateTimeOffset.UtcNow);
+
+    private static TsaCertificatePair ReadTsaCertificates(
+        string generationPath)
+    {
+        using var leaf = X509Certificate2.CreateFromPem(
+            File.ReadAllText(
+                System.IO.Path.Combine(
+                    generationPath,
+                    "public",
+                    "tsa",
+                    "leaf.pem")));
+        using var root = X509Certificate2.CreateFromPem(
+            File.ReadAllText(
+                System.IO.Path.Combine(
+                generationPath,
+                "public",
+                "tsa",
+                "root.pem")));
+        return new TsaCertificatePair(
+            leaf.RawData,
+            root.RawData);
+    }
+
+    private static void WriteTrustedRoot(
+        string statePath,
+        IReadOnlyList<TsaCertificatePair> authorities)
+    {
+        var targetPath = System.IO.Path.Combine(
+            statePath,
+            "tuf",
+            "active",
+            "targets");
+        Directory.CreateDirectory(targetPath);
+        File.WriteAllText(
+            System.IO.Path.Combine(
+                targetPath,
+                "trusted_root.json"),
+            JsonSerializer.Serialize(
+                new
+                {
+                    mediaType =
+                        "application/vnd.dev.sigstore.trustedroot+json;version=0.1",
+                    timestampAuthorities = authorities.Select(
+                        certificates => new
+                        {
+                            uri = SigstoreDefaults.TimestampAuthorityUrl,
+                            certChain = new
+                            {
+                                certificates = new[]
+                                {
+                                    new
+                                    {
+                                        rawBytes = certificates.Leaf
+                                    },
+                                    new
+                                    {
+                                        rawBytes = certificates.Root
+                                    }
+                                }
+                            }
+                        })
+                }));
+    }
+
+    private static void CopyDirectory(
+        string source,
+        string destination)
+    {
+        Directory.CreateDirectory(destination);
+        foreach (var directory in Directory.EnumerateDirectories(
+            source,
+            "*",
+            SearchOption.AllDirectories))
+        {
+            Directory.CreateDirectory(
+                System.IO.Path.Combine(
+                    destination,
+                    System.IO.Path.GetRelativePath(source, directory)));
+        }
+        foreach (var file in Directory.EnumerateFiles(
+            source,
+            "*",
+            SearchOption.AllDirectories))
+        {
+            var target = System.IO.Path.Combine(
+                destination,
+                System.IO.Path.GetRelativePath(source, file));
+            Directory.CreateDirectory(
+                System.IO.Path.GetDirectoryName(target)!);
+            File.Copy(file, target, overwrite: true);
+        }
+    }
+
     private static string CreateOidcJwt(string kid)
     {
         static string Encode(object value) =>
@@ -1261,6 +1877,10 @@ public sealed class SigstoreOperationTests
     private static string Hash(char value) =>
         new(value, 64);
 
+    private static string HashBytes(ReadOnlySpan<byte> value) =>
+        Convert.ToHexString(SHA256.HashData(value))
+            .ToLowerInvariant();
+
     private static int IndexOf(
         ConcurrentQueue<string> events,
         string value) =>
@@ -1293,6 +1913,10 @@ public sealed class SigstoreOperationTests
                 {
                     SourcePath = sourcePath
                 });
+            Parent.WithRequiredResource(
+                builder.AddContainer(
+                    "shady-blob-store",
+                    "alpine"));
             foreach (var (name, language) in new[]
             {
                 ("rust-client", "rust"),
@@ -1319,8 +1943,8 @@ public sealed class SigstoreOperationTests
                     "Healthy",
                     null,
                     [],
-                    14,
-                    14));
+                    15,
+                    15));
         }
 
         public string Path { get; }
@@ -1417,6 +2041,14 @@ public sealed class SigstoreOperationTests
 
         public Queue<FulcioIssuanceEvidence?> FulcioCertificates { get; } = [];
 
+        public Queue<SigstoreTimestampAuthorityProbe> TimestampProbes
+        {
+            get;
+        } = [];
+
+        public Queue<SigstoreTimestampAuthorityProbeEvidence>
+            StoredTimestampProofs { get; } = [];
+
         public Dictionary<string, SigstoreResourceInstanceSnapshot>
             WaitResults { get; } = new(StringComparer.Ordinal);
 
@@ -1425,6 +2057,9 @@ public sealed class SigstoreOperationTests
 
         public Dictionary<string, SigstoreClientTrustStatus>
             ClientStatuses { get; } = new(StringComparer.Ordinal);
+
+        public Dictionary<string, Queue<SigstoreClientTrustStatus>>
+            ClientStatusSequences { get; } = new(StringComparer.Ordinal);
 
         public List<(string Resource, string Command)> ExecutedCommands
         {
@@ -1546,6 +2181,12 @@ public sealed class SigstoreOperationTests
             CancellationToken cancellationToken)
         {
             events.Enqueue($"client-status:{client.Resource.Name}");
+            if (ClientStatusSequences.TryGetValue(
+                    client.Resource.Name,
+                    out var sequence))
+            {
+                return Task.FromResult(sequence.Dequeue());
+            }
             return Task.FromResult(
                 ClientStatuses[client.Resource.Name]);
         }
@@ -1566,6 +2207,28 @@ public sealed class SigstoreOperationTests
             return Task.FromResult(FulcioCertificates.Dequeue());
         }
 
+        public Task<SigstoreTimestampAuthorityProbe>
+            ProbeTimestampAuthorityAsync(
+                IReadOnlyList<SigstoreTimestampAuthorityTrustEntry>
+                    trustedAuthorities,
+                CancellationToken cancellationToken)
+        {
+            events.Enqueue("timestamp-probe");
+            return Task.FromResult(TimestampProbes.Dequeue());
+        }
+
+        public Task<SigstoreTimestampAuthorityProbeEvidence>
+            ValidateStoredTimestampAuthorityResponseAsync(
+                ReadOnlyMemory<byte> request,
+                ReadOnlyMemory<byte> response,
+                IReadOnlyList<SigstoreTimestampAuthorityTrustEntry>
+                    trustedAuthorities,
+                CancellationToken cancellationToken)
+        {
+            events.Enqueue("timestamp-proof");
+            return Task.FromResult(StoredTimestampProofs.Dequeue());
+        }
+
         public Task PublishParentStateAsync(SigstoreResource target)
         {
             events.Enqueue(
@@ -1583,7 +2246,12 @@ public sealed class SigstoreOperationTests
         {
             Interlocked.Exchange(ref _callback, null)?.Invoke();
         }
+
     }
+
+    private sealed record TsaCertificatePair(
+        byte[] Leaf,
+        byte[] Root);
 
     private sealed class EmptyServiceProvider : IServiceProvider
     {

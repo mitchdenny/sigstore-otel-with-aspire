@@ -73,6 +73,21 @@ public sealed record SigstoreStatusError(
     string Source,
     string Message);
 
+public sealed record SigstoreActiveOperationStatus(
+    string Command,
+    string Phase,
+    int Completed,
+    int Total,
+    string Message,
+    DateTimeOffset StartedAtUtc);
+
+public sealed record SigstoreRecoveryStatus(
+    string Command,
+    string Phase,
+    string State,
+    string Message,
+    DateTimeOffset UpdatedAtUtc);
+
 public sealed record SigstoreAggregateTrustStatus(
     int SchemaVersion,
     string Resource,
@@ -84,7 +99,10 @@ public sealed record SigstoreAggregateTrustStatus(
     SigstoreServedTrustStatus? Served,
     IReadOnlyList<SigstoreClientTrustStatus> Clients,
     IReadOnlyList<SigstoreRequiredResourceStatus> RequiredResources,
-    IReadOnlyList<SigstoreStatusError> Errors);
+    IReadOnlyList<SigstoreStatusError> Errors,
+    SigstoreTimestampAuthorityStatus? TimestampAuthority = null,
+    SigstoreActiveOperationStatus? Operation = null,
+    SigstoreRecoveryStatus? Recovery = null);
 
 internal sealed record PublishedTrustStatus(
     int SchemaVersion,
@@ -111,6 +129,17 @@ internal sealed record GenerationManifestStatus(
     string TsaRootSha256,
     string TsaLeafSha256,
     string OidcKeyId,
+    string? OidcRotationOperationId,
+    int OidcPriorGeneration,
+    string? OidcPriorGenerationId,
+    string? OidcPriorKeyId,
+    DateTimeOffset? OidcOverlapExpiresAtUtc,
+    IReadOnlyList<string>? OidcRetainedPrivateKeyPaths,
+    string? TsaRotationOperationId,
+    int TsaPriorGeneration,
+    string? TsaPriorGenerationId,
+    string? TsaPriorRootSha256,
+    string? TsaPriorLeafSha256,
     SortedDictionary<string, string> Files);
 
 internal sealed record TrustDomainManifestStatus(
@@ -127,6 +156,8 @@ internal sealed record GenerationReferenceStatus(
 
 internal sealed record TransitionJournalStatus(
     int SchemaVersion,
+    string? TransitionId,
+    string? Operation,
     string Status,
     string LastCheckpoint,
     GenerationReferenceStatus? PriorGeneration,
@@ -209,6 +240,7 @@ internal static class SigstoreStatusCommand
         var errors = new List<SigstoreStatusError>();
         SigstoreDiskTrustStatus? disk = null;
         SigstoreServedTrustStatus? served = null;
+        SigstoreTimestampAuthorityStatus? timestampAuthority = null;
 
         try
         {
@@ -296,6 +328,47 @@ internal static class SigstoreStatusCommand
             }
         }
 
+        if (disk is not null)
+        {
+            try
+            {
+                var trustedAuthorities =
+                    SigstoreTimestampAuthority.ReadTrustedAuthorities(
+                        resource.StatePath);
+                var endpoint = await resource.Components.Timestamp
+                    .GetEndpoint("http")
+                    .GetValueAsync(cancellationToken)
+                    ?? throw new SigstoreStatusException(
+                        "The timestamp authority endpoint is not allocated.");
+                var probe = await SigstoreTimestampAuthority.ProbeAsync(
+                    new Uri(
+                        new Uri(endpoint, UriKind.Absolute),
+                        "api/v1/timestamp"),
+                    trustedAuthorities,
+                    cancellationToken);
+                timestampAuthority = SigstoreTimestampAuthority.ReadStatus(
+                    resource.StatePath,
+                    probe.Evidence);
+                if (!timestampAuthority.ActiveSignerMatches)
+                {
+                    errors.Add(
+                        new(
+                            "timestamp",
+                            "signer activation is pending: running " +
+                            $"{timestampAuthority.RunningSigner.RootSha256}/" +
+                            $"{timestampAuthority.RunningSigner.LeafSha256}, " +
+                            "active generation " +
+                            $"{timestampAuthority.ActiveRootSha256}/" +
+                            $"{timestampAuthority.ActiveLeafSha256}."));
+                }
+            }
+            catch (Exception exception)
+                when (IsExpectedStatusFailure(exception))
+            {
+                errors.Add(new("timestamp", exception.Message));
+            }
+        }
+
         if (runtime.State != "Healthy")
         {
             errors.Add(
@@ -303,6 +376,17 @@ internal static class SigstoreStatusCommand
                     "resources",
                     runtime.Reason
                         ?? $"Parent resource state is {runtime.State}."));
+        }
+        var presentation = resource.GetPresentation();
+        if (presentation.Operation is null
+            && presentation.Recovery is not null)
+        {
+            errors.Add(
+                new(
+                    "operation",
+                    $"{presentation.Recovery.Command} recovery is pending in " +
+                    $"phase {presentation.Recovery.Phase}: " +
+                    presentation.Recovery.Message));
         }
 
         errors.Sort(
@@ -324,11 +408,14 @@ internal static class SigstoreStatusCommand
         var ready = errors.Count == 0
             && disk is not null
             && served is not null
+            && timestampAuthority is not null
             && clients.Count == registrations.Clients.Count;
         var reason = errors.Count == 0
             ? null
             : $"{errors[0].Source}: {errors[0].Message}";
 
+        var operation = presentation.Operation;
+        var recovery = presentation.Recovery;
         return new SigstoreAggregateTrustStatus(
             StatusSchemaVersion,
             resource.Name,
@@ -340,7 +427,25 @@ internal static class SigstoreStatusCommand
             served,
             clients,
             runtime.Resources,
-            errors);
+            errors,
+            timestampAuthority,
+            operation is null
+                ? null
+                : new SigstoreActiveOperationStatus(
+                    operation.Command,
+                    operation.Phase,
+                    operation.Completed,
+                    operation.Total,
+                    operation.Message,
+                    operation.StartedAtUtc),
+            recovery is null
+                ? null
+                : new SigstoreRecoveryStatus(
+                    recovery.Command,
+                    recovery.Phase,
+                    recovery.DisplayState,
+                    recovery.Message,
+                    recovery.UpdatedAtUtc));
     }
 
     internal static SigstoreDiskTrustStatus ReadDiskStatus(string statePath)
@@ -417,6 +522,7 @@ internal static class SigstoreStatusCommand
         ValidateGenerationFiles(
             generationPath,
             generationManifest.Files);
+        ValidateTimestampRotationMetadata(generationManifest);
         var generationManifestHash = Hash(generationManifestBytes);
 
         var transition = DeserializeRequired<TransitionJournalStatus>(
@@ -449,7 +555,14 @@ internal static class SigstoreStatusCommand
             || transition.Candidate.GenerationId
                 != generationManifest.GenerationId
             || transition.Candidate.ManifestSha256
-                != generationManifestHash)
+                != generationManifestHash
+            || generationManifest.TsaRotationOperationId is not null
+                && generationManifest.TsaPriorGeneration
+                    == generationManifest.Generation - 1
+                && generationManifest.OidcRotationOperationId is null
+                && (transition.Operation != "tsa-rotation"
+                    || transition.TransitionId
+                        != generationManifest.TsaRotationOperationId))
         {
             throw new SigstoreStatusException(
                 "The active generation does not match the committed transition.");
@@ -1061,7 +1174,66 @@ internal static class SigstoreStatusCommand
         && first.TsaRootSha256 == second.TsaRootSha256
         && first.TsaLeafSha256 == second.TsaLeafSha256
         && first.OidcKeyId == second.OidcKeyId
+        && first.OidcRotationOperationId
+            == second.OidcRotationOperationId
+        && first.OidcPriorGeneration == second.OidcPriorGeneration
+        && first.OidcPriorGenerationId
+            == second.OidcPriorGenerationId
+        && first.OidcPriorKeyId == second.OidcPriorKeyId
+        && first.OidcOverlapExpiresAtUtc
+            == second.OidcOverlapExpiresAtUtc
+        && (first.OidcRetainedPrivateKeyPaths ?? [])
+            .SequenceEqual(
+                second.OidcRetainedPrivateKeyPaths ?? [],
+                StringComparer.Ordinal)
+        && first.TsaRotationOperationId
+            == second.TsaRotationOperationId
+        && first.TsaPriorGeneration == second.TsaPriorGeneration
+        && first.TsaPriorGenerationId
+            == second.TsaPriorGenerationId
+        && first.TsaPriorRootSha256
+            == second.TsaPriorRootSha256
+        && first.TsaPriorLeafSha256
+            == second.TsaPriorLeafSha256
         && DictionariesEqual(first.Files, second.Files);
+
+    private static void ValidateTimestampRotationMetadata(
+        GenerationManifestStatus generation)
+    {
+        if (generation.TsaRotationOperationId is null)
+        {
+            if (generation.TsaPriorGeneration != 0
+                || generation.TsaPriorGenerationId is not null
+                || generation.TsaPriorRootSha256 is not null
+                || generation.TsaPriorLeafSha256 is not null)
+            {
+                throw new SigstoreStatusException(
+                    "The active generation has partial TSA rotation metadata.");
+            }
+            return;
+        }
+        if (!Guid.TryParseExact(
+                generation.TsaRotationOperationId,
+                "N",
+                out _)
+            || generation.TsaRotationOperationId.Any(char.IsUpper)
+            || generation.TsaPriorGeneration < 1
+            || generation.TsaPriorGeneration >= generation.Generation
+            || generation.TsaPriorGenerationId
+                != $"generation-{generation.TsaPriorGeneration:D8}"
+            || !IsLowerHexSha256(
+                generation.TsaPriorRootSha256 ?? "")
+            || !IsLowerHexSha256(
+                generation.TsaPriorLeafSha256 ?? "")
+            || generation.TsaPriorRootSha256
+                == generation.TsaRootSha256
+            || generation.TsaPriorLeafSha256
+                == generation.TsaLeafSha256)
+        {
+            throw new SigstoreStatusException(
+                "The active generation has invalid TSA rotation metadata.");
+        }
+    }
 
     private static void ValidatePublicationReference(
         PublicationReferenceStatus reference,
@@ -1761,7 +1933,9 @@ internal static class SigstoreStatusCommand
             or UnauthorizedAccessException
             or HttpRequestException
             or TaskCanceledException
-            or UriFormatException;
+            or UriFormatException
+            or InvalidDataException
+            or CryptographicException;
 
     private sealed record ClientStatusResult(
         string Source,

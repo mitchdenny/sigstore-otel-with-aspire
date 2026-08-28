@@ -1003,6 +1003,8 @@ health condition fails the parent command.
 
 ## Step 10: Implement timestamp-authority rotation
 
+**Status: Implemented**
+
 ### Scope
 
 - Generate a new TSA chain and signer.
@@ -1016,6 +1018,105 @@ health condition fails the parent command.
 - New artifacts use the new TSA certificate.
 - All clients verify artifacts from both generations.
 - Failure before activation leaves the old signer active.
+
+### Implementation
+
+`rotate-timestamp-authority` is a confirmed, non-cancelable parent command with
+the same in-process contention gate and shared `state.lock` used by Steps 3-9.
+Its schema-versioned result contains the old/new generation and TSA
+fingerprints, TUF publication identity, every client convergence record,
+timestamp lifecycle identity, RFC3161 evidence, postconditions, and recovery
+errors.
+
+The AppHost first issues a nonce-bound RFC3161 request to the running timestamp
+service. It verifies the CMS signature and message imprint, validates the
+returned leaf against the active TSA root, and stores the exact request and
+response under `tsa-rotation/<operation-id>/` with mode `0600`. Candidate
+generation uses the bootstrapper's existing ECDSA P-256, SHA-256, encrypted
+PKCS#8, AES-256/PBES2, and random-password profile. The candidate has:
+
+```text
+tsa-rotation/<operation-id>/
+|-- command.json
+|-- old-request.tsq
+|-- old-response.tsr
+`-- candidate/
+    |-- private/tsa/                 # removed after worker completion
+    |   |-- signer.key
+    |   `-- password
+    `-- public/tsa/
+        |-- root.pem
+        |-- leaf.pem
+        `-- cert-chain.pem
+```
+
+The TSA root private key exists only while the candidate is being built and
+validated. Generation N+1 contains only the active signer and password in its
+private TSA subtree. It copies every non-TSA file from N byte-for-byte,
+replaces the TSA subtree, writes exact operation/prior-generation fingerprints
+to the immutable manifest, and retains generation N unchanged.
+
+The Go worker owns the durable mutation while holding `state.lock`:
+
+1. Strictly validate the request, candidate profile, old active chain, manifest
+   binding, and any replay state.
+2. Commit immutable generation N+1 without changing `active-generation`.
+3. Clone the active TUF publication, append the new chain to
+   `TrustedRoot.TimestampAuthorities`, preserve every existing Fulcio, CT,
+   Rekor, standby, and historical TSA entry, and retain
+   `signing_config.v0.2.json` byte-for-byte.
+4. Rebuild `client_trust_config.json`, replace only the current TSA alias
+   targets, update `trust_status.v1.json`, and advance targets, snapshot, and
+   timestamp through the existing preparing/committed publication transaction.
+   TUF root and `bootstrap/root.json` remain unchanged.
+5. Switch `active-generation` through the trust-transition journal only after
+   the additive TUF publication commits.
+6. Atomically write the operation-bound worker completion, remove the request,
+   retire candidate private material, and retain only its public chain as
+   journal evidence.
+
+The old timestamp process continues using its prior in-memory signer throughout
+publication. The parent proves that old signer is still running, restarts the
+six clients in deterministic name order, and requires each `/trust/status` to
+match generation N+1 and the additive TrustedRoot hash. It then writes the
+`clients-converged` checkpoint and restarts only `timestamp`. OIDC, Fulcio,
+Tesseract, Rekor server/proxy, TUF nginx, and `shady-blob-store` are protected
+by exact container ID and start-time postconditions.
+
+The timestamp container now bind-mounts the stable state root at
+`/var/lib/sigstore`; both the entrypoint password and server key/chain arguments
+resolve through `/var/lib/sigstore/active-generation/...` inside the replacement
+container. A post-restart RFC3161 request must be signed by the N+1 leaf and
+validate to the new trusted root. `--include-chain-in-response=false` remains
+unchanged; the response includes the signing leaf requested by the client while
+verification obtains roots from additive TrustedRoot.
+
+### Recovery and status
+
+Candidate generation, TUF preparing/commit, generation switch, each client
+convergence, timestamp restart, old/new RFC3161 proof, and final completion are
+durable replay boundaries. Before TUF activation, recovery removes only known
+unjournaled scratch and keeps the old signer active. After TUF activation it
+always completes forward. A replay checks live client status before restarting,
+so already converged clients are not restarted again. It probes the live TSA
+before issuing the service command; if the new signer and a replacement
+container are already present after all recorded client start times, the second
+restart is suppressed. Any mismatched operation ID, fingerprint, generation,
+publication, container ordering, or file hash fails loudly.
+
+While additive trust is committed but activation is incomplete, the parent
+shows `TSA Activation Pending` (or `TSA Verification Pending`) and disables
+unrelated mutation commands. The TSA command remains available for recovery.
+The read-only `status` command parses and validates every TSA chain in
+TrustedRoot, exposes the active and running root/leaf identities, and remains
+degraded until the running RFC3161 signer matches the active generation.
+
+### Known limitation
+
+The existing sigstore-python rejection of a bundle whose protobuf JSON omits an
+index-zero enum remains out of scope. Rotation does not alter or normalize
+bundle serialization; live validation reports the issue if that producer wins
+the affected artifact instead of masking it.
 
 ## Step 11: Implement Fulcio CA rotation
 

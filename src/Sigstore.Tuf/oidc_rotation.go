@@ -416,6 +416,11 @@ func rotateOidcGeneration(
 		OIDCPriorKeyID:              current.OIDCKeyID,
 		OIDCOverlapExpiresAtUTC:     &overlapExpires,
 		OIDCRetainedPrivateKeyPaths: retainedPaths,
+		TSARotationOperationID:      currentManifest.TSARotationOperationID,
+		TSAPriorGeneration:          currentManifest.TSAPriorGeneration,
+		TSAPriorGenerationID:        currentManifest.TSAPriorGenerationID,
+		TSAPriorRootSHA256:          currentManifest.TSAPriorRootSHA256,
+		TSAPriorLeafSHA256:          currentManifest.TSAPriorLeafSHA256,
 		Files:                       newFiles,
 	}
 
