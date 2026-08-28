@@ -436,15 +436,26 @@ aspire resource sigstore rotate-oidc-signing-key
 ```
 
 The command:
-1. Captures a pre-rotation token and baseline OIDC/Fulcio container identities
-2. Dispatches a Go TUF worker that creates generation N+1 with a new RSA key,
-   overlapping JWKS (old+new public keys), and retained old private key
-3. Restarts OIDC (resolves new generation via active-generation symlink)
-4. Verifies new tokens use the new key ID
-5. Proves Fulcio accepts both old and new tokens without restart (JWKS refresh)
-6. Restarts all six clients for generation uptake
+1. Captures a pre-rotation token and durably binds it to a resumable operation
+2. Dispatches the Go TUF worker, which atomically commits one immutable N+1
+   generation containing the new active signer, an append-only overlapping
+   JWKS, and kid-bound retained private keys
+3. Transactionally republishes TUF `trust_status` and switches
+   `active-generation` before restarting OIDC exactly once
+4. Verifies new tokens use the new key ID and proves Fulcio accepts both the
+   exact pre-switch token and a post-switch token without restarting Fulcio
+5. Restarts all six clients and requires generation/status convergence before
+   reporting success
 
 Generation immutability is preserved: prior generation bytes remain unchanged.
 TrustedRoot and SigningConfig are not modified (OIDC keys are operational, not
 in client trust material). Fulcio discovers the new key via its JWKS endpoint
-refresh — no Fulcio restart required.
+refresh — no Fulcio restart required. OIDC mounts the stable state root and
+resolves `/var/lib/sigstore/active-generation/...` only when its replacement
+container starts.
+
+Every completed Step 9 rotation retains all historical OIDC public and private
+keys; repeated rotations grow JWKS history rather than retiring keys. The
+overlap deadline recorded in the generation is the minimum token TTL plus
+clock-skew safety window, not a deletion trigger. Retirement is a separate
+future policy and is not performed by this command.

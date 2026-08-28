@@ -27,6 +27,11 @@ internal static partial class SigstoreStateBootstrapper
     private const string TransitionStatusRecovered = "recovered";
     private const string BootstrapOperation = "bootstrap";
     private const string MigrationOperation = "migrate-schema-4";
+    private const string OidcRotationOperation = "oidc-rotation";
+    private const string GenerationAdvanceOperation = "generation-advance";
+    private const string OidcRotationDirectoryName = "oidc-rotation";
+    private const string OidcRotationCompletionFileName =
+        "rotate-oidc-signing-key.completed";
 
     private static readonly string[] GenerationMaterialFiles =
         LegacyRequiredStateFiles
@@ -543,7 +548,7 @@ internal static partial class SigstoreStateBootstrapper
         ValidateLegacyArchive(
             layout,
             generation);
-        ValidateCurrentRootEntries(layout);
+        ValidateCurrentRootEntries(layout, generation);
 
         if (HashSerialized(journal.CandidateManifest)
             != journal.Candidate.ManifestSha256)
@@ -577,7 +582,9 @@ internal static partial class SigstoreStateBootstrapper
             journal.TrustDomainManifestSha256,
             HashFile(layout.TrustDomain));
         ValidateGenerationDirectory(
-            layout.Generation,
+            Path.Combine(
+                layout.Generations,
+                journal.Candidate.GenerationId),
             journal.CandidateManifest,
             journal.Candidate.ManifestSha256);
         EnsureEqual(
@@ -600,7 +607,9 @@ internal static partial class SigstoreStateBootstrapper
         }
         if (journal.Operation is not (
             BootstrapOperation
-            or MigrationOperation))
+            or MigrationOperation
+            or OidcRotationOperation
+            or GenerationAdvanceOperation))
         {
             throw new InvalidDataException(
                 $"Trust transition operation '{journal.Operation}' is " +
@@ -615,10 +624,26 @@ internal static partial class SigstoreStateBootstrapper
             throw new InvalidDataException(
                 $"Trust transition status '{journal.Status}' is unsupported.");
         }
-        if (journal.PriorGeneration is not null)
+        if (journal.Operation is BootstrapOperation or MigrationOperation
+            && journal.PriorGeneration is not null)
         {
             throw new InvalidDataException(
-                "Step 4 does not permit a prior generation or live rotation.");
+                "Initial trust transitions cannot reference a prior generation.");
+        }
+        if (journal.Operation is OidcRotationOperation or GenerationAdvanceOperation)
+        {
+            if (journal.PriorGeneration is null)
+            {
+                throw new InvalidDataException(
+                    "Generation advance must reference its prior generation.");
+            }
+            ValidateGenerationReference(journal.PriorGeneration);
+            if (journal.Candidate.Generation
+                    != journal.PriorGeneration.Generation + 1)
+            {
+                throw new InvalidDataException(
+                    "Generation advance must be exactly sequential.");
+            }
         }
         ValidateGenerationReference(journal.Candidate);
         ValidateGenerationIdentity(
@@ -642,7 +667,8 @@ internal static partial class SigstoreStateBootstrapper
                 journal.LegacyManifestSha256,
                 "legacy bootstrap manifest");
         }
-        else if (journal.LegacyManifestSha256 is not null)
+        else if (journal.Operation == BootstrapOperation
+            && journal.LegacyManifestSha256 is not null)
         {
             throw new InvalidDataException(
                 "A fresh bootstrap transition cannot reference a legacy " +
@@ -653,12 +679,11 @@ internal static partial class SigstoreStateBootstrapper
     private static void ValidateGenerationReference(
         GenerationReference reference)
     {
-        if (reference.Generation != InitialGeneration
-            || reference.GenerationId != InitialGenerationId)
+        if (reference.Generation < InitialGeneration
+            || reference.GenerationId != GenerationId(reference.Generation))
         {
             throw new InvalidDataException(
-                "Step 4 supports only the imported or freshly bootstrapped " +
-                "initial generation.");
+                "Generation reference has an invalid number or ID.");
         }
         ValidateSha256(
             reference.ManifestSha256,
@@ -987,6 +1012,12 @@ internal static partial class SigstoreStateBootstrapper
             projection.TsaRootSha256,
             projection.TsaLeafSha256,
             projection.OidcKeyId,
+            null,
+            0,
+            null,
+            null,
+            null,
+            null,
             files);
 
     private static void ValidateTrustDomain(
@@ -1046,18 +1077,18 @@ internal static partial class SigstoreStateBootstrapper
                 $"Generation schema {generation.SchemaVersion} is unsupported; " +
                 $"expected {TrustStateSchemaVersion}.");
         }
-        if (generation.Generation != InitialGeneration
-            || generation.GenerationId != InitialGenerationId)
+        if (generation.Generation < InitialGeneration
+            || generation.GenerationId != GenerationId(generation.Generation))
         {
             throw new InvalidDataException(
-                "Step 4 supports only generation 1; rotation is not yet " +
-                "implemented.");
+                "Generation number and generation ID are inconsistent.");
         }
         EnsureEqual(
             "generation trust-domain ID",
             domain.TrustDomainId,
             generation.TrustDomainId);
-        if (generation.CreatedAtUtc != domain.CreatedAtUtc)
+        if (generation.Generation == InitialGeneration
+            && generation.CreatedAtUtc != domain.CreatedAtUtc)
         {
             throw new InvalidDataException(
                 "The initial generation creation time does not match the " +
@@ -1083,6 +1114,7 @@ internal static partial class SigstoreStateBootstrapper
                 "A fresh generation cannot reference a schema-4 manifest.");
         }
         ValidateGenerationFileMap(generation.Files);
+        ValidateOidcRotationMetadata(generation);
     }
 
     private static void ValidateGenerationCryptography(
@@ -1121,6 +1153,7 @@ internal static partial class SigstoreStateBootstrapper
             "OIDC key ID",
             generation.OidcKeyId,
             ValidateOidcKeyPair(generationPath));
+        ValidateOidcRetainedKeys(generationPath, generation);
         ValidateCtLogRuntimeState(stateRootPath);
         ValidateRuntimeState(
             stateRootPath,
@@ -1306,13 +1339,20 @@ internal static partial class SigstoreStateBootstrapper
     private static void ValidateGenerationFileMap(
         SortedDictionary<string, string> files)
     {
-        if (!files.Keys.SequenceEqual(
-                GenerationMaterialFiles,
-                StringComparer.Ordinal))
+        var required = GenerationMaterialFiles.ToHashSet(StringComparer.Ordinal);
+        var actual = files.Keys.ToHashSet(StringComparer.Ordinal);
+        if (!required.IsSubsetOf(actual))
         {
             throw new InvalidDataException(
-                "The generation manifest does not contain the exact expected " +
-                "private/public file set.");
+                "The generation manifest omits required private/public files.");
+        }
+        foreach (var path in actual.Except(required, StringComparer.Ordinal))
+        {
+            if (!IsRetainedOidcKeyPath(path))
+            {
+                throw new InvalidDataException(
+                    $"The generation manifest contains unexpected file '{path}'.");
+            }
         }
         foreach (var pair in files)
         {
@@ -1322,6 +1362,152 @@ internal static partial class SigstoreStateBootstrapper
         }
     }
 
+    private static void ValidateOidcRotationMetadata(
+            GenerationManifest generation)
+        {
+            if (generation.OidcRotationOperationId is null)
+            {
+                if (generation.OidcPriorGeneration != 0
+                    || generation.OidcPriorGenerationId is not null
+                    || generation.OidcPriorKeyId is not null
+                    || generation.OidcOverlapExpiresAtUtc is not null)
+                {
+                    throw new InvalidDataException(
+                        "Generation contains partial OIDC rotation metadata.");
+                }
+                return;
+            }
+
+            if (!Guid.TryParseExact(
+                    generation.OidcRotationOperationId,
+                    "N",
+                    out _)
+                || generation.OidcRotationOperationId.Any(char.IsUpper)
+                || generation.OidcPriorGeneration != generation.Generation - 1
+                || generation.OidcPriorGenerationId
+                    != GenerationId(generation.OidcPriorGeneration)
+                || !IsOidcKeyId(generation.OidcPriorKeyId)
+                || generation.OidcOverlapExpiresAtUtc is null)
+            {
+                throw new InvalidDataException(
+                    "Generation contains invalid OIDC rotation metadata.");
+            }
+        }
+
+        private static void ValidateOidcRetainedKeys(
+            string generationPath,
+            GenerationManifest generation)
+        {
+            using var document = JsonDocument.Parse(
+                File.ReadAllText(Resolve(generationPath, OidcJwksPath)));
+            var keys = document.RootElement.GetProperty("keys")
+                .EnumerateArray()
+                .ToArray();
+            var expectedPaths = new List<string>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var key in keys)
+            {
+                var kid = key.GetProperty("kid").GetString();
+                if (!IsOidcKeyId(kid) || !seen.Add(kid!))
+                {
+                    throw new InvalidDataException(
+                        "OIDC JWKS key IDs must be unique valid SHA-256 IDs.");
+                }
+                EnsureEqual("OIDC key type", "RSA", key.GetProperty("kty").GetString());
+                EnsureEqual("OIDC key use", "sig", key.GetProperty("use").GetString());
+                EnsureEqual("OIDC algorithm", "RS256", key.GetProperty("alg").GetString());
+
+                var parameters = new RSAParameters
+                {
+                    Modulus = DecodeBase64Url(key.GetProperty("n").GetString()),
+                    Exponent = DecodeBase64Url(key.GetProperty("e").GetString())
+                };
+                using var publicKey = RSA.Create();
+                try
+                {
+                    publicKey.ImportParameters(parameters);
+                }
+                catch (CryptographicException exception)
+                {
+                    throw new InvalidDataException(
+                        $"OIDC JWK '{kid}' is not a valid RSA key.",
+                        exception);
+                }
+                EnsureEqual(
+                    "OIDC key ID",
+                    kid!,
+                    Base64UrlEncode(
+                        SHA256.HashData(publicKey.ExportSubjectPublicKeyInfo())));
+
+                if (kid == generation.OidcKeyId)
+                {
+                    continue;
+                }
+                var relativePath =
+                    $"private/oidc/retained/signer-{kid}.key";
+                expectedPaths.Add(relativePath);
+                using var retained = LoadRsaKey(
+                    Resolve(generationPath, relativePath));
+                EnsureKeyBytesEqual(
+                    $"retained OIDC key '{kid}'",
+                    publicKey.ExportSubjectPublicKeyInfo(),
+                    retained.ExportSubjectPublicKeyInfo());
+            }
+
+            expectedPaths.Sort(StringComparer.Ordinal);
+            var actualPaths = (generation.OidcRetainedPrivateKeyPaths ?? [])
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+            if (!expectedPaths.SequenceEqual(actualPaths, StringComparer.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "OIDC retained private-key paths do not exactly match JWKS history.");
+            }
+        }
+
+        private static bool IsRetainedOidcKeyPath(string path)
+        {
+            const string prefix = "private/oidc/retained/signer-";
+            const string suffix = ".key";
+            return path.StartsWith(prefix, StringComparison.Ordinal)
+                && path.EndsWith(suffix, StringComparison.Ordinal)
+                && IsOidcKeyId(
+                    path[prefix.Length..^suffix.Length]);
+        }
+
+        private static bool IsOidcKeyId(string? keyId) =>
+            keyId is { Length: 43 }
+            && keyId.All(character =>
+                char.IsAsciiLetterOrDigit(character)
+                || character is '-' or '_');
+
+        private static byte[] DecodeBase64Url(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new InvalidDataException(
+                    "OIDC JWK contains an empty key parameter.");
+            }
+            var padded = value.Replace('-', '+').Replace('_', '/');
+            padded += (padded.Length % 4) switch
+            {
+                0 => string.Empty,
+                2 => "==",
+                3 => "=",
+                _ => throw new InvalidDataException(
+                    "OIDC JWK contains invalid base64url data.")
+            };
+            try
+            {
+                return Convert.FromBase64String(padded);
+            }
+            catch (FormatException exception)
+            {
+                throw new InvalidDataException(
+                    "OIDC JWK contains invalid base64url data.",
+                    exception);
+            }
+        }
     private static bool FileMapsEqual(
         SortedDictionary<string, string> expected,
         SortedDictionary<string, string> actual)
@@ -1346,7 +1532,8 @@ internal static partial class SigstoreStateBootstrapper
     }
 
     private static void ValidateCurrentRootEntries(
-        TrustStateLayout layout)
+        TrustStateLayout layout,
+        GenerationManifest generation)
     {
         var allowed = new List<string>
         {
@@ -1365,12 +1552,21 @@ internal static partial class SigstoreStateBootstrapper
         {
             allowed.Add("tuf");
         }
+        if (Directory.Exists(Path.Combine(layout.Root, OidcRotationDirectoryName)))
+        {
+            allowed.Add(OidcRotationDirectoryName);
+        }
+        if (File.Exists(Path.Combine(layout.Root, OidcRotationCompletionFileName)))
+        {
+            allowed.Add(OidcRotationCompletionFileName);
+        }
         EnsureOnlyEntries(
             layout.Root,
             allowed);
         EnsureOnlyEntries(
             layout.Generations,
-            [InitialGenerationId]);
+            Enumerable.Range(InitialGeneration, generation.Generation)
+                .Select(GenerationId));
         EnsureOnlyEntries(
             layout.Transition,
             [TransitionStateFileName]);
@@ -1523,13 +1719,32 @@ internal static partial class SigstoreStateBootstrapper
         var expectedDirectory = Path.GetDirectoryName(target);
         var generationId = Path.GetFileName(target);
         if (expectedDirectory != GenerationsDirectoryName
-            || generationId != InitialGenerationId)
+            || !TryParseGenerationId(generationId, out _))
         {
             throw new InvalidDataException(
                 $"Active generation link '{path}' has unsafe target " +
                 $"'{target}'.");
         }
         return generationId;
+    }
+
+    private static string GenerationId(int generation) =>
+        $"generation-{generation:D8}";
+
+    private static bool TryParseGenerationId(
+        string generationId,
+        out int generation)
+    {
+        generation = 0;
+        return generationId.Length == "generation-00000000".Length
+            && generationId.StartsWith("generation-", StringComparison.Ordinal)
+            && int.TryParse(
+                generationId.AsSpan("generation-".Length),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out generation)
+            && generation >= InitialGeneration
+            && generationId == GenerationId(generation);
     }
 
     private static string ReadRelativeLink(string path)

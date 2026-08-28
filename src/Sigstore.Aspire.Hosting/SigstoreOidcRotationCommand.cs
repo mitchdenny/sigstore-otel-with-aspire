@@ -1,8 +1,3 @@
-using System.Globalization;
-using System.Net.Http.Json;
-using System.Text.Json;
-using Microsoft.Extensions.Logging;
-
 namespace Aspire.Hosting.ApplicationModel;
 
 /// <summary>
@@ -24,8 +19,8 @@ internal static class SigstoreOidcRotationCommand
         {
             Description =
                 "Rotates the OIDC signing key by creating generation N+1 " +
-                "with a new RSA key pair, overlapping JWKS, and bounded " +
-                "retained prior key material.",
+                "with a new RSA key pair, overlapping JWKS, and retained " +
+                "historical private keys.",
             ConfirmationMessage =
                 "This will generate a new OIDC signing key, advance the " +
                 "trust generation, restart the OIDC issuer and all six " +
@@ -33,7 +28,15 @@ internal static class SigstoreOidcRotationCommand
                 "keys via JWKS refresh). Proceed?",
             IsHighlighted = true,
             UpdateState = _ =>
-                SigstoreOperationCommand.GetMutationCommandState(resource)
+                SigstoreOperationCommand.GetMutationCommandState(resource),
+            Progress = new CommandProgressOptions
+            {
+                Title = "Rotate OIDC signing key",
+                Message =
+                    "Advancing trust, restarting OIDC once, and proving old/new " +
+                    "token issuance through Fulcio.",
+                HideCancelButton = true
+            }
         };
 
     public static Task<ExecuteCommandResult> ExecuteAsync(

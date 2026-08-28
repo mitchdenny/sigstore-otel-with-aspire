@@ -13,22 +13,31 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	tuf "github.com/theupdateframework/go-tuf"
 )
 
 const (
-	oidcRotationRequestFile    = "rotate-oidc-signing-key.request"
-	oidcRotationCompletionFile = "rotate-oidc-signing-key.completed"
-	oidcRotationCompletionSchema = 1
+	oidcRotationRequestFile      = "rotate-oidc-signing-key.request"
+	oidcRotationCompletionFile   = "rotate-oidc-signing-key.completed"
+	oidcRotationCompletionSchema = 2
+	oidcRotationSchema           = 2
+	oidcRotationDirectory        = "oidc-rotation"
 )
 
 // oidcRotationRequest is the schema-versioned request signal file content.
 type oidcRotationRequest struct {
-	SchemaVersion int    `json:"schemaVersion"`
-	OperationID   string `json:"operationId"`
-	TrustDomainID string `json:"trustDomainId"`
+	SchemaVersion        int    `json:"schemaVersion"`
+	OperationID          string `json:"operationId"`
+	TrustDomainID        string `json:"trustDomainId"`
+	StartingGeneration   int    `json:"startingGeneration"`
+	StartingGenerationID string `json:"startingGenerationId"`
+	StartingOIDCKeyID    string `json:"startingOidcKeyId"`
 }
 
 // oidcRotationCompletion records that OIDC rotation completed successfully.
@@ -45,19 +54,23 @@ type oidcRotationCompletion struct {
 	NewOidcKeyID         string    `json:"newOidcKeyId"`
 	ManifestSHA256       string    `json:"manifestSha256"`
 	JwksKeyIDs           []string  `json:"jwksKeyIds"`
+	JwksSHA256           string    `json:"jwksSha256"`
+	RetainedKeyPaths     []string  `json:"retainedKeyPaths"`
 	TokenLifetimeSeconds int       `json:"tokenLifetimeSeconds"`
 	OverlapExpiresAt     time.Time `json:"overlapExpiresAtUtc"`
 	PublicationID        string    `json:"publicationId"`
 }
 
 const (
-	// oidcTokenLifetimeSeconds is the configured OIDC token lifetime (5 min).
-	oidcTokenLifetimeSeconds = 300
+	// oidcTokenLifetimeSeconds is the configured OIDC token lifetime (30 min).
+	oidcTokenLifetimeSeconds = 1800
 	// oidcClockSkewSeconds is allowed clock drift for token validation.
 	oidcClockSkewSeconds = 30
-	// oidcMaxJwksKeys bounds the number of keys retained in overlapping JWKS.
-	// Current active + at most 2 historical (one overlap + one retained).
-	oidcMaxJwksKeys = 3
+)
+
+var (
+	oidcOperationIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
+	oidcKeyIDPattern       = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 )
 
 // jwk represents a single RSA public key in JWK format.
@@ -85,8 +98,6 @@ func dispatchOidcRotation(statePath string) (repositoryAction, error) {
 
 func dispatchOidcRotationWithHooks(statePath string, hooks publicationHooks) (repositoryAction, error) {
 	requestPath := filepath.Join(statePath, oidcRotationRequestFile)
-
-	// Read and validate the request strictly before acquiring the lock.
 	requestData, err := os.ReadFile(requestPath)
 	if err != nil {
 		return "", fmt.Errorf("read OIDC rotation request: %w", err)
@@ -95,24 +106,16 @@ func dispatchOidcRotationWithHooks(statePath string, hooks publicationHooks) (re
 	if err := json.Unmarshal(requestData, &req); err != nil {
 		return "", fmt.Errorf("parse OIDC rotation request: %w", err)
 	}
-	if req.SchemaVersion != 1 {
-		return "", fmt.Errorf("OIDC rotation request schema %d unsupported (expected 1)", req.SchemaVersion)
-	}
-	if req.OperationID == "" {
-		return "", fmt.Errorf("OIDC rotation request missing operationId")
-	}
-	if req.TrustDomainID == "" {
-		return "", fmt.Errorf("OIDC rotation request missing trustDomainId")
+	if err := validateOIDCRotationRequest(req); err != nil {
+		return "", err
 	}
 
-	// Acquire the shared state lock for the entire dispatch lifecycle.
 	stateLock, err := acquireStateLock(statePath, 30*time.Second, "oidc-rotation-dispatch")
 	if err != nil {
 		return "", err
 	}
 	defer stateLock.release()
 
-	// Validate request trust domain against immutable state under lock.
 	domain, err := loadTrustDomain(statePath)
 	if err != nil {
 		return "", fmt.Errorf("load trust domain for OIDC rotation: %w", err)
@@ -123,7 +126,6 @@ func dispatchOidcRotationWithHooks(statePath string, hooks publicationHooks) (re
 			req.TrustDomainID, domain.TrustDomainID)
 	}
 
-	// Check for replay: if completion already exists with this operation ID.
 	comp, err := loadOidcRotationCompletion(statePath)
 	if err != nil {
 		return "", fmt.Errorf("ambiguous OIDC rotation completion state: %w", err)
@@ -140,79 +142,75 @@ func dispatchOidcRotationWithHooks(statePath string, hooks publicationHooks) (re
 		return repositoryActionPublished, nil
 	}
 
-	// Load current trust generation.
+	if err := recoverCommittedOIDCRotation(statePath, req); err != nil {
+		return "", fmt.Errorf("recover committed OIDC rotation: %w", err)
+	}
+	if _, err := recoverTUFStateLocked(statePath, hooks); err != nil {
+		return "", fmt.Errorf("recover TUF publication for OIDC rotation: %w", err)
+	}
 	bootstrap, err := loadActiveTrustGeneration(statePath)
 	if err != nil {
 		return "", fmt.Errorf("load active generation for OIDC rotation: %w", err)
 	}
+	if bootstrap.Generation == req.StartingGeneration+1 {
+		generation, err := readOIDCGenerationManifest(statePath, bootstrap.GenerationID)
+		if err != nil {
+			return "", err
+		}
+		if generation.OIDCRotationOperationID != req.OperationID {
+			return "", fmt.Errorf(
+				"active generation %s belongs to OIDC rotation %q, not %q",
+				bootstrap.GenerationID,
+				generation.OIDCRotationOperationID,
+				req.OperationID,
+			)
+		}
+		if err := validateOIDCRequestStartingState(req, generation); err != nil {
+			return "", err
+		}
+		if err := finalizeOIDCRotationCompletion(statePath, req, bootstrap); err != nil {
+			return "", err
+		}
+		if err := os.Remove(requestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("remove recovered OIDC rotation request: %w", err)
+		}
+		return repositoryActionRecovered, nil
+	}
+	if bootstrap.Generation != req.StartingGeneration ||
+		bootstrap.GenerationID != req.StartingGenerationID ||
+		bootstrap.OIDCKeyID != req.StartingOIDCKeyID {
+		return "", errors.New("OIDC rotation request does not match the active starting generation")
+	}
 
-	// Perform the OIDC key rotation: create generation N+1 with new keys.
-	newBootstrap, err := rotateOidcGeneration(statePath, bootstrap)
+	newBootstrap, err := rotateOidcGeneration(statePath, bootstrap, req)
 	if err != nil {
 		return "", fmt.Errorf("rotate OIDC generation: %w", err)
 	}
-
-	// Publish updated TUF trust_status through proper candidate→commit lifecycle.
-	// This must happen BEFORE switching the active-generation symlink so that
-	// the active publication's fingerprint remains valid during the switch.
-	if err := publishOidcTrustStatusUpdate(statePath, bootstrap, newBootstrap, hooks); err != nil {
-		return "", fmt.Errorf("publish OIDC trust status update: %w", err)
-	}
-
-	// Switch active-generation symlink now that TUF publication succeeded.
-	if err := switchActiveGeneration(statePath, bootstrap, newBootstrap, newBootstrap.GenerationManifestSHA256); err != nil {
-		return "", fmt.Errorf("switch active generation: %w", err)
-	}
-
-	// Read new JWKS for completion record.
-	newGenPath := filepath.Join(statePath, "generations", newBootstrap.GenerationID)
-	jwksData, err := os.ReadFile(filepath.Join(newGenPath, "public", "oidc", "jwks.json"))
-	if err != nil {
-		return "", fmt.Errorf("read new JWKS for completion: %w", err)
-	}
-	var newJwks jwks
-	if err := json.Unmarshal(jwksData, &newJwks); err != nil {
-		return "", fmt.Errorf("parse new JWKS for completion: %w", err)
-	}
-	var jwksKeyIDs []string
-	for _, k := range newJwks.Keys {
-		jwksKeyIDs = append(jwksKeyIDs, k.Kid)
-	}
-
-	// Write completion atomically.
-	now := time.Now().UTC()
-	overlapExpires := now.Add(time.Duration(oidcTokenLifetimeSeconds+oidcClockSkewSeconds) * time.Second)
-
-	// Read final publication ID.
-	layout := newTUFLayout(statePath)
-	finalState, _ := loadPublicationState(layout)
-	publicationID := ""
-	if finalState.Active != nil {
-		publicationID = finalState.Active.ID
-	}
-
-	newComp := oidcRotationCompletion{
-		SchemaVersion:        oidcRotationCompletionSchema,
-		OperationID:          req.OperationID,
-		TrustDomainID:        req.TrustDomainID,
-		CompletedAt:          now,
-		PriorGeneration:      bootstrap.Generation,
-		PriorGenerationID:    bootstrap.GenerationID,
-		PriorOidcKeyID:       bootstrap.OIDCKeyID,
-		NewGeneration:        newBootstrap.Generation,
-		NewGenerationID:      newBootstrap.GenerationID,
-		NewOidcKeyID:         newBootstrap.OIDCKeyID,
-		ManifestSHA256:       newBootstrap.GenerationManifestSHA256,
-		JwksKeyIDs:           jwksKeyIDs,
-		TokenLifetimeSeconds: oidcTokenLifetimeSeconds,
-		OverlapExpiresAt:     overlapExpires,
-		PublicationID:        publicationID,
-	}
-	if err := writeOidcRotationCompletion(statePath, newComp); err != nil {
+	if err := runCheckpoint(hooks, publicationCheckpoint("oidc-generation-committed")); err != nil {
 		return "", err
 	}
 
-	// Remove request file last.
+	if err := publishOidcTrustStatusUpdate(statePath, bootstrap, newBootstrap, hooks); err != nil {
+		return "", fmt.Errorf("publish OIDC trust status update: %w", err)
+	}
+	if err := runCheckpoint(hooks, publicationCheckpoint("oidc-tuf-committed")); err != nil {
+		return "", err
+	}
+
+	if err := switchActiveGeneration(statePath, bootstrap, newBootstrap, newBootstrap.GenerationManifestSHA256); err != nil {
+		return "", fmt.Errorf("switch active generation: %w", err)
+	}
+	if err := runCheckpoint(hooks, publicationCheckpoint("oidc-generation-switched")); err != nil {
+		return "", err
+	}
+
+	if err := finalizeOIDCRotationCompletion(statePath, req, newBootstrap); err != nil {
+		return "", err
+	}
+	if err := runCheckpoint(hooks, publicationCheckpoint("oidc-completion-written")); err != nil {
+		return "", err
+	}
+
 	if err := os.Remove(requestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("remove OIDC rotation request file: %w", err)
 	}
@@ -227,21 +225,51 @@ func dispatchOidcRotationWithHooks(statePath string, hooks publicationHooks) (re
 // rotateOidcGeneration creates generation N+1 with a new OIDC signing key,
 // overlapping JWKS containing all prior keys, and all non-OIDC material
 // preserved unchanged from the current generation.
-func rotateOidcGeneration(statePath string, current bootstrapManifest) (bootstrapManifest, error) {
+func rotateOidcGeneration(
+	statePath string,
+	current bootstrapManifest,
+	request oidcRotationRequest,
+) (bootstrapManifest, error) {
 	newGeneration := current.Generation + 1
 	newGenerationID := fmt.Sprintf("generation-%08d", newGeneration)
 	currentGenerationPath := filepath.Join(statePath, "generations", current.GenerationID)
 	newGenerationPath := filepath.Join(statePath, "generations", newGenerationID)
 
-	// If generation N+1 already exists (interrupted prior attempt), validate and reuse.
 	if pathExists(newGenerationPath) {
-		return validateAndReuseOidcGeneration(statePath, current, newGenerationPath, newGenerationID, newGeneration)
+		return validateAndReuseOidcGeneration(
+			statePath,
+			current,
+			newGenerationPath,
+			newGenerationID,
+			newGeneration,
+			request,
+		)
 	}
-
-	// Generate new RSA 2048 key pair.
-	newKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	stagingGenerationPath := filepath.Join(
+		statePath,
+		oidcRotationDirectory,
+		request.OperationID,
+		newGenerationID+".staging",
+	)
+	if err := os.RemoveAll(stagingGenerationPath); err != nil {
+		return bootstrapManifest{}, fmt.Errorf("clean OIDC generation staging directory: %w", err)
+	}
+	currentManifest, err := readOIDCGenerationManifest(
+		statePath,
+		current.GenerationID,
+	)
 	if err != nil {
-		return bootstrapManifest{}, fmt.Errorf("generate new OIDC signing key: %w", err)
+		return bootstrapManifest{}, fmt.Errorf("read current OIDC generation manifest: %w", err)
+	}
+	if err := validateOIDCGenerationMaterial(
+		currentGenerationPath,
+		currentManifest,
+	); err != nil {
+		return bootstrapManifest{}, fmt.Errorf("validate current OIDC generation: %w", err)
+	}
+	newKey, err := ensureOIDCOperationCandidate(statePath, request.OperationID)
+	if err != nil {
+		return bootstrapManifest{}, err
 	}
 
 	// Compute new key ID: base64url(SHA-256(SPKI DER))
@@ -253,37 +281,37 @@ func rotateOidcGeneration(statePath string, current bootstrapManifest) (bootstra
 	newKid := base64.RawURLEncoding.EncodeToString(newKidHash[:])
 
 	// Copy all files from current generation to new generation.
-	if err := os.MkdirAll(newGenerationPath, 0o755); err != nil {
+	if err := os.MkdirAll(stagingGenerationPath, 0o755); err != nil {
 		return bootstrapManifest{}, fmt.Errorf("create new generation directory: %w", err)
 	}
-	if err := copyDirectory(currentGenerationPath, newGenerationPath); err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+	if err := copyDirectory(currentGenerationPath, stagingGenerationPath); err != nil {
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("copy prior generation material: %w", err)
 	}
 
 	// Remove prior manifest (will write new one).
-	_ = os.Remove(filepath.Join(newGenerationPath, "manifest.json"))
+	_ = os.Remove(filepath.Join(stagingGenerationPath, "manifest.json"))
 
 	// Write new active private key.
 	newPrivateKeyPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "PRIVATE KEY",
 		Bytes: mustMarshalPKCS8(newKey),
 	})
-	signerKeyPath := filepath.Join(newGenerationPath, "private", "oidc", "signer.key")
+	signerKeyPath := filepath.Join(stagingGenerationPath, "private", "oidc", "signer.key")
 	if err := os.WriteFile(signerKeyPath, newPrivateKeyPEM, 0o600); err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("write new OIDC signer key: %w", err)
 	}
 
 	// Retain old private key with a stable kid-based path.
 	oldPrivateKeyPEM, err := os.ReadFile(filepath.Join(currentGenerationPath, "private", "oidc", "signer.key"))
 	if err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("read old OIDC signer key: %w", err)
 	}
-	retainedDir := filepath.Join(newGenerationPath, "private", "oidc", "retained")
+	retainedDir := filepath.Join(stagingGenerationPath, "private", "oidc", "retained")
 	if err := os.MkdirAll(retainedDir, 0o700); err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("create retained key directory: %w", err)
 	}
 	// Also preserve any existing retained keys from the current generation.
@@ -294,7 +322,7 @@ func rotateOidcGeneration(statePath string, current bootstrapManifest) (bootstra
 	// Write old active key to retained (may overwrite copy if same name).
 	oldRetainedPath := filepath.Join(retainedDir, fmt.Sprintf("signer-%s.key", current.OIDCKeyID))
 	if err := os.WriteFile(oldRetainedPath, oldPrivateKeyPEM, 0o600); err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("write retained OIDC key: %w", err)
 	}
 
@@ -303,93 +331,123 @@ func rotateOidcGeneration(statePath string, current bootstrapManifest) (bootstra
 		Type:  "PUBLIC KEY",
 		Bytes: newSPKI,
 	})
-	pubKeyPath := filepath.Join(newGenerationPath, "public", "oidc", "signer.pub")
+	pubKeyPath := filepath.Join(stagingGenerationPath, "public", "oidc", "signer.pub")
 	if err := os.WriteFile(pubKeyPath, newPublicKeyPEM, 0o644); err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("write new OIDC public key: %w", err)
 	}
 
 	// Build overlapping JWKS containing new key + retained prior keys.
 	existingJwksData, err := os.ReadFile(filepath.Join(currentGenerationPath, "public", "oidc", "jwks.json"))
 	if err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("read existing JWKS: %w", err)
 	}
 	var existingJwks jwks
 	if err := json.Unmarshal(existingJwksData, &existingJwks); err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("parse existing JWKS: %w", err)
 	}
 
 	// Create new JWK entry for the new key.
 	newJWK := rsaPublicKeyToJWK(&newKey.PublicKey, newKid)
 
-	// Apply bounded retention: keep keys whose overlap hasn't expired,
-	// up to oidcMaxJwksKeys total (including the new active key).
-	retainedKeys := retainJwksKeys(existingJwks.Keys, statePath, oidcMaxJwksKeys-1)
+	retainedKeys := append([]jwk(nil), existingJwks.Keys...)
 
 	// Overlapping JWKS: new active key first, then retained historical keys.
 	overlappingJwks := jwks{
 		Keys: append([]jwk{newJWK}, retainedKeys...),
 	}
 
-	// Remove private keys for retired public keys.
-	retainedKids := map[string]bool{newKid: true}
-	for _, k := range retainedKeys {
-		retainedKids[k.Kid] = true
-	}
-	retireExpiredPrivateKeys(retainedDir, retainedKids)
-
 	overlappingJwksData, err := json.MarshalIndent(overlappingJwks, "", "  ")
 	if err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("marshal overlapping JWKS: %w", err)
 	}
 	overlappingJwksData = append(overlappingJwksData, '\n')
-	jwksPath := filepath.Join(newGenerationPath, "public", "oidc", "jwks.json")
+	jwksPath := filepath.Join(stagingGenerationPath, "public", "oidc", "jwks.json")
 	if err := os.WriteFile(jwksPath, overlappingJwksData, 0o644); err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("write overlapping JWKS: %w", err)
 	}
 
 	// Compute file hashes for new generation.
-	newFiles, err := collectGenerationFileHashes(newGenerationPath)
+	newFiles, err := collectGenerationFileHashes(stagingGenerationPath)
 	if err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, err
 	}
 
 	// Write new generation manifest.
 	now := time.Now().UTC()
+	overlapExpires := now.Add(
+		time.Duration(oidcTokenLifetimeSeconds+oidcClockSkewSeconds) * time.Second,
+	)
+	retainedPaths := make([]string, 0, len(retainedKeys))
+	for _, key := range retainedKeys {
+		retainedPaths = append(
+			retainedPaths,
+			filepath.ToSlash(filepath.Join(
+				"private",
+				"oidc",
+				"retained",
+				fmt.Sprintf("signer-%s.key", key.Kid),
+			)),
+		)
+	}
+	sort.Strings(retainedPaths)
 	genManifest := generationManifest{
-		SchemaVersion:        trustStateSchemaVersion,
-		Generation:           newGeneration,
-		GenerationID:         newGenerationID,
-		TrustDomainID:        current.TrustDomainID,
-		CreatedAtUTC:         now,
-		SourceSchemaVersion:  trustStateSchemaVersion,
-		SourceManifestSHA256: nil,
-		FulcioRootSHA256:     current.FulcioRootSHA256,
-		CtLogPublicKeySHA256: current.CtLogPublicKeySHA256,
-		RekorPublicKeySHA256: current.RekorPublicKeySHA256,
-		TsaRootSHA256:        current.TsaRootSHA256,
-		TsaLeafSHA256:        current.TsaLeafSHA256,
-		OIDCKeyID:            newKid,
-		Files:                newFiles,
+		SchemaVersion:               trustStateSchemaVersion,
+		Generation:                  newGeneration,
+		GenerationID:                newGenerationID,
+		TrustDomainID:               current.TrustDomainID,
+		CreatedAtUTC:                now,
+		SourceSchemaVersion:         trustStateSchemaVersion,
+		SourceManifestSHA256:        nil,
+		FulcioRootSHA256:            current.FulcioRootSHA256,
+		CtLogPublicKeySHA256:        current.CtLogPublicKeySHA256,
+		RekorPublicKeySHA256:        current.RekorPublicKeySHA256,
+		TsaRootSHA256:               current.TsaRootSHA256,
+		TsaLeafSHA256:               current.TsaLeafSHA256,
+		OIDCKeyID:                   newKid,
+		OIDCRotationOperationID:     request.OperationID,
+		OIDCPriorGeneration:         current.Generation,
+		OIDCPriorGenerationID:       current.GenerationID,
+		OIDCPriorKeyID:              current.OIDCKeyID,
+		OIDCOverlapExpiresAtUTC:     &overlapExpires,
+		OIDCRetainedPrivateKeyPaths: retainedPaths,
+		Files:                       newFiles,
 	}
 
 	manifestBytes, err := json.MarshalIndent(genManifest, "", "  ")
 	if err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("marshal OIDC rotation generation manifest: %w", err)
 	}
 	manifestBytes = append(manifestBytes, '\n')
-	manifestPath := filepath.Join(newGenerationPath, "manifest.json")
+	manifestPath := filepath.Join(stagingGenerationPath, "manifest.json")
 	if err := os.WriteFile(manifestPath, manifestBytes, 0o644); err != nil {
-		_ = os.RemoveAll(newGenerationPath)
+		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("write OIDC rotation generation manifest: %w", err)
 	}
 	manifestHash := hashBytes(manifestBytes)
+	if err := validateOIDCGenerationMaterial(stagingGenerationPath, genManifest); err != nil {
+		_ = os.RemoveAll(stagingGenerationPath)
+		return bootstrapManifest{}, fmt.Errorf("validate rotated OIDC generation: %w", err)
+	}
+	if err := validateUnchangedNonOIDCMaterial(
+		currentGenerationPath,
+		stagingGenerationPath,
+	); err != nil {
+		_ = os.RemoveAll(stagingGenerationPath)
+		return bootstrapManifest{}, err
+	}
+	if err := os.Rename(stagingGenerationPath, newGenerationPath); err != nil {
+		return bootstrapManifest{}, fmt.Errorf("commit OIDC generation: %w", err)
+	}
+	if err := syncDirectory(filepath.Dir(newGenerationPath)); err != nil {
+		return bootstrapManifest{}, fmt.Errorf("sync committed OIDC generation: %w", err)
+	}
 
 	return bootstrapManifest{
 		SchemaVersion:            4,
@@ -415,6 +473,7 @@ func validateAndReuseOidcGeneration(
 	newGenPath string,
 	newGenID string,
 	newGen int,
+	request oidcRotationRequest,
 ) (bootstrapManifest, error) {
 	manifestPath := filepath.Join(newGenPath, "manifest.json")
 	manifestBytes, err := os.ReadFile(manifestPath)
@@ -438,6 +497,14 @@ func validateAndReuseOidcGeneration(
 			"pre-existing generation trust domain %q does not match current %q",
 			genManifest.TrustDomainID, current.TrustDomainID)
 	}
+	if genManifest.OIDCRotationOperationID != request.OperationID ||
+		genManifest.OIDCPriorGeneration != request.StartingGeneration ||
+		genManifest.OIDCPriorGenerationID != request.StartingGenerationID ||
+		genManifest.OIDCPriorKeyID != request.StartingOIDCKeyID {
+		return bootstrapManifest{}, errors.New(
+			"pre-existing generation is not bound to this OIDC rotation request",
+		)
+	}
 	// Verify files match manifest.
 	actualFiles, err := collectGenerationFileHashes(newGenPath)
 	if err != nil {
@@ -449,6 +516,15 @@ func validateAndReuseOidcGeneration(
 	for k, v := range genManifest.Files {
 		if actualFiles[k] != v {
 			return bootstrapManifest{}, fmt.Errorf("pre-existing generation file %q hash mismatch", k)
+		}
+		if err := validateOIDCGenerationMaterial(newGenPath, genManifest); err != nil {
+			return bootstrapManifest{}, err
+		}
+		if err := validateUnchangedNonOIDCMaterial(
+			filepath.Join(statePath, "generations", current.GenerationID),
+			newGenPath,
+		); err != nil {
+			return bootstrapManifest{}, err
 		}
 	}
 
@@ -705,6 +781,25 @@ func loadOidcRotationCompletion(statePath string) (*oidcRotationCompletion, erro
 	if comp.OperationID == "" || comp.TrustDomainID == "" {
 		return nil, fmt.Errorf("OIDC rotation completion missing required fields")
 	}
+	if !oidcOperationIDPattern.MatchString(comp.OperationID) ||
+		comp.NewGeneration != comp.PriorGeneration+1 ||
+		comp.PriorGenerationID != fmt.Sprintf(
+			"generation-%08d",
+			comp.PriorGeneration,
+		) ||
+		comp.NewGenerationID != fmt.Sprintf(
+			"generation-%08d",
+			comp.NewGeneration,
+		) ||
+		!oidcKeyIDPattern.MatchString(comp.PriorOidcKeyID) ||
+		!oidcKeyIDPattern.MatchString(comp.NewOidcKeyID) ||
+		validateSHA256(comp.ManifestSHA256) != nil ||
+		validateSHA256(comp.JwksSHA256) != nil ||
+		comp.TokenLifetimeSeconds != oidcTokenLifetimeSeconds ||
+		comp.OverlapExpiresAt.IsZero() ||
+		comp.PublicationID == "" {
+		return nil, errors.New("OIDC rotation completion has invalid durable state")
+	}
 	return &comp, nil
 }
 
@@ -747,6 +842,40 @@ func validateOidcCompletionAgainstState(statePath string, comp *oidcRotationComp
 		return fmt.Errorf("completion OIDC key ID %q does not match active %q",
 			comp.NewOidcKeyID, bootstrap.OIDCKeyID)
 	}
+	generation, err := readOIDCGenerationManifest(statePath, bootstrap.GenerationID)
+	if err != nil {
+		return err
+	}
+	if generation.OIDCRotationOperationID != comp.OperationID ||
+		generation.OIDCPriorGeneration != comp.PriorGeneration ||
+		generation.OIDCPriorGenerationID != comp.PriorGenerationID ||
+		generation.OIDCPriorKeyID != comp.PriorOidcKeyID ||
+		generation.OIDCOverlapExpiresAtUTC == nil ||
+		!generation.OIDCOverlapExpiresAtUTC.Equal(comp.OverlapExpiresAt) ||
+		!reflect.DeepEqual(
+			generation.OIDCRetainedPrivateKeyPaths,
+			comp.RetainedKeyPaths,
+		) {
+		return errors.New("completion does not match OIDC generation metadata")
+	}
+	generationPath := filepath.Join(statePath, "generations", bootstrap.GenerationID)
+	keyIDs, jwksHash, err := readValidatedOIDCJWKS(generationPath)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(keyIDs, comp.JwksKeyIDs) ||
+		jwksHash != comp.JwksSHA256 {
+		return errors.New("completion does not match the active OIDC JWKS")
+	}
+	publication, err := loadPublicationState(newTUFLayout(statePath))
+	if err != nil {
+		return err
+	}
+	if publication.Status != publicationStatusCommitted ||
+		publication.Active == nil ||
+		publication.Active.ID != comp.PublicationID {
+		return errors.New("completion does not match the active TUF publication")
+	}
 	return nil
 }
 
@@ -771,55 +900,573 @@ func mustMarshalPKCS8(key *rsa.PrivateKey) []byte {
 	return data
 }
 
-// retainJwksKeys applies bounded retention policy to existing JWKS keys.
-// It retains keys that still have unexpired overlap (based on prior completion
-// record), up to maxRetained total. Keys are kept in order (most recent first).
-func retainJwksKeys(existingKeys []jwk, statePath string, maxRetained int) []jwk {
-	if len(existingKeys) == 0 {
-		return nil
+func validateOIDCRotationRequest(request oidcRotationRequest) error {
+	if request.SchemaVersion != oidcRotationSchema {
+		return fmt.Errorf(
+			"OIDC rotation request schema %d unsupported (expected %d)",
+			request.SchemaVersion,
+			oidcRotationSchema,
+		)
 	}
-
-	// Load prior completion to check overlap expiry.
-	comp, err := loadOidcRotationCompletion(statePath)
-	now := time.Now().UTC()
-
-	var retained []jwk
-	for _, k := range existingKeys {
-		if len(retained) >= maxRetained {
-			break
-		}
-		// If we have a completion record and this key's overlap has expired,
-		// retire it (don't include in new JWKS).
-		if err == nil && comp != nil && !comp.OverlapExpiresAt.IsZero() {
-			// The prior completion's OverlapExpiresAt covers the PRIOR active key.
-			// If this key is the prior active key and overlap expired, retire.
-			if k.Kid == comp.PriorOidcKeyID && now.After(comp.OverlapExpiresAt) {
-				continue
-			}
-		}
-		retained = append(retained, k)
+	if !oidcOperationIDPattern.MatchString(request.OperationID) {
+		return errors.New("OIDC rotation operationId must be 32 lowercase hexadecimal characters")
 	}
-	return retained
+	if request.TrustDomainID == "" ||
+		request.StartingGeneration < initialGeneration ||
+		request.StartingGenerationID != fmt.Sprintf(
+			"generation-%08d",
+			request.StartingGeneration,
+		) ||
+		!oidcKeyIDPattern.MatchString(request.StartingOIDCKeyID) {
+		return errors.New("OIDC rotation request has invalid starting trust state")
+	}
+	return nil
 }
 
-// retireExpiredPrivateKeys removes private key files from the retained directory
-// that are no longer needed (their public key was retired from JWKS).
-func retireExpiredPrivateKeys(retainedDir string, activeKids map[string]bool) {
-	entries, err := os.ReadDir(retainedDir)
-	if err != nil {
-		return
+func validateOIDCRequestStartingState(
+	request oidcRotationRequest,
+	generation generationManifest,
+) error {
+	if generation.OIDCPriorGeneration != request.StartingGeneration ||
+		generation.OIDCPriorGenerationID != request.StartingGenerationID ||
+		generation.OIDCPriorKeyID != request.StartingOIDCKeyID ||
+		generation.TrustDomainID != request.TrustDomainID {
+		return errors.New("OIDC rotation generation does not match its request starting state")
 	}
-	for _, entry := range entries {
-		if entry.IsDir() {
+	return nil
+}
+
+func ensureOIDCOperationCandidate(
+	statePath string,
+	operationID string,
+) (*rsa.PrivateKey, error) {
+	operationPath := filepath.Join(statePath, oidcRotationDirectory, operationID)
+	if err := os.MkdirAll(operationPath, 0o700); err != nil {
+		return nil, fmt.Errorf("create OIDC operation state: %w", err)
+	}
+	path := filepath.Join(operationPath, "candidate.key")
+	if data, err := os.ReadFile(path); err == nil {
+		return parseOIDCPrivateKey(data)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read OIDC operation candidate: %w", err)
+	}
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("generate OIDC operation candidate: %w", err)
+	}
+	data := pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: mustMarshalPKCS8(key),
+	})
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("create OIDC operation candidate: %w", err)
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("write OIDC operation candidate: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("fsync OIDC operation candidate: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return nil, fmt.Errorf("close OIDC operation candidate: %w", err)
+	}
+	if err := syncDirectory(operationPath); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func parseOIDCPrivateKey(data []byte) (*rsa.PrivateKey, error) {
+	block, rest := pem.Decode(data)
+	if block == nil ||
+		block.Type != "PRIVATE KEY" ||
+		len(strings.TrimSpace(string(rest))) != 0 {
+		return nil, errors.New("OIDC private key is not one PKCS#8 PEM block")
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	rsaKey, ok := key.(*rsa.PrivateKey)
+	if !ok || rsaKey.N.BitLen() < 2048 {
+		return nil, errors.New("OIDC private key must be RSA with at least 2048 bits")
+	}
+	if err := rsaKey.Validate(); err != nil {
+		return nil, err
+	}
+	return rsaKey, nil
+}
+
+func readOIDCGenerationManifest(
+	statePath string,
+	generationID string,
+) (generationManifest, error) {
+	data, err := os.ReadFile(filepath.Join(
+		statePath,
+		"generations",
+		generationID,
+		"manifest.json",
+	))
+	if err != nil {
+		return generationManifest{}, err
+	}
+	var manifest generationManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return generationManifest{}, err
+	}
+	return manifest, nil
+}
+
+func finalizeOIDCRotationCompletion(
+	statePath string,
+	request oidcRotationRequest,
+	bootstrap bootstrapManifest,
+) error {
+	generation, err := readOIDCGenerationManifest(statePath, bootstrap.GenerationID)
+	if err != nil {
+		return fmt.Errorf("read rotated generation for completion: %w", err)
+	}
+	if generation.OIDCRotationOperationID != request.OperationID {
+		return errors.New("rotated generation operation ID does not match completion request")
+	}
+	generationPath := filepath.Join(statePath, "generations", bootstrap.GenerationID)
+	keyIDs, jwksHash, err := readValidatedOIDCJWKS(generationPath)
+	if err != nil {
+		return err
+	}
+	layout := newTUFLayout(statePath)
+	publication, err := loadPublicationState(layout)
+	if err != nil {
+		return fmt.Errorf("load final OIDC TUF publication: %w", err)
+	}
+	if publication.Status != publicationStatusCommitted || publication.Active == nil {
+		return errors.New("OIDC rotation has no committed active TUF publication")
+	}
+	now := time.Now().UTC()
+	overlapExpires := generation.OIDCOverlapExpiresAtUTC
+	if overlapExpires == nil {
+		return errors.New("rotated generation omits overlap expiry")
+	}
+	completion := oidcRotationCompletion{
+		SchemaVersion:        oidcRotationCompletionSchema,
+		OperationID:          request.OperationID,
+		TrustDomainID:        request.TrustDomainID,
+		CompletedAt:          now,
+		PriorGeneration:      request.StartingGeneration,
+		PriorGenerationID:    request.StartingGenerationID,
+		PriorOidcKeyID:       request.StartingOIDCKeyID,
+		NewGeneration:        bootstrap.Generation,
+		NewGenerationID:      bootstrap.GenerationID,
+		NewOidcKeyID:         bootstrap.OIDCKeyID,
+		ManifestSHA256:       bootstrap.GenerationManifestSHA256,
+		JwksKeyIDs:           keyIDs,
+		JwksSHA256:           jwksHash,
+		RetainedKeyPaths:     generation.OIDCRetainedPrivateKeyPaths,
+		TokenLifetimeSeconds: oidcTokenLifetimeSeconds,
+		OverlapExpiresAt:     *overlapExpires,
+		PublicationID:        publication.Active.ID,
+	}
+	if err := writeOidcRotationCompletion(statePath, completion); err != nil {
+		return err
+	}
+	candidatePath := filepath.Join(
+		statePath,
+		oidcRotationDirectory,
+		request.OperationID,
+		"candidate.key",
+	)
+	if err := os.Remove(candidatePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove completed OIDC operation candidate: %w", err)
+	}
+	return nil
+}
+
+func recoverCommittedOIDCRotation(
+	statePath string,
+	request oidcRotationRequest,
+) error {
+	journalPath := filepath.Join(statePath, "transition", "state.json")
+	journalData, err := os.ReadFile(journalPath)
+	if err != nil {
+		return err
+	}
+	var journal trustTransitionJournal
+	if err := json.Unmarshal(journalData, &journal); err != nil {
+		return err
+	}
+	if journal.Operation != "oidc-rotation" ||
+		journal.TransitionID != request.OperationID ||
+		journal.Status != "staged" {
+		return nil
+	}
+	if journal.Candidate.Generation != request.StartingGeneration+1 ||
+		journal.Candidate.GenerationID != fmt.Sprintf(
+			"generation-%08d",
+			request.StartingGeneration+1,
+		) ||
+		journal.PriorGeneration == nil ||
+		journal.PriorGeneration.Generation != request.StartingGeneration ||
+		journal.PriorGeneration.GenerationID != request.StartingGenerationID ||
+		journal.CandidateManifest.OIDCRotationOperationID != request.OperationID {
+		return errors.New("staged OIDC transition does not match its request")
+	}
+	generationPath := filepath.Join(
+		statePath,
+		"generations",
+		journal.Candidate.GenerationID,
+	)
+	manifestData, err := os.ReadFile(filepath.Join(generationPath, "manifest.json"))
+	if err != nil {
+		return err
+	}
+	if hashBytes(manifestData) != journal.Candidate.ManifestSHA256 {
+		return errors.New("staged OIDC transition manifest hash does not match")
+	}
+	if err := validateOIDCGenerationMaterial(
+		generationPath,
+		journal.CandidateManifest,
+	); err != nil {
+		return err
+	}
+	nextBootstrap := bootstrapManifest{
+		SchemaVersion:            4,
+		CreatedAtUTC:             journal.CandidateManifest.CreatedAtUTC,
+		FulcioRootSHA256:         journal.CandidateManifest.FulcioRootSHA256,
+		CtLogPublicKeySHA256:     journal.CandidateManifest.CtLogPublicKeySHA256,
+		RekorPublicKeySHA256:     journal.CandidateManifest.RekorPublicKeySHA256,
+		TsaRootSHA256:            journal.CandidateManifest.TsaRootSHA256,
+		TsaLeafSHA256:            journal.CandidateManifest.TsaLeafSHA256,
+		OIDCKeyID:                journal.CandidateManifest.OIDCKeyID,
+		TrustDomainID:            journal.CandidateManifest.TrustDomainID,
+		Generation:               journal.Candidate.Generation,
+		GenerationID:             journal.Candidate.GenerationID,
+		GenerationManifestSHA256: journal.Candidate.ManifestSHA256,
+	}
+	fingerprint, err := fingerprintSource(nextBootstrap)
+	if err != nil {
+		return err
+	}
+	layout := newTUFLayout(statePath)
+	publication, err := loadPublicationState(layout)
+	if err != nil {
+		return err
+	}
+	if publication.Status != publicationStatusCommitted ||
+		publication.Active == nil {
+		return errors.New("staged OIDC transition lacks a committed TUF publication")
+	}
+	if err := validateReference(
+		committedPath(layout, publication.Active.ID),
+		*publication.Active,
+		fingerprint,
+	); err != nil {
+		return fmt.Errorf("validate staged OIDC TUF publication: %w", err)
+	}
+	activeID, err := readActiveGeneration(filepath.Join(statePath, "active-generation"))
+	if err != nil {
+		return err
+	}
+	switch activeID {
+	case request.StartingGenerationID:
+		activeLink := filepath.Join(statePath, "active-generation")
+		nextLink := filepath.Join(statePath, "active-generation.next")
+		if pathExists(nextLink) {
+			if err := os.Remove(nextLink); err != nil {
+				return err
+			}
+		}
+		target := filepath.Join("generations", journal.Candidate.GenerationID)
+		if err := os.Symlink(target, nextLink); err != nil {
+			return err
+		}
+		if err := os.Rename(nextLink, activeLink); err != nil {
+			return err
+		}
+	case journal.Candidate.GenerationID:
+	default:
+		return fmt.Errorf("staged OIDC transition has unexpected active generation %q", activeID)
+	}
+	journal.Status = "recovered"
+	journal.LastCheckpoint = "transition-finalized"
+	journal.UpdatedAtUTC = time.Now().UTC()
+	data, err := json.MarshalIndent(journal, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeAtomicJSON(journalPath, append(data, '\n'))
+}
+
+func readValidatedOIDCJWKS(
+	generationPath string,
+) ([]string, string, error) {
+	data, err := os.ReadFile(filepath.Join(
+		generationPath,
+		"public",
+		"oidc",
+		"jwks.json",
+	))
+	if err != nil {
+		return nil, "", err
+	}
+	var set jwks
+	if err := json.Unmarshal(data, &set); err != nil {
+		return nil, "", err
+	}
+	if len(set.Keys) == 0 {
+		return nil, "", errors.New("OIDC JWKS is empty")
+	}
+	ids := make([]string, 0, len(set.Keys))
+	seen := map[string]bool{}
+	for _, key := range set.Keys {
+		if !oidcKeyIDPattern.MatchString(key.Kid) ||
+			key.Kty != "RSA" ||
+			key.Use != "sig" ||
+			key.Alg != "RS256" {
+			return nil, "", fmt.Errorf("OIDC JWK %q has invalid metadata", key.Kid)
+		}
+		if seen[key.Kid] {
+			return nil, "", fmt.Errorf("OIDC JWKS contains duplicate kid %q", key.Kid)
+		}
+		seen[key.Kid] = true
+		publicKey, err := oidcJWKPublicKey(key)
+		if err != nil {
+			return nil, "", err
+		}
+		spki, err := x509.MarshalPKIXPublicKey(publicKey)
+		if err != nil {
+			return nil, "", err
+		}
+		if oidcKeyID(spki) != key.Kid {
+			return nil, "", fmt.Errorf("OIDC JWK %q kid does not match its key", key.Kid)
+		}
+		ids = append(ids, key.Kid)
+	}
+	return ids, hashBytes(data), nil
+}
+
+func oidcJWKPublicKey(key jwk) (*rsa.PublicKey, error) {
+	modulus, err := base64.RawURLEncoding.DecodeString(key.N)
+	if err != nil || len(modulus) < 256 {
+		return nil, fmt.Errorf("OIDC JWK %q has invalid RSA modulus", key.Kid)
+	}
+	exponentBytes, err := base64.RawURLEncoding.DecodeString(key.E)
+	if err != nil || len(exponentBytes) == 0 || len(exponentBytes) > 4 {
+		return nil, fmt.Errorf("OIDC JWK %q has invalid RSA exponent", key.Kid)
+	}
+	exponent := 0
+	for _, value := range exponentBytes {
+		exponent = exponent<<8 | int(value)
+	}
+	if exponent < 3 || exponent%2 == 0 {
+		return nil, fmt.Errorf("OIDC JWK %q has invalid RSA exponent", key.Kid)
+	}
+	return &rsa.PublicKey{N: new(big.Int).SetBytes(modulus), E: exponent}, nil
+}
+
+func validateOIDCGenerationMaterial(
+	generationPath string,
+	manifest generationManifest,
+) error {
+	actual, err := collectGenerationFileHashes(generationPath)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(actual, manifest.Files) {
+		return errors.New("OIDC generation files do not exactly match the manifest")
+	}
+	keyIDs, _, err := readValidatedOIDCJWKS(generationPath)
+	if err != nil {
+		return err
+	}
+	jwksData, err := os.ReadFile(filepath.Join(
+		generationPath,
+		"public",
+		"oidc",
+		"jwks.json",
+	))
+	if err != nil {
+		return err
+	}
+	var set jwks
+	if err := json.Unmarshal(jwksData, &set); err != nil {
+		return err
+	}
+	jwkByID := make(map[string]jwk, len(set.Keys))
+	for _, key := range set.Keys {
+		jwkByID[key.Kid] = key
+	}
+	signerData, err := os.ReadFile(filepath.Join(
+		generationPath,
+		"private",
+		"oidc",
+		"signer.key",
+	))
+	if err != nil {
+		return err
+	}
+	signer, err := parseOIDCPrivateKey(signerData)
+	if err != nil {
+		return err
+	}
+	if err := validateOIDCKeyMatchesJWK(signer, manifest.OIDCKeyID, jwkByID); err != nil {
+		return fmt.Errorf("active OIDC signer: %w", err)
+	}
+	signerSPKI, err := x509.MarshalPKIXPublicKey(&signer.PublicKey)
+	if err != nil {
+		return err
+	}
+	publicData, err := os.ReadFile(filepath.Join(
+		generationPath,
+		"public",
+		"oidc",
+		"signer.pub",
+	))
+	if err != nil {
+		return err
+	}
+	publicBlock, rest := pem.Decode(publicData)
+	if publicBlock == nil ||
+		publicBlock.Type != "PUBLIC KEY" ||
+		len(strings.TrimSpace(string(rest))) != 0 ||
+		!reflect.DeepEqual(publicBlock.Bytes, signerSPKI) {
+		return errors.New("active OIDC public key does not match signer")
+	}
+	expectedPaths := make([]string, 0, len(keyIDs)-1)
+	for _, kid := range keyIDs {
+		if kid == manifest.OIDCKeyID {
 			continue
 		}
-		// Extract kid from filename: signer-<kid>.key
-		name := entry.Name()
-		if len(name) > 11 && name[:7] == "signer-" && name[len(name)-4:] == ".key" {
-			kid := name[7 : len(name)-4]
-			if !activeKids[kid] {
-				_ = os.Remove(filepath.Join(retainedDir, name))
+		path := filepath.ToSlash(filepath.Join(
+			"private",
+			"oidc",
+			"retained",
+			fmt.Sprintf("signer-%s.key", kid),
+		))
+		expectedPaths = append(expectedPaths, path)
+		data, err := os.ReadFile(filepath.Join(
+			generationPath,
+			filepath.FromSlash(path),
+		))
+		if err != nil {
+			return fmt.Errorf("read retained OIDC key %q: %w", kid, err)
+		}
+		key, err := parseOIDCPrivateKey(data)
+		if err != nil {
+			return fmt.Errorf("parse retained OIDC key %q: %w", kid, err)
+		}
+		if err := validateOIDCKeyMatchesJWK(key, kid, jwkByID); err != nil {
+			return fmt.Errorf("retained OIDC key %q: %w", kid, err)
+		}
+	}
+	sort.Strings(expectedPaths)
+	actualPaths := append([]string(nil), manifest.OIDCRetainedPrivateKeyPaths...)
+	sort.Strings(actualPaths)
+	if len(actualPaths) != len(expectedPaths) {
+		return errors.New("OIDC retained private-key paths do not match historical JWKS keys")
+	}
+	for index := range expectedPaths {
+		if actualPaths[index] != expectedPaths[index] {
+			return errors.New("OIDC retained private-key paths do not match historical JWKS keys")
+		}
+	}
+	for path := range manifest.Files {
+		if strings.HasPrefix(path, "private/oidc/retained/") {
+			found := false
+			for _, expected := range expectedPaths {
+				if path == expected {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("unexpected retained OIDC private key %q", path)
 			}
 		}
 	}
+	if manifest.OIDCRotationOperationID == "" {
+		if manifest.OIDCRotationOperationID != "" ||
+			manifest.OIDCPriorGeneration != 0 ||
+			manifest.OIDCPriorGenerationID != "" ||
+			manifest.OIDCPriorKeyID != "" ||
+			manifest.OIDCOverlapExpiresAtUTC != nil {
+			return errors.New("generation contains partial OIDC rotation metadata")
+		}
+	} else {
+		if !oidcOperationIDPattern.MatchString(manifest.OIDCRotationOperationID) ||
+			manifest.OIDCPriorGeneration != manifest.Generation-1 ||
+			manifest.OIDCPriorGenerationID != fmt.Sprintf(
+				"generation-%08d",
+				manifest.Generation-1,
+			) ||
+			!oidcKeyIDPattern.MatchString(manifest.OIDCPriorKeyID) ||
+			manifest.OIDCOverlapExpiresAtUTC == nil {
+			return errors.New("rotated generation has invalid OIDC operation metadata")
+		}
+	}
+	return nil
+}
+
+func validateOIDCKeyMatchesJWK(
+	privateKey *rsa.PrivateKey,
+	kid string,
+	keys map[string]jwk,
+) error {
+	spki, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return err
+	}
+	if oidcKeyID(spki) != kid {
+		return errors.New("kid does not match private key")
+	}
+	key, ok := keys[kid]
+	if !ok {
+		return errors.New("matching JWK is missing")
+	}
+	publicKey, err := oidcJWKPublicKey(key)
+	if err != nil {
+		return err
+	}
+	if privateKey.PublicKey.E != publicKey.E ||
+		privateKey.PublicKey.N.Cmp(publicKey.N) != 0 {
+		return errors.New("JWK does not match private key")
+	}
+	return nil
+}
+
+func validateUnchangedNonOIDCMaterial(currentPath, nextPath string) error {
+	current, err := collectGenerationFileHashes(currentPath)
+	if err != nil {
+		return err
+	}
+	next, err := collectGenerationFileHashes(nextPath)
+	if err != nil {
+		return err
+	}
+	for path, hash := range current {
+		if strings.HasPrefix(path, "private/oidc/") ||
+			strings.HasPrefix(path, "public/oidc/") {
+			continue
+		}
+		if next[path] != hash {
+			return fmt.Errorf("non-OIDC generation material %q changed", path)
+		}
+	}
+	for path := range next {
+		if strings.HasPrefix(path, "private/oidc/") ||
+			strings.HasPrefix(path, "public/oidc/") {
+			continue
+		}
+		if _, ok := current[path]; !ok {
+			return fmt.Errorf("unexpected non-OIDC generation material %q", path)
+		}
+	}
+	return nil
+}
+
+func oidcKeyID(spki []byte) string {
+	sum := sha256.Sum256(spki)
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
