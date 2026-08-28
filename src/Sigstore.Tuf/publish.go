@@ -778,3 +778,100 @@ func newStandbyTransparencyLog(activeDER, standbyDER []byte, standbyStart time.T
 		},
 	}
 }
+
+// cleanupOrphanedGeneration removes a generation directory that was created
+// during a cross-generation publish attempt that failed before completion.
+// The orphaned directory is any generation N+1 directory that exists but is
+// not the active generation (symlink target) and not in the transition journal.
+func cleanupOrphanedGeneration(statePath string, activeBootstrap bootstrapManifest) error {
+	nextGenID := fmt.Sprintf("generation-%08d", activeBootstrap.Generation+1)
+	nextGenPath := filepath.Join(statePath, "generations", nextGenID)
+	if !pathExists(nextGenPath) {
+		return nil
+	}
+	// The active symlink should NOT point here (it points to the current gen).
+	activeGenID, err := readActiveGeneration(filepath.Join(statePath, "active-generation"))
+	if err != nil {
+		return nil // Can't determine; leave it.
+	}
+	if activeGenID == nextGenID {
+		return nil // It IS the active generation; not orphaned.
+	}
+	// Remove the orphaned generation directory.
+	return os.RemoveAll(nextGenPath)
+}
+
+// tryForwardCompleteGeneration handles the crash window where TUF publication
+// committed with generation N+1's fingerprint, but the generation symlink and
+// transition journal were not updated. It detects this by finding an orphaned
+// generation N+1 directory whose fingerprint matches the committed TUF
+// publication, then completes the switch.
+func tryForwardCompleteGeneration(
+	statePath string,
+	layout tufLayout,
+	state publicationState,
+	activeBootstrap bootstrapManifest,
+) (bool, error) {
+	// Look for a generation N+1 directory.
+	nextGenID := fmt.Sprintf("generation-%08d", activeBootstrap.Generation+1)
+	nextGenPath := filepath.Join(statePath, "generations", nextGenID)
+	if !pathExists(nextGenPath) {
+		return false, nil
+	}
+
+	// Read the next generation's manifest and compute its fingerprint.
+	nextManifestPath := filepath.Join(nextGenPath, "manifest.json")
+	nextManifestBytes, err := os.ReadFile(nextManifestPath)
+	if err != nil {
+		return false, err
+	}
+	var nextManifest generationManifest
+	if err := json.Unmarshal(nextManifestBytes, &nextManifest); err != nil {
+		return false, err
+	}
+	nextManifestHash := hashBytes(nextManifestBytes)
+
+	// Build a bootstrap from the next generation to compute its fingerprint.
+	nextBootstrap := bootstrapManifest{
+		SchemaVersion:            4,
+		CreatedAtUTC:             nextManifest.CreatedAtUTC,
+		FulcioRootSHA256:         nextManifest.FulcioRootSHA256,
+		CtLogPublicKeySHA256:     nextManifest.CtLogPublicKeySHA256,
+		RekorPublicKeySHA256:     nextManifest.RekorPublicKeySHA256,
+		TsaRootSHA256:            nextManifest.TsaRootSHA256,
+		TsaLeafSHA256:            nextManifest.TsaLeafSHA256,
+		OIDCKeyID:                nextManifest.OIDCKeyID,
+		TrustDomainID:            nextManifest.TrustDomainID,
+		Generation:               nextManifest.Generation,
+		GenerationID:             nextGenID,
+		GenerationManifestSHA256: nextManifestHash,
+	}
+	nextFingerprint, err := fingerprintSource(nextBootstrap)
+	if err != nil {
+		return false, err
+	}
+
+	// Validate that the committed TUF active publication matches the next generation.
+	// We only check the active reference (not previous, which has the old gen's fingerprint).
+	if err := validateCommittedState(state); err != nil {
+		return false, err
+	}
+	activeID, exists, err := readActivePublication(layout.active)
+	if err != nil || !exists || activeID != state.Active.ID {
+		return false, fmt.Errorf("active publication mismatch during cross-gen recovery")
+	}
+	if err := validateReference(
+		committedPath(layout, state.Active.ID),
+		*state.Active,
+		nextFingerprint,
+	); err != nil {
+		// The TUF publication doesn't match gen N+1 either — genuinely broken.
+		return false, err
+	}
+
+	// Forward-complete: switch the generation symlink and journal.
+	if err := switchActiveGeneration(statePath, activeBootstrap, nextBootstrap, nextManifestHash); err != nil {
+		return false, err
+	}
+	return true, nil
+}

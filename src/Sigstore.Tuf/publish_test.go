@@ -197,9 +197,9 @@ func TestPublishTrustedRootRecoversPreviousStateOnWorkerFailure(t *testing.T) {
 		t.Fatalf("active TUF publication is invalid after failed publish: %v", err)
 	}
 
-	// 3. TUF state is "preparing" (failure is detectable, not silent).
-	if state.Status != publicationStatusPreparing {
-		t.Fatalf("status = %q, want %q (failure is recorded)", state.Status, publicationStatusPreparing)
+	// 3. TUF state is "committed" (rollback successfully restored prior state).
+	if state.Status != publicationStatusCommitted {
+		t.Fatalf("status = %q, want %q (rollback restored committed)", state.Status, publicationStatusCommitted)
 	}
 
 	// 4. The gen 2 directory was created on disk (advance happened before publish)
@@ -317,7 +317,7 @@ func (e *testError) Error() string {
 
 func TestDebugFingerprint(t *testing.T) {
 	statePath := newTestState(t)
-	
+
 	// Load before ensureTUFRepository
 	bootstrap1, err := loadActiveTrustGeneration(statePath)
 	if err != nil {
@@ -325,12 +325,12 @@ func TestDebugFingerprint(t *testing.T) {
 	}
 	fp1, _ := fingerprintSource(bootstrap1)
 	t.Logf("fingerprint before TUF: %s", fp1)
-	
+
 	_, err = ensureTUFRepository(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Load after ensureTUFRepository
 	bootstrap2, err := loadActiveTrustGeneration(statePath)
 	if err != nil {
@@ -338,7 +338,7 @@ func TestDebugFingerprint(t *testing.T) {
 	}
 	fp2, _ := fingerprintSource(bootstrap2)
 	t.Logf("fingerprint after TUF: %s", fp2)
-	
+
 	if fp1 != fp2 {
 		t.Fatalf("fingerprints differ!\nbefore: %+v\nafter: %+v", bootstrap1, bootstrap2)
 	}
@@ -350,7 +350,7 @@ func TestDebugPublish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	
+
 	// Now check the stored fingerprint in manifest
 	layout := newTUFLayout(statePath)
 	state := readTestPublicationState(t, layout)
@@ -360,7 +360,7 @@ func TestDebugPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("stored manifest: %s", string(manifestBytes))
-	
+
 	// Now call publish
 	bootstrap, err := loadActiveTrustGeneration(statePath)
 	if err != nil {
@@ -368,4 +368,177 @@ func TestDebugPublish(t *testing.T) {
 	}
 	fp, _ := fingerprintSource(bootstrap)
 	t.Logf("current fingerprint: %s", fp)
+}
+
+// TestCrossGenRecoverForwardCompleteAfterTUFCommit simulates the crash window
+// where TUF publication committed with gen 2's fingerprint but the generation
+// symlink was not yet switched. On next ensureTUFRepository, recovery must
+// forward-complete (switch symlink to gen 2) without error.
+func TestCrossGenRecoverForwardCompleteAfterTUFCommit(t *testing.T) {
+	statePath := newTestState(t)
+
+	// Create initial TUF repo.
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate cross-gen publish that crashes after TUF commit but before
+	// generation switch: advance generation and publish targets, but skip
+	// switchActiveGeneration.
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBootstrap, newGenPath, err := advanceTrustGeneration(statePath, bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Compute fingerprints.
+	sourceFingerprint, _ := fingerprintSource(bootstrap)
+	newSourceFingerprint, _ := fingerprintSource(newBootstrap)
+
+	// Run publishNewTargets (this commits TUF with gen 2's fingerprint).
+	layout := newTUFLayout(statePath)
+	state := readTestPublicationState(t, layout)
+	err = publishNewTargets(layout, state, newGenPath, newBootstrap, sourceFingerprint, newSourceFingerprint, publicationHooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// At this point: TUF committed with gen 2's fingerprint, symlink still gen 1.
+	// Verify symlink still points to gen 1.
+	activeGenID, _ := readActiveGeneration(filepath.Join(statePath, "active-generation"))
+	if activeGenID != "generation-00000001" {
+		t.Fatalf("expected symlink at gen 1, got %s", activeGenID)
+	}
+
+	// Now run recovery (next startup).
+	action, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if action != repositoryActionRecovered {
+		t.Fatalf("expected recovered action, got %q", action)
+	}
+
+	// Verify symlink was forward-completed to gen 2.
+	activeGenID, _ = readActiveGeneration(filepath.Join(statePath, "active-generation"))
+	if activeGenID != "generation-00000002" {
+		t.Fatalf("expected symlink at gen 2 after recovery, got %s", activeGenID)
+	}
+}
+
+// TestCrossGenRecoverRollbackWhenTUFStillOld simulates a crash after generation
+// directory was created but before TUF publication started (or before TUF active
+// switch). Recovery should rollback: TUF stays at gen 1, orphaned gen 2 dir is
+// cleaned up, and the system is coherent.
+func TestCrossGenRecoverRollbackWhenTUFStillOld(t *testing.T) {
+	statePath := newTestState(t)
+
+	// Create initial TUF repo.
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a crash after advanceTrustGeneration but before publishNewTargets:
+	// just create gen 2 directory.
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = advanceTrustGeneration(statePath, bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify gen 2 dir exists.
+	gen2Path := filepath.Join(statePath, "generations", "generation-00000002")
+	if _, err := os.Stat(gen2Path); err != nil {
+		t.Fatalf("gen 2 dir not created: %v", err)
+	}
+
+	// Recovery: ensureTUFRepository should succeed (TUF validates with gen 1)
+	// and clean up orphaned gen 2.
+	action, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	// TUF state is still committed with gen 1 — validates fine, just refreshes.
+	t.Logf("action after recovery = %q", action)
+
+	// Verify gen stays at 1.
+	activeGenID, _ := readActiveGeneration(filepath.Join(statePath, "active-generation"))
+	if activeGenID != "generation-00000001" {
+		t.Fatalf("expected symlink at gen 1, got %s", activeGenID)
+	}
+
+	// Verify orphaned gen 2 dir was cleaned up.
+	if _, err := os.Stat(gen2Path); !os.IsNotExist(err) {
+		t.Fatal("orphaned gen 2 directory was not cleaned up")
+	}
+}
+
+// TestCrossGenRecoverPreparingActiveSwitched simulates a crash during TUF
+// publication where the active link was switched to candidate (gen 2) but
+// the state was not finalized and gen symlink was not switched. Recovery
+// should forward-complete both TUF finalization and generation switch.
+func TestCrossGenRecoverPreparingActiveSwitched(t *testing.T) {
+	statePath := newTestState(t)
+
+	// Create initial TUF repo.
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance generation.
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBootstrap, newGenPath, err := advanceTrustGeneration(statePath, bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sourceFingerprint, _ := fingerprintSource(bootstrap)
+	newSourceFingerprint, _ := fingerprintSource(newBootstrap)
+
+	// Publish but crash after TUF active link switches (before finalization).
+	// Use hooks to interrupt at the right moment.
+	layout := newTUFLayout(statePath)
+	state := readTestPublicationState(t, layout)
+
+	crashErr := &testError{msg: "simulated crash after active switch"}
+	hooks := publicationHooks{
+		checkpoint: func(name publicationCheckpoint) error {
+			if name == checkpointActiveSwitched {
+				return crashErr
+			}
+			return nil
+		},
+	}
+	err = publishNewTargets(layout, state, newGenPath, newBootstrap, sourceFingerprint, newSourceFingerprint, hooks)
+	if err == nil {
+		t.Fatal("expected error from crash hook")
+	}
+
+	// State: TUF "preparing", active link → candidate (gen 2), gen symlink → gen 1.
+	// Recovery should forward-complete.
+	action, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if action != repositoryActionRecovered {
+		t.Fatalf("expected recovered action, got %q", action)
+	}
+
+	// Verify gen symlink was forward-completed to gen 2.
+	activeGenID, _ := readActiveGeneration(filepath.Join(statePath, "active-generation"))
+	if activeGenID != "generation-00000002" {
+		t.Fatalf("expected symlink at gen 2 after recovery, got %s", activeGenID)
+	}
 }

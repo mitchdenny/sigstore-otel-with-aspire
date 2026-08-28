@@ -402,3 +402,26 @@ aspire stop
 
 If startup fails, first confirm Docker is running, then use `aspire doctor` to
 check the local Aspire environment.
+
+## Additive Trusted-Root Rollout (Step 8)
+
+The `publish-trusted-root` command advances the trust generation with additive
+standby verification material and publishes through TUF transactionally:
+
+```bash
+aspire resource sigstore publish-trusted-root
+```
+
+The command:
+1. Creates generation N+1 with a standby Rekor verification key (inactive/future-dated)
+2. Publishes updated TrustedRoot/SigningConfig/ClientTrustConfig through TUF
+3. Restarts all six language clients for uptake
+4. Waits until every client reports the new generation and fingerprint
+
+SigningConfig routing is unchanged — the standby key is verification-only and
+does not affect live signing. All historical verification material is preserved.
+
+Cross-generation recovery is automatic: a crash at any point between generation
+advance and completion is detected on next startup and either rolled back (if
+TUF still serves the prior generation) or forward-completed (if TUF already
+committed the new generation's publication).

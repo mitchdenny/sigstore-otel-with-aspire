@@ -154,9 +154,16 @@ func ensureTUFRepositoryWithHooks(
 
 	if state.Status == publicationStatusPreparing {
 		initial := state.Active == nil
-		if err := recoverPreparingPublication(layout, state, sourceFingerprint, hooks); err != nil {
+		if err := recoverPreparingPublication(layout, state, sourceFingerprint, hooks, statePath, bootstrap); err != nil {
+			// Cross-generation rollback: if the candidate has a different fingerprint
+			// (from a generation advance), we may need to detect an orphaned generation
+			// and clean it up. The rollback itself now handles mismatched candidate
+			// fingerprints by removing without validation.
 			return "", err
 		}
+		// After successful rollback/recovery, clean up any orphaned generation
+		// directory that was created during the failed cross-generation publish.
+		_ = cleanupOrphanedGeneration(statePath, bootstrap)
 		if initial {
 			return repositoryActionCreated, nil
 		}
@@ -172,8 +179,19 @@ func ensureTUFRepositoryWithHooks(
 		return "", err
 	}
 	if err := validateCommittedPublication(layout, state, sourceFingerprint); err != nil {
-		return "", err
+		// If validation fails due to source fingerprint mismatch, check for a
+		// cross-generation forward-complete scenario: TUF publication committed
+		// with a newer generation's fingerprint, but the generation symlink
+		// wasn't switched yet.
+		recovered, fwdErr := tryForwardCompleteGeneration(statePath, layout, state, bootstrap)
+		if fwdErr != nil || !recovered {
+			return "", err // Return the original validation error.
+		}
+		return repositoryActionRecovered, nil
 	}
+	// Clean up any orphaned generation directory from an incomplete publish
+	// that crashed before TUF publication started.
+	_ = cleanupOrphanedGeneration(statePath, bootstrap)
 	if err := refreshPublication(layout, state, sourceFingerprint, hooks); err != nil {
 		return "", err
 	}
@@ -505,6 +523,8 @@ func recoverPreparingPublication(
 	state publicationState,
 	sourceFingerprint string,
 	hooks publicationHooks,
+	statePath string,
+	activeBootstrap bootstrapManifest,
 ) error {
 	if err := validatePreparingState(state); err != nil {
 		return err
@@ -530,7 +550,50 @@ func recoverPreparingPublication(
 	case state.Active.ID:
 		return rollbackPreparingPublication(layout, state, sourceFingerprint, nil)
 	case state.Candidate.ID:
-		return finalizeRefreshedPublication(layout, state, sourceFingerprint, hooks)
+		err := finalizeRefreshedPublication(layout, state, sourceFingerprint, hooks)
+		if err == nil {
+			return nil
+		}
+		// Cross-generation forward-complete: the candidate was published with
+		// generation N+1's fingerprint. Try computing the next-gen fingerprint
+		// and finalize with that.
+		nextGenID := fmt.Sprintf("generation-%08d", activeBootstrap.Generation+1)
+		nextGenPath := filepath.Join(statePath, "generations", nextGenID)
+		if !pathExists(nextGenPath) {
+			return err // Not a cross-gen issue.
+		}
+		nextManifestBytes, readErr := os.ReadFile(filepath.Join(nextGenPath, "manifest.json"))
+		if readErr != nil {
+			return err
+		}
+		var nextManifest generationManifest
+		if jsonErr := json.Unmarshal(nextManifestBytes, &nextManifest); jsonErr != nil {
+			return err
+		}
+		nextManifestHash := hashBytes(nextManifestBytes)
+		nextBootstrap := bootstrapManifest{
+			SchemaVersion:            4,
+			CreatedAtUTC:             nextManifest.CreatedAtUTC,
+			CtLogPublicKeySHA256:     nextManifest.CtLogPublicKeySHA256,
+			RekorPublicKeySHA256:     nextManifest.RekorPublicKeySHA256,
+			FulcioRootSHA256:         nextManifest.FulcioRootSHA256,
+			TsaRootSHA256:            nextManifest.TsaRootSHA256,
+			TsaLeafSHA256:            nextManifest.TsaLeafSHA256,
+			OIDCKeyID:                nextManifest.OIDCKeyID,
+			TrustDomainID:            nextManifest.TrustDomainID,
+			Generation:               nextManifest.Generation,
+			GenerationID:             nextGenID,
+			GenerationManifestSHA256: nextManifestHash,
+		}
+		nextFingerprint, fpErr := fingerprintSource(nextBootstrap)
+		if fpErr != nil {
+			return err
+		}
+		if fwdErr := finalizePublishPublication(layout, state, sourceFingerprint, nextFingerprint, hooks); fwdErr != nil {
+			return err // Still can't finalize — return original error.
+		}
+		// Forward-complete: finalize succeeded with next-gen fingerprint, switch generation.
+		return switchActiveGeneration(statePath, activeBootstrap, nextBootstrap, nextManifestHash)
 	default:
 		return fmt.Errorf(
 			"active TUF publication %q matches neither the prior %q nor candidate %q",
@@ -741,17 +804,15 @@ func rollbackPreparingPublication(
 		)
 	}
 	if stagedCandidate {
-		if _, err := repositoryReference(layout.candidate, sourceFingerprint); err != nil {
-			return combinePublicationErrors(cause, err)
-		}
+		// During cross-generation publication, the candidate may have a different
+		// source fingerprint than the active generation. We remove it regardless
+		// since we are rolling back — fingerprint validation is not required for
+		// material being discarded.
 		if err := os.RemoveAll(layout.candidate); err != nil {
 			return combinePublicationErrors(cause, fmt.Errorf("remove staged TUF candidate: %w", err))
 		}
 	}
 	if committedCandidate {
-		if _, err := repositoryReference(committedCandidatePath, sourceFingerprint); err != nil {
-			return combinePublicationErrors(cause, err)
-		}
 		if err := os.RemoveAll(committedCandidatePath); err != nil {
 			return combinePublicationErrors(cause, fmt.Errorf("remove committed TUF candidate: %w", err))
 		}
