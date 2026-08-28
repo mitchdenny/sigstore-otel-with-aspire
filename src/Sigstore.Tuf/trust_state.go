@@ -108,9 +108,11 @@ func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
 			journal.LastCheckpoint,
 		)
 	}
-	if journal.PriorGeneration != nil {
-		return bootstrapManifest{}, errors.New(
-			"Step 4 does not support a prior trust generation or live rotation",
+	if journal.PriorGeneration != nil && journal.Candidate.Generation <= journal.PriorGeneration.Generation {
+		return bootstrapManifest{}, fmt.Errorf(
+			"candidate generation %d must be greater than prior generation %d",
+			journal.Candidate.Generation,
+			journal.PriorGeneration.Generation,
 		)
 	}
 	if journal.TrustDomainManifestSHA256 != hashBytes(domainBytes) {
@@ -195,16 +197,17 @@ func validateGenerationState(
 			trustStateSchemaVersion,
 		)
 	}
-	if generation.Generation != initialGeneration ||
-		generation.GenerationID != initialGenerationID {
-		return errors.New(
-			"Step 4 supports only generation 1; rotation is not implemented",
+	if generation.Generation < initialGeneration {
+		return fmt.Errorf(
+			"generation %d is invalid; must be >= %d",
+			generation.Generation,
+			initialGeneration,
 		)
 	}
 	if generation.TrustDomainID != domain.TrustDomainID {
 		return errors.New("generation trust-domain identity does not match")
 	}
-	if !generation.CreatedAtUTC.Equal(domain.CreatedAtUTC) {
+	if generation.Generation == initialGeneration && !generation.CreatedAtUTC.Equal(domain.CreatedAtUTC) {
 		return errors.New("initial generation creation time does not match trust-domain identity")
 	}
 	if generation.SourceSchemaVersion != 4 &&
@@ -294,9 +297,11 @@ func readActiveGeneration(path string) (string, error) {
 		return "", fmt.Errorf("active generation link has unsafe target %q", target)
 	}
 	directory, generationID := filepath.Split(target)
-	if strings.TrimSuffix(filepath.Clean(directory), string(filepath.Separator)) != "generations" ||
-		generationID != initialGenerationID {
+	if strings.TrimSuffix(filepath.Clean(directory), string(filepath.Separator)) != "generations" {
 		return "", fmt.Errorf("active generation link has unsafe target %q", target)
+	}
+	if !strings.HasPrefix(generationID, "generation-") {
+		return "", fmt.Errorf("active generation link has unexpected ID format %q", generationID)
 	}
 	return generationID, nil
 }

@@ -29,6 +29,7 @@ const (
 	repositoryActionRecovered repositoryAction = "Recovered"
 	repositoryActionRefreshed repositoryAction = "Refreshed"
 	repositoryActionRotated   repositoryAction = "Rotated"
+	repositoryActionPublished repositoryAction = "Published"
 )
 
 type publicationReference struct {

@@ -31,7 +31,8 @@ public sealed class SigstoreOperationTests
                 "status",
                 SigstoreOperationCommand.RefreshTufCommand,
                 SigstoreOperationCommand.RotateTufRootCommand,
-                SigstoreOperationCommand.RestartClientsCommand
+                SigstoreOperationCommand.RestartClientsCommand,
+                SigstoreOperationCommand.PublishTrustedRootCommand
             ],
             annotations.Keys);
 
@@ -39,7 +40,8 @@ public sealed class SigstoreOperationTests
         {
             SigstoreOperationCommand.RefreshTufCommand,
             SigstoreOperationCommand.RotateTufRootCommand,
-            SigstoreOperationCommand.RestartClientsCommand
+            SigstoreOperationCommand.RestartClientsCommand,
+            SigstoreOperationCommand.PublishTrustedRootCommand
         })
         {
             var annotation = annotations[name];
