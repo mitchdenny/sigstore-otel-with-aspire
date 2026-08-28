@@ -197,19 +197,46 @@ internal sealed class OidcTokenIssuer : IDisposable
             .EnumerateArray()
             .ToArray();
 
-        if (keys.Length != 1)
+        if (keys.Length < 1)
         {
             throw new InvalidDataException(
-                "The OIDC JWKS must contain exactly one key.");
+                "The OIDC JWKS must contain at least one key.");
         }
 
-        var key = keys[0];
+        var parameters = signingKey.ExportParameters(
+            includePrivateParameters: false);
+        var expectedKeyId = Base64UrlEncode(
+            SHA256.HashData(
+                signingKey.ExportSubjectPublicKeyInfo()));
+
+        // Find the key in JWKS that matches the loaded private key.
+        JsonElement? matchedKey = null;
+        foreach (var candidate in keys)
+        {
+            if (!string.Equals(
+                    candidate.GetProperty("kid").GetString(),
+                    expectedKeyId,
+                    StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            matchedKey = candidate;
+            break;
+        }
+
+        if (matchedKey is null)
+        {
+            throw new InvalidDataException(
+                "The OIDC JWKS does not contain a key matching " +
+                "the private key.");
+        }
+
+        var key = matchedKey.Value;
         EnsureEqual("key type", "RSA", key.GetProperty("kty").GetString());
         EnsureEqual("key use", "sig", key.GetProperty("use").GetString());
         EnsureEqual("algorithm", "RS256", key.GetProperty("alg").GetString());
 
-        var parameters = signingKey.ExportParameters(
-            includePrivateParameters: false);
         EnsureKeyBytesEqual(
             "modulus",
             parameters.Modulus!,
@@ -219,13 +246,38 @@ internal sealed class OidcTokenIssuer : IDisposable
             parameters.Exponent!,
             Base64UrlDecode(key.GetProperty("e").GetString()));
 
-        var expectedKeyId = Base64UrlEncode(
-            SHA256.HashData(
-                signingKey.ExportSubjectPublicKeyInfo()));
-        EnsureEqual(
-            "key ID",
-            expectedKeyId,
-            key.GetProperty("kid").GetString());
+        // Validate all other keys have required fields and unique kids.
+        var seenKids = new HashSet<string>(StringComparer.Ordinal)
+        {
+            expectedKeyId
+        };
+        foreach (var otherKey in keys)
+        {
+            var otherKid = otherKey.GetProperty("kid").GetString();
+            if (string.Equals(otherKid, expectedKeyId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (!seenKids.Add(otherKid!))
+            {
+                throw new InvalidDataException(
+                    "The OIDC JWKS contains duplicate key IDs.");
+            }
+
+            EnsureEqual(
+                "retained key type",
+                "RSA",
+                otherKey.GetProperty("kty").GetString());
+            EnsureEqual(
+                "retained key use",
+                "sig",
+                otherKey.GetProperty("use").GetString());
+            EnsureEqual(
+                "retained key algorithm",
+                "RS256",
+                otherKey.GetProperty("alg").GetString());
+        }
 
         return expectedKeyId;
     }

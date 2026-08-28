@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../Sigstore.Bootstrap/Sigstore.Bootstrap.csproj" />
+    <ProjectReference Include="../Sigstore.Oidc/Sigstore.Oidc.csproj" />
   </ItemGroup>
 
 </Project>

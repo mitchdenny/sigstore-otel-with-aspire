@@ -32,7 +32,8 @@ public sealed class SigstoreOperationTests
                 SigstoreOperationCommand.RefreshTufCommand,
                 SigstoreOperationCommand.RotateTufRootCommand,
                 SigstoreOperationCommand.RestartClientsCommand,
-                SigstoreOperationCommand.PublishTrustedRootCommand
+                SigstoreOperationCommand.PublishTrustedRootCommand,
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand
             ],
             annotations.Keys);
 

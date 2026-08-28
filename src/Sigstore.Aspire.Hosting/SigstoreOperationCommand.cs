@@ -13,6 +13,7 @@ internal static class SigstoreOperationCommand
     public const string RotateTufRootCommand = "rotate-tuf-root";
     public const string RestartClientsCommand = "restart-clients";
     public const string PublishTrustedRootCommand = "publish-trusted-root";
+    public const string RotateOidcSigningKeyCommand = "rotate-oidc-signing-key";
 
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)

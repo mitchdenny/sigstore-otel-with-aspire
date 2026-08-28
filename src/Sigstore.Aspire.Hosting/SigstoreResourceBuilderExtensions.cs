@@ -102,6 +102,16 @@ public static class SigstoreResourceBuilderExtensions
                 commandOptions:
                     SigstoreOperationCommand.CreatePublishTrustedRootOptions(
                         parent.Resource))
+            .WithCommand(
+                name: SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+                displayName: "Rotate OIDC Signing Key",
+                executeCommand: context =>
+                    SigstoreOidcRotationCommand.ExecuteAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreOidcRotationCommand.CreateOptions(
+                        parent.Resource))
             .OnInitializeResource(
                (resource, context, cancellationToken) =>
                {

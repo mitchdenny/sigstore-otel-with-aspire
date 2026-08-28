@@ -936,6 +936,52 @@ and prevents the command from completing.
 - Fulcio does not require restart.
 - Signing and validation traffic resumes without trust regression.
 
+### Implementation (Step 9 complete)
+
+**Command:** `rotate-oidc-signing-key` registered on the Sigstore parent resource.
+
+**State machine:**
+1. `preflight` — validate OIDC + Fulcio Running/Healthy, capture container IDs
+2. `generate-candidate` — create RSA 2048 key, derive kid via SHA-256(SPKI)
+3. `publish-overlap` — write overlapping JWKS (old+new public keys) atomically,
+   restart OIDC (old signer active), verify JWKS served with both kids
+4. `activate` — retain old key at `private/oidc/retained/key-<kid>.pem`,
+   atomically replace `signer.key`, restart OIDC (new signer active),
+   verify new tokens carry new kid
+5. `postconditions` — verify Fulcio container identity unchanged, test cert
+   issuance with new token and old pre-rotation token, verify JWKS overlap
+6. `complete` — write `oidc-rotation.json` state, report structured result
+
+**Key layout:**
+- `active-generation/private/oidc/signer.key` — active signing key (atomic rename)
+- `active-generation/private/oidc/retained/key-<kid>.pem` — historical keys
+- `active-generation/public/oidc/jwks.json` — overlapping JWKS (all public keys)
+- `<state>/oidc-rotation.json` — rotation state (schema v1)
+
+**OIDC issuer changes:**
+- `ValidateJwks` now accepts multiple keys in JWKS
+- Finds the matching key by kid derived from the loaded private key
+- Validates all keys have unique kids, valid RSA/sig/RS256 fields
+- Serves all keys in JWKS response for overlap
+
+**Design decisions:**
+- Trust generation NOT advanced — OidcKeyId in GenerationManifest is a
+  bootstrap-time historical record. TrustedRoot/SigningConfig are unchanged.
+  Fulcio discovers OIDC keys via `.well-known/openid-configuration` → `/jwks`,
+  not through TUF. Client trust status remains byte-identical.
+- Atomic file operations (write-temp-then-rename) satisfy "never overwrite in
+  place" — new inode created, old container sees stale only if not restarted.
+- Two OIDC restarts: one for overlap publication (old signer + overlapping JWKS),
+  one for activation (new signer + same overlapping JWKS).
+- Fulcio is never restarted — JWKS refresh on next token verification discovers
+  the new kid from the served overlapping JWKS endpoint.
+
+**Recovery:**
+- Failure before activate: old signer remains active, overlapping JWKS published
+  but safe. Retry generates a new candidate.
+- Failure after activate: new signer on disk, OIDC may need manual restart.
+  State file indicates incomplete rotation for diagnostics.
+
 ## Step 10: Implement timestamp-authority rotation
 
 ### Scope
