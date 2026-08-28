@@ -10,6 +10,7 @@ namespace Aspire.Hosting.ApplicationModel;
 internal static class SigstoreOperationCommand
 {
     public const string RefreshTufCommand = "refresh-tuf";
+    public const string RotateTufRootCommand = "rotate-tuf-root";
     public const string RestartClientsCommand = "restart-clients";
 
     private static readonly JsonSerializerOptions JsonOptions =
@@ -37,6 +38,30 @@ internal static class SigstoreOperationCommand
                 Title = "Refresh TUF metadata",
                 Message =
                     "Refreshing and validating the signed TUF repository.",
+                HideCancelButton = true
+            }
+        };
+
+    public static CommandOptions CreateRotateTufRootOptions(
+        SigstoreResource resource) =>
+        new()
+        {
+            Description =
+                "Rotate the TUF root signing key. Generates root N+1 signed " +
+                "by both old and new keys, then updates snapshot and timestamp.",
+            ConfirmationMessage =
+                "Rotate the TUF root key? A new root version will be " +
+                "published with fresh signing keys. Bootstrap root, targets " +
+                "content, and trust generation remain unchanged.",
+            IconName = "KeyMultiple",
+            IconVariant = IconVariant.Regular,
+            UpdateState = _ => GetMutationCommandState(resource),
+            Progress = new CommandProgressOptions
+            {
+                Title = "Rotate TUF root key",
+                Message =
+                    "Generating root N+1 with new key and validating the " +
+                    "full versioned root chain.",
                 HideCancelButton = true
             }
         };
@@ -79,6 +104,24 @@ internal static class SigstoreOperationCommand
                 new SigstoreFileStateInspector(),
                 context.Logger)
             .ExecuteRefreshTufAsync(context.CancellationToken);
+    }
+
+    public static Task<ExecuteCommandResult> ExecuteRotateTufRootAsync(
+        SigstoreResource resource,
+        ExecuteCommandContext context)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        ArgumentNullException.ThrowIfNull(context);
+
+        var runtime = new AspireSigstoreOperationRuntime(
+            resource,
+            context.Services);
+        return new SigstoreOperationExecutor(
+                resource,
+                runtime,
+                new SigstoreFileStateInspector(),
+                context.Logger)
+            .ExecuteRotateTufRootAsync(context.CancellationToken);
     }
 
     public static Task<ExecuteCommandResult> ExecuteRestartClientsAsync(
@@ -178,6 +221,52 @@ internal sealed class SigstoreOperationExecutor(
             return execution.Failure(
                 $"{SigstoreOperationCommand.RefreshTufCommand} failed during " +
                 $"{execution.Phase}.");
+        }
+        finally
+        {
+            lease!.Dispose();
+            await runtime.PublishParentStateAsync(resource);
+        }
+    }
+
+    public async Task<ExecuteCommandResult> ExecuteRotateTufRootAsync(
+        CancellationToken requestCancellationToken)
+    {
+        requestCancellationToken.ThrowIfCancellationRequested();
+        if (!resource.TryBeginOperation(
+                SigstoreOperationCommand.RotateTufRootCommand,
+                "Rotating TUF Root",
+                out var lease,
+                out var active))
+        {
+            return CreateContentionResult(
+                SigstoreOperationCommand.RotateTufRootCommand,
+                active!);
+        }
+
+        var execution = new OperationExecution(
+            resource,
+            runtime,
+            logger,
+            lease!,
+            total: 7);
+        try
+        {
+            return await ExecuteRotateTufRootCoreAsync(
+                execution,
+                requestCancellationToken);
+        }
+        catch (Exception exception)
+            when (IsExpectedOperationFailure(exception))
+        {
+            execution.AddError(
+                execution.Phase,
+                resource.Name,
+                null,
+                exception.Message);
+            return execution.Failure(
+                $"{SigstoreOperationCommand.RotateTufRootCommand} failed " +
+                $"during {execution.Phase}.");
         }
         finally
         {
@@ -434,6 +523,227 @@ internal sealed class SigstoreOperationExecutor(
             "TUF snapshot and timestamp metadata refreshed and verified.");
     }
 
+    private async Task<ExecuteCommandResult> ExecuteRotateTufRootCoreAsync(
+        OperationExecution execution,
+        CancellationToken requestCancellationToken)
+    {
+        await execution.ReportAsync(
+            "preflight",
+            0,
+            "Validating current trust, TUF, and resource state for root rotation.");
+
+        SigstoreOperationSnapshot before;
+        SigstoreResourceInstanceSnapshot workerBefore;
+        ExecuteCommandResult workerStart;
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-rotate-tuf-root-preflight"))
+        {
+            requestCancellationToken.ThrowIfCancellationRequested();
+            if (!await ValidatePreconditionsAsync(
+                    execution,
+                    requestCancellationToken))
+            {
+                return execution.Failure(
+                    "TUF root rotation preconditions are not satisfied.");
+            }
+
+            before = await CaptureAsync(requestCancellationToken);
+            execution.Before = before;
+            if (!ValidateCapture(
+                    execution,
+                    "preflight",
+                    before))
+            {
+                return execution.Failure(
+                    "The current TUF repository is not internally consistent.");
+            }
+
+            workerBefore = runtime.GetRequiredSnapshot(
+                resource.Components.TufBootstrap.Resource);
+            if (!execution.Check(
+                    "worker-ready",
+                    IsSuccessfulTerminal(workerBefore),
+                    "a completed one-shot with exit code 0",
+                    Describe(workerBefore),
+                    "preflight",
+                    workerBefore.Resource))
+            {
+                return execution.Failure(
+                    "The TUF worker is not ready for a new one-shot run.");
+            }
+            if (!execution.Check(
+                    "worker-baseline-identity",
+                    HasContainerIdentity(workerBefore),
+                    "a non-empty container identity",
+                    workerBefore.ContainerId ?? "missing",
+                    "preflight",
+                    workerBefore.Resource))
+            {
+                return execution.Failure(
+                    "The completed TUF worker has no observable container identity.");
+            }
+
+            await execution.ReportAsync(
+                "write-signal",
+                1,
+                "Writing rotate-root.request signal file for the TUF worker.");
+
+            // Write the signal file that tells the Go worker to rotate
+            // instead of refresh. The file is in the state directory root
+            // (not inside the TUF layout) to avoid layout validation failure.
+            var signalPath = Path.Combine(
+                resource.StatePath,
+                "rotate-root.request");
+            await File.WriteAllTextAsync(
+                signalPath,
+                "rotate",
+                requestCancellationToken);
+
+            await execution.ReportAsync(
+                "start-worker",
+                2,
+                "Starting a new TUF one-shot while handing off state.lock.");
+
+            using var critical = new CancellationTokenSource(WorkerTimeout);
+            workerStart = await runtime.ExecuteCommandAsync(
+                resource.Components.TufBootstrap.Resource,
+                KnownResourceCommands.StartCommand,
+                critical.Token);
+        }
+
+        if (!workerStart.Success)
+        {
+            execution.AddError(
+                "start-worker",
+                resource.Components.TufBootstrap.Resource.Name,
+                null,
+                workerStart.Message
+                    ?? "Aspire rejected the TUF worker start command.");
+            return await CompleteWorkerFailureAsync(
+                execution,
+                before,
+                "The TUF worker could not be started for root rotation.");
+        }
+
+        await execution.ReportAsync(
+            "wait-worker",
+            3,
+            "Waiting for the root rotation worker to complete.");
+
+        SigstoreResourceInstanceSnapshot workerAfter;
+        using (var critical = new CancellationTokenSource(WorkerTimeout))
+        {
+            try
+            {
+                workerAfter = await runtime.WaitForSnapshotAsync(
+                    resource.Components.TufBootstrap.Resource,
+                    snapshot => IsNewInstance(workerBefore, snapshot)
+                        && IsTerminal(snapshot),
+                    WorkerTimeout,
+                    critical.Token);
+            }
+            catch (OperationCanceledException exception)
+            {
+                execution.AddError(
+                    "wait-worker",
+                    resource.Components.TufBootstrap.Resource.Name,
+                    null,
+                    exception.Message);
+                return await CompleteWorkerFailureAsync(
+                    execution,
+                    before,
+                    "The root rotation worker did not complete within the timeout.");
+            }
+        }
+
+        execution.Resources.Add(
+            CreateLifecycleResult(
+                resource.Components.TufBootstrap.Resource.Name,
+                KnownResourceCommands.StartCommand,
+                workerBefore,
+                workerAfter,
+                null));
+        if (!IsSuccessfulTerminal(workerAfter))
+        {
+            execution.AddError(
+                "wait-worker",
+                workerAfter.Resource,
+                null,
+                $"Worker completed as {Describe(workerAfter)}.");
+            return await CompleteWorkerFailureAsync(
+                execution,
+                before,
+                "The root rotation worker failed.");
+        }
+
+        await execution.ReportAsync(
+            "postconditions",
+            4,
+            "Validating root version advance, key rotation, and versioned chain.");
+
+        using var postconditionToken = new CancellationTokenSource(
+            WorkerTimeout);
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-rotate-tuf-root-postconditions"))
+        {
+            var after = await CaptureAsync(postconditionToken.Token);
+            execution.After = after;
+            ValidateRotationPostconditions(
+                execution,
+                before,
+                after,
+                workerBefore,
+                workerAfter);
+
+            await execution.ReportAsync(
+                "aggregate-status",
+                5,
+                "Checking served metadata; clients will update to new root asynchronously.");
+            var aggregate = await runtime.CollectStatusAsync(
+                postconditionToken.Token);
+            // After rotation, clients may still report the old root version
+            // until their next TUF update cycle. This is expected and not a
+            // failure - the rotation succeeded if disk/served are consistent.
+            if (!aggregate.Ready)
+            {
+                logger.LogInformation(
+                    "Aggregate status not yet ready after rotation " +
+                    "(clients may need to refresh): {Reason}",
+                    aggregate.Reason);
+            }
+
+            await execution.ReportAsync(
+                "final-verification",
+                6,
+                "Rechecking the TUF server identity before reporting success.");
+            var finalServer = runtime.GetRequiredSnapshot(
+                resource.Components.Tuf.Resource);
+            execution.Check(
+                "tuf-server-final-identity",
+                SameInstance(after.TufServer, finalServer)
+                    && IsRunningHealthy(finalServer),
+                Describe(after.TufServer),
+                Describe(finalServer),
+                "aggregate-status",
+                finalServer.Resource);
+        }
+
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "Root rotation completed, but one or more postconditions failed.");
+        }
+
+        await execution.ReportAsync(
+            "complete",
+            7,
+            "TUF root key rotated successfully. Root version advanced by 1.");
+        return execution.Success(
+            "TUF root key rotated, signed by old and new keys, and verified.");
+    }
+
     private async Task<ExecuteCommandResult> ExecuteRestartClientsCoreAsync(
         OperationExecution execution,
         CancellationToken requestCancellationToken)
@@ -447,7 +757,7 @@ internal sealed class SigstoreOperationExecutor(
             resource.StatePath,
             "dashboard-restart-clients");
         requestCancellationToken.ThrowIfCancellationRequested();
-        if (!await ValidatePreconditionsAsync(
+        if (!await ValidateRestartPreconditionsAsync(
                 execution,
                 requestCancellationToken))
         {
@@ -688,6 +998,77 @@ internal sealed class SigstoreOperationExecutor(
             resource.Name);
     }
 
+    /// <summary>
+    /// Validates preconditions for restart-clients. Accepts stale
+    /// tufRootVersion/tufTargetsVersion on clients (valid after root
+    /// rotation - clients will catch up on restart). Rejects all other
+    /// trust mismatches (domain, generation, trusted-root, signing-config).
+    /// </summary>
+    private async Task<bool> ValidateRestartPreconditionsAsync(
+        OperationExecution execution,
+        CancellationToken cancellationToken)
+    {
+        var health = resource.GetRuntimeHealth();
+        var healthy = execution.Check(
+            "parent-runtime-healthy",
+            health.State == "Healthy",
+            "Healthy",
+            health.Reason ?? health.State,
+            "preflight",
+            resource.Name);
+        if (!healthy)
+        {
+            return false;
+        }
+
+        var status = await runtime.CollectStatusAsync(cancellationToken);
+        if (status.Ready)
+        {
+            return execution.Check(
+                "trust-status-ready",
+                true,
+                "ready=true with no status errors",
+                "ready",
+                "preflight",
+                resource.Name);
+        }
+
+        // After root rotation, clients may report stale tufRootVersion
+        // and/or tufTargetsVersion until restarted. This is the valid
+        // state that restart-clients is designed to resolve. Reject any
+        // errors about domain, generation, trusted-root, or signing-config.
+        var unsafeErrors = status.Errors
+            .Where(error =>
+                !error.Message.StartsWith(
+                    "tufRootVersion",
+                    StringComparison.Ordinal)
+                && !error.Message.StartsWith(
+                    "tufTargetsVersion",
+                    StringComparison.Ordinal))
+            .ToArray();
+
+        if (unsafeErrors.Length != 0)
+        {
+            return execution.Check(
+                "trust-status-ready",
+                false,
+                "only stale root/targets version errors (post-rotation)",
+                $"{unsafeErrors[0].Source}: {unsafeErrors[0].Message}",
+                "preflight",
+                resource.Name);
+        }
+
+        // All errors are stale root/targets versions - acceptable for
+        // restart-clients as it will resolve them.
+        return execution.Check(
+            "trust-status-stale-root-acceptable",
+            true,
+            "clients have stale root/targets version (will converge on restart)",
+            status.Reason ?? "stale root version",
+            "preflight",
+            resource.Name);
+    }
+
     private async Task<SigstoreOperationSnapshot> CaptureAsync(
         CancellationToken cancellationToken)
     {
@@ -843,6 +1224,155 @@ internal sealed class SigstoreOperationExecutor(
             "tuf-bootstrap");
         execution.Check(
             "disk-served-after-refresh",
+            MatchesServed(after.Tuf, after.Served),
+            Describe(after.Tuf),
+            Describe(after.Served),
+            "postconditions",
+            after.TufServer.Resource);
+        execution.Check(
+            "tuf-server-not-restarted",
+            SameInstance(before.TufServer, after.TufServer)
+                && IsRunningHealthy(after.TufServer),
+            Describe(before.TufServer),
+            Describe(after.TufServer),
+            "postconditions",
+            after.TufServer.Resource);
+        execution.Check(
+            "worker-ran-once",
+            IsNewInstance(workerBefore, workerAfter)
+                && IsSuccessfulTerminal(workerAfter),
+            Describe(workerBefore),
+            Describe(workerAfter),
+            "postconditions",
+            workerAfter.Resource);
+    }
+
+    private static void ValidateRotationPostconditions(
+        OperationExecution execution,
+        SigstoreOperationSnapshot before,
+        SigstoreOperationSnapshot after,
+        SigstoreResourceInstanceSnapshot workerBefore,
+        SigstoreResourceInstanceSnapshot workerAfter)
+    {
+        // Root must advance by exactly 1.
+        execution.Check(
+            "root-version-advanced",
+            after.Tuf.Metadata.Root.Version
+                == before.Tuf.Metadata.Root.Version + 1
+                && after.Tuf.Metadata.Root.Sha256
+                    != before.Tuf.Metadata.Root.Sha256,
+            $"root version {before.Tuf.Metadata.Root.Version + 1} " +
+                "with changed hash",
+            $"root version {after.Tuf.Metadata.Root.Version}, " +
+                $"sha256 {after.Tuf.Metadata.Root.Sha256}",
+            "postconditions",
+            "tuf-bootstrap");
+
+        // Targets must advance (trust_status target updated with new
+        // root version).
+        execution.Check(
+            "targets-version-advanced",
+            after.Tuf.Metadata.Targets.Version
+                > before.Tuf.Metadata.Targets.Version
+                && after.Tuf.Metadata.Targets.Sha256
+                    != before.Tuf.Metadata.Targets.Sha256,
+            $"targets version > {before.Tuf.Metadata.Targets.Version} " +
+                "with changed hash",
+            $"targets version {after.Tuf.Metadata.Targets.Version}, " +
+                $"sha256 {after.Tuf.Metadata.Targets.Sha256}",
+            "postconditions",
+            "tuf-bootstrap");
+
+        // Snapshot and timestamp must advance.
+        CheckAdvanced(
+            execution,
+            "snapshot-advanced",
+            before.Tuf.Metadata.Snapshot,
+            after.Tuf.Metadata.Snapshot);
+        CheckAdvanced(
+            execution,
+            "timestamp-advanced",
+            before.Tuf.Metadata.Timestamp,
+            after.Tuf.Metadata.Timestamp);
+
+        // Non-root content must be preserved.
+        CheckEqual(
+            execution,
+            "trusted-root-unchanged",
+            before.Tuf.Metadata.TrustedRootSha256,
+            after.Tuf.Metadata.TrustedRootSha256);
+        CheckEqual(
+            execution,
+            "signing-config-unchanged",
+            before.Tuf.Metadata.SigningConfigSha256,
+            after.Tuf.Metadata.SigningConfigSha256);
+        CheckEqual(
+            execution,
+            "trust-domain-unchanged",
+            before.Tuf.Trust.TrustDomainId,
+            after.Tuf.Trust.TrustDomainId);
+        CheckEqual(
+            execution,
+            "generation-unchanged",
+            DescribeGeneration(before.Tuf.Trust),
+            DescribeGeneration(after.Tuf.Trust));
+        CheckEqual(
+            execution,
+            "bootstrap-root-unchanged",
+            before.Tuf.BootstrapRootSha256,
+            after.Tuf.BootstrapRootSha256);
+        CheckEqual(
+            execution,
+            "source-fingerprint-unchanged",
+            before.Tuf.SourceFingerprint,
+            after.Tuf.SourceFingerprint);
+        CheckEqual(
+            execution,
+            "trust-material-unchanged",
+            before.TrustMaterialSha256,
+            after.TrustMaterialSha256);
+
+        // Trust status root version must reflect new root.
+        execution.Check(
+            "trust-status-root-version",
+            after.Tuf.Trust.TufRootVersion
+                == before.Tuf.Trust.TufRootVersion + 1,
+            $"TUF root version {before.Tuf.Trust.TufRootVersion + 1}",
+            $"TUF root version {after.Tuf.Trust.TufRootVersion}",
+            "postconditions",
+            "tuf-bootstrap");
+
+        // Publication must advance.
+        execution.Check(
+            "publication-advanced",
+            before.Tuf.Trust.PublicationId
+                    != after.Tuf.Trust.PublicationId
+                && before.Tuf.Trust.PublicationManifestSha256
+                    != after.Tuf.Trust.PublicationManifestSha256,
+            DescribePublication(before.Tuf.Trust),
+            DescribePublication(after.Tuf.Trust),
+            "postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "history-retains-prior-active",
+            after.Tuf.PreviousPublicationId
+                    == before.Tuf.Trust.PublicationId
+                && after.Tuf.PreviousPublicationManifestSha256
+                    == before.Tuf.Trust.PublicationManifestSha256,
+            DescribePublication(before.Tuf.Trust),
+            $"{after.Tuf.PreviousPublicationId}/" +
+                after.Tuf.PreviousPublicationManifestSha256,
+            "postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "trust-state-changed-only-by-publication",
+            before.TrustStateSha256 != after.TrustStateSha256,
+            "a changed trust-state fingerprint",
+            after.TrustStateSha256,
+            "postconditions",
+            "tuf-bootstrap");
+        execution.Check(
+            "disk-served-after-rotation",
             MatchesServed(after.Tuf, after.Served),
             Describe(after.Tuf),
             Describe(after.Served),

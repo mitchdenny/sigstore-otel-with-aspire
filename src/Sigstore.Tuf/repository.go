@@ -28,6 +28,7 @@ const (
 	repositoryActionCreated   repositoryAction = "Created"
 	repositoryActionRecovered repositoryAction = "Recovered"
 	repositoryActionRefreshed repositoryAction = "Refreshed"
+	repositoryActionRotated   repositoryAction = "Rotated"
 )
 
 type publicationReference struct {
@@ -176,6 +177,155 @@ func ensureTUFRepositoryWithHooks(
 		return "", err
 	}
 	return repositoryActionRefreshed, nil
+}
+
+// rotateTUFRootKey generates a new root key and publishes root N+1 within the
+// existing transactional publication framework. The rotation must only be
+// invoked against a committed, validated publication.
+func rotateTUFRootKey(statePath string) (repositoryAction, error) {
+	return rotateTUFRootKeyWithHooks(statePath, publicationHooks{})
+}
+
+func rotateTUFRootKeyWithHooks(
+	statePath string,
+	hooks publicationHooks,
+) (repositoryAction, error) {
+	stateLock, err := acquireStateLock(statePath, 30*time.Second, "tuf-root-rotation")
+	if err != nil {
+		return "", err
+	}
+	defer stateLock.release()
+
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		return "", err
+	}
+	sourceFingerprint, err := fingerprintSource(bootstrap)
+	if err != nil {
+		return "", err
+	}
+
+	layout := newTUFLayout(statePath)
+	if err := ensureTUFLayout(layout); err != nil {
+		return "", err
+	}
+	state, err := loadPublicationState(layout)
+	if err != nil {
+		return "", fmt.Errorf("load TUF publication state for rotation: %w", err)
+	}
+	if state.Status != publicationStatusCommitted {
+		return "", fmt.Errorf(
+			"TUF root rotation requires a committed publication, found status %q",
+			state.Status,
+		)
+	}
+	if err := cleanupPublicationTemps(layout); err != nil {
+		return "", err
+	}
+	if err := cleanupUnjournaledCandidate(layout); err != nil {
+		return "", err
+	}
+	if err := validateCommittedPublication(layout, state, sourceFingerprint); err != nil {
+		return "", err
+	}
+	if err := rotateRootPublication(layout, state, sourceFingerprint, statePath, hooks); err != nil {
+		return "", err
+	}
+	return repositoryActionRotated, nil
+}
+
+func rotateRootPublication(
+	layout tufLayout,
+	state publicationState,
+	sourceFingerprint string,
+	statePath string,
+	hooks publicationHooks,
+) error {
+	if state.Active == nil {
+		return errors.New("committed TUF publication has no active repository for rotation")
+	}
+	activePath := committedPath(layout, state.Active.ID)
+	manifest, _, err := validateExistingRepository(activePath, sourceFingerprint)
+	if err != nil {
+		return err
+	}
+	if err := os.Mkdir(layout.candidate, 0o755); err != nil {
+		return fmt.Errorf("create TUF rotation staging directory: %w", err)
+	}
+	if err := copyDirectory(activePath, layout.candidate); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return err
+	}
+	if err := rotateTUFRoot(layout.candidate, statePath); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return err
+	}
+
+	manifest.UpdatedAtUTC = time.Now().UTC()
+	if err := writeRepositoryManifest(layout.candidate, manifest); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return err
+	}
+	candidate, err := repositoryReference(layout.candidate, sourceFingerprint)
+	if err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return err
+	}
+	if candidate.ID == state.Active.ID {
+		_ = os.RemoveAll(layout.candidate)
+		return errors.New("rotated TUF publication is identical to the active publication")
+	}
+	if pathExists(committedPath(layout, candidate.ID)) {
+		_ = os.RemoveAll(layout.candidate)
+		return fmt.Errorf("TUF rotation candidate %s already exists in committed state", candidate.ID)
+	}
+
+	preparing := state
+	preparing.Status = publicationStatusPreparing
+	preparing.UpdatedAtUTC = time.Now().UTC()
+	preparing.Candidate = &candidate
+	if err := writePublicationState(layout, preparing); err != nil {
+		_ = os.RemoveAll(layout.candidate)
+		return err
+	}
+	if err := runCheckpoint(hooks, checkpointCandidatePrepared); err != nil {
+		return rollbackPreparingPublication(layout, preparing, sourceFingerprint, err)
+	}
+
+	if state.Previous != nil {
+		if err := os.Rename(layout.previous, layout.retiredPrevious); err != nil {
+			return rollbackPreparingPublication(
+				layout,
+				preparing,
+				sourceFingerprint,
+				fmt.Errorf("park previous TUF publication during rotation: %w", err),
+			)
+		}
+	}
+	if err := runCheckpoint(hooks, checkpointHistoryParked); err != nil {
+		return rollbackPreparingPublication(layout, preparing, sourceFingerprint, err)
+	}
+
+	candidatePath := committedPath(layout, candidate.ID)
+	if err := os.Rename(layout.candidate, candidatePath); err != nil {
+		return rollbackPreparingPublication(
+			layout,
+			preparing,
+			sourceFingerprint,
+			fmt.Errorf("commit staged TUF rotation publication: %w", err),
+		)
+	}
+	if err := runCheckpoint(hooks, checkpointCandidateCommitted); err != nil {
+		return rollbackPreparingPublication(layout, preparing, sourceFingerprint, err)
+	}
+	if err := switchActivePublication(layout, candidate.ID, hooks); err != nil {
+		return rollbackPreparingPublication(layout, preparing, sourceFingerprint, err)
+	}
+
+	if err := runCheckpoint(hooks, checkpointActiveSwitched); err != nil {
+		return err
+	}
+	return finalizeRefreshedPublication(layout, preparing, sourceFingerprint, hooks)
 }
 
 func createInitialPublication(

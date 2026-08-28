@@ -770,6 +770,8 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 
 ## Step 7: Implement TUF root rotation
 
+**Status: ✅ Implemented**
+
 ### Scope
 
 - Add `rotate-tuf-root`.
@@ -778,6 +780,28 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 - Preserve all versioned roots and the immutable bootstrap anchor.
 - Publish snapshot and timestamp metadata transactionally.
 
+### Implementation
+
+- **Go TUF worker** (`src/Sigstore.Tuf/main.go`, `repository.go`): On
+  `rotate-root.request` signal file, `rotateTUFRoot()` generates a new root key,
+  revokes the old key, and `rotateRootPublication()` publishes transactionally
+  using the candidate/commit/switch pattern. go-tuf signs with both old and new
+  keys satisfying both thresholds.
+- **C# dashboard command** (`SigstoreOperationCommand.cs`): `rotate-tuf-root`
+  uses the proven Step 6 one-shot worker pattern (signal file → start worker →
+  wait → validate postconditions). Structured output includes before/after root
+  versions, key rotation evidence, snapshot/timestamp advance, and bootstrap
+  preservation.
+- **Restart-clients integration**: After rotation, clients report stale root
+  version (v1 vs disk v2). `restart-clients` accepts this specific valid
+  stale-client state (root/targets version behind disk along a valid retained
+  root chain) while still rejecting unsafe mismatches (wrong trust domain,
+  generation, trusted-root, signing-config). After restart, clients follow the
+  immutable bootstrap root v1 → `2.root.json` → v2 chain.
+- **Bootstrap root remains v1**: The immutable `bootstrap/root.json` is never
+  modified. Fresh clients always start from v1 and follow the versioned root
+  chain (`1.root.json`, `2.root.json`, ...) to reach the current active root.
+
 ### Validation gate
 
 - Cryptographic tests validate signatures and thresholds.
@@ -785,6 +809,20 @@ Completed on `2026-08-27` with the file-based AppHost and Aspire SDK `13.5.2`.
 - A fresh client can bootstrap and update through the full root chain.
 - Rollback, freeze, skipped-version, and tampered-root cases are rejected.
 - Restarting a client with the latest root is not accepted as proof of rotation.
+
+### Evidence
+
+- 16/16 Go tests pass (6 rotation-specific: advance, second rotation,
+  dual-threshold signatures, injected failure rollback, rotation-then-refresh,
+  signal file consumption).
+- 22/22 C# hosting tests pass (3 rotation + 2 restart-stale-root + existing).
+- 21/21 Bootstrap tests pass.
+- Live: `rotate-tuf-root` succeeds v1→v2 with all 24 postconditions passing.
+- Live: `restart-clients` preflight accepts stale root; 5/6 clients converge to
+  v2 (javascript-client has pre-existing startup flakiness unrelated to
+  rotation).
+- Nginx TUF server identity unchanged across rotation.
+- Bootstrap root hash preserved at original value.
 
 ## Step 8: Implement additive trusted-root rollout
 
