@@ -875,6 +875,22 @@ or preempting Steps 9-13.
 - No manual intervention required for any checkpoint. Repeated invocations are
   idempotent and converge to one coherent generation.
 
+**Request/replay protocol**: The C# command writes a schema-versioned JSON
+request file containing a unique `operationId` (GUID). The Go worker uses
+`dispatchPublishRequest` which:
+1. Checks a durable `publishCompletion` journal for same-ID (crash-after-success).
+2. Calls `recoverTUFState` (recovery-only — no refresh or new publication).
+3. Detects recovery-forward-completed state vs genuinely new second request.
+4. Writes completion journal BEFORE removing request (crash-safe ordering).
+
+**Repeated invocation contract**: `publish-trusted-root` is explicitly one-shot
+per trust domain. A second invocation (different operation ID after a prior
+completion) is rejected pre-mutation with a clear error. This prevents silent
+removal of prior standby verification material and upholds "retain historical
+verification material by default." Accumulating multiple standby keys with
+stable unique identities is deferred to Steps 9-13 which introduce real
+rotating keys.
+
 **Client uptake**: All six language clients (Go cosign, Python sigstore, Rust
 sigstore, Java sigstore, TypeScript sigstore, .NET sigstore) require
 restart-based uptake via `ResourceCommandService`. None support in-process TUF
@@ -897,7 +913,7 @@ and prevents the command from completing.
 
 ### Evidence
 
-- All Go tests pass (31 tests including 3 cross-gen recovery fault-injection tests).
+- All Go tests pass (33 tests including 5 dispatch-path, 3 cross-gen recovery, 2 tampered-domain tests).
 - All C# hosting tests pass (22 tests including command registration).
 - `git diff --check` clean from base commit.
 - Live validation: generation 1→2, all 6 clients converged, 14/14 healthy.
