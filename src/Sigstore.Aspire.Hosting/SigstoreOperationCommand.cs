@@ -482,10 +482,27 @@ internal sealed class SigstoreOperationExecutor(
             var signalPath = Path.Combine(
                 resource.StatePath,
                 "publish-trusted-root.request");
+
+            // Reject if a surviving request file exists from a prior failed worker
+            // — never overwrite replay correlation.
+            if (File.Exists(signalPath))
+            {
+                execution.AddError(
+                    execution.Phase,
+                    resource.Name,
+                    null,
+                    "A publish-trusted-root.request file already exists from a prior " +
+                    "interrupted operation. The TUF worker must consume it on restart " +
+                    "before a new operation can be issued.");
+                return execution.Failure(
+                    "Cannot issue publish-trusted-root: surviving request file exists");
+            }
+
             var requestContent = System.Text.Json.JsonSerializer.Serialize(new
             {
                 schemaVersion = 1,
-                operationId = operationId
+                operationId = operationId,
+                trustDomainId = before.Tuf.Trust.TrustDomainId
             });
             await File.WriteAllTextAsync(
                 signalPath,

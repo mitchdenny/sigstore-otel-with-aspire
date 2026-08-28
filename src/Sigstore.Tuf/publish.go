@@ -25,146 +25,275 @@ const (
 	standbyRekorKeyFile       = "rekor-standby.pub"
 	publishRequestFile        = "publish-trusted-root.request"
 	publishCompletionFile     = "publish-trusted-root.completed"
+	publishCompletionSchema   = 2
+)
+
+// recoveryOutcome distinguishes no-op from actual state mutations.
+type recoveryOutcome int
+
+const (
+	recoveryNoop             recoveryOutcome = iota // State was already coherent
+	recoveryRolledBack                              // Rolled back to prior committed state
+	recoveryForwardCompleted                        // Forward-completed interrupted publish
 )
 
 // publishRequest is the schema-versioned content of the request file.
 type publishRequest struct {
 	SchemaVersion int    `json:"schemaVersion"`
 	OperationID   string `json:"operationId"`
+	TrustDomainID string `json:"trustDomainId"`
 }
 
-// publishCompletion records that a specific operation ID was completed.
+// publishCompletion records that a specific operation ID was completed,
+// bound to enough committed state to prove the operation outcome.
 type publishCompletion struct {
-	SchemaVersion int       `json:"schemaVersion"`
-	OperationID   string    `json:"operationId"`
-	CompletedAt   time.Time `json:"completedAtUtc"`
-	Generation    int       `json:"generation"`
+	SchemaVersion  int       `json:"schemaVersion"`
+	OperationID    string    `json:"operationId"`
+	TrustDomainID  string    `json:"trustDomainId"`
+	CompletedAt    time.Time `json:"completedAtUtc"`
+	Generation     int       `json:"generation"`
+	GenerationID   string    `json:"generationId"`
+	PublicationID  string    `json:"publicationId"`
+	ManifestSHA256 string    `json:"manifestSha256"`
+}
+
+// writeAtomicJSON writes data to path atomically via temp+fsync+rename.
+func writeAtomicJSON(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".atomic-*")
+	if err != nil {
+		return fmt.Errorf("create temp for atomic write: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("fsync temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename atomic: %w", err)
+	}
+	return nil
+}
+
+// loadAndValidateCompletion reads and strictly validates the completion file.
+// Returns (nil, nil) if the file does not exist.
+func loadAndValidateCompletion(statePath string) (*publishCompletion, error) {
+	completionPath := filepath.Join(statePath, publishCompletionFile)
+	data, err := os.ReadFile(completionPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read completion file: %w", err)
+	}
+	var comp publishCompletion
+	if err := json.Unmarshal(data, &comp); err != nil {
+		return nil, fmt.Errorf("malformed completion file: %w", err)
+	}
+	if comp.SchemaVersion != publishCompletionSchema {
+		return nil, fmt.Errorf("completion schema %d unsupported (expected %d)", comp.SchemaVersion, publishCompletionSchema)
+	}
+	if comp.OperationID == "" || comp.TrustDomainID == "" || comp.GenerationID == "" || comp.PublicationID == "" {
+		return nil, fmt.Errorf("completion file missing required fields")
+	}
+	return &comp, nil
+}
+
+// writeCompletion atomically writes a validated completion record.
+func writeCompletion(statePath string, comp publishCompletion) error {
+	comp.SchemaVersion = publishCompletionSchema
+	data, err := json.MarshalIndent(comp, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal completion: %w", err)
+	}
+	data = append(data, '\n')
+	return writeAtomicJSON(filepath.Join(statePath, publishCompletionFile), data)
 }
 
 // dispatchPublishRequest handles the full lifecycle of a publish-trusted-root
 // request including recovery, replay detection, and deterministic consumption.
-// This is the production entry point called from main.
+// This is the production entry point called from main. Holds the shared state
+// lock across recovery, decision, publication, completion, and request removal.
 func dispatchPublishRequest(statePath string) (repositoryAction, error) {
 	return dispatchPublishRequestWithHooks(statePath, publicationHooks{})
 }
 
 func dispatchPublishRequestWithHooks(statePath string, hooks publicationHooks) (repositoryAction, error) {
 	requestPath := filepath.Join(statePath, publishRequestFile)
-	completionPath := filepath.Join(statePath, publishCompletionFile)
 
-	// Read and parse the request to get its operation ID.
+	// Read and validate the request strictly before acquiring the lock.
 	requestData, err := os.ReadFile(requestPath)
 	if err != nil {
 		return "", fmt.Errorf("read publish request: %w", err)
 	}
 	var req publishRequest
 	if err := json.Unmarshal(requestData, &req); err != nil {
-		return "", fmt.Errorf("parse publish request (must contain operationId): %w", err)
+		return "", fmt.Errorf("parse publish request (must be valid JSON with operationId): %w", err)
+	}
+	if req.SchemaVersion != 1 {
+		return "", fmt.Errorf("publish request schema %d unsupported (expected 1)", req.SchemaVersion)
 	}
 	if req.OperationID == "" {
 		return "", fmt.Errorf("publish request missing operationId")
 	}
-
-	// Check if this operation was already completed (crash after completion
-	// journal write but before request file removal).
-	if completionData, err := os.ReadFile(completionPath); err == nil {
-		var comp publishCompletion
-		if json.Unmarshal(completionData, &comp) == nil && comp.OperationID == req.OperationID {
-			// Same operation already completed. Remove request and return success.
-			_ = os.Remove(requestPath)
-			return repositoryActionPublished, nil
-		}
-		// Different operation ID in completion than request — this would be a
-		// new request after a prior completion. The one-shot guard in
-		// publishTrustedRootUpdate will reject it, but first recover state.
+	if req.TrustDomainID == "" {
+		return "", fmt.Errorf("publish request missing trustDomainId")
 	}
 
-	// Recover any interrupted TUF/generation state WITHOUT refreshing.
-	if _, err := recoverTUFStateWithHooks(statePath, hooks); err != nil {
-		return "", fmt.Errorf("recover TUF state before publish dispatch: %w", err)
-	}
-
-	// After recovery, check if this operation was already completed by the
-	// recovery itself (forward-complete scenario where gen is now > 1).
-	bootstrap, err := loadActiveTrustGeneration(statePath)
-	if err != nil {
-		return "", fmt.Errorf("load generation after recovery: %w", err)
-	}
-	if bootstrap.Generation > 1 {
-		// Recovery forward-completed the generation. Check if this is the
-		// same operation that was interrupted (not a new second request).
-		if completionData, err := os.ReadFile(completionPath); err == nil {
-			var comp publishCompletion
-			if json.Unmarshal(completionData, &comp) == nil && comp.OperationID == req.OperationID {
-				_ = os.Remove(requestPath)
-				return repositoryActionPublished, nil
-			}
-			// A completion exists with a DIFFERENT operation ID. This means a
-			// prior operation completed and this is a genuinely new second
-			// request which must be rejected by the one-shot guard.
-		} else {
-			// No completion record but gen > 1 means recovery completed an
-			// interrupted publish for this same request. Write completion now.
-			comp := publishCompletion{
-				SchemaVersion: 1,
-				OperationID:   req.OperationID,
-				CompletedAt:   time.Now().UTC(),
-				Generation:    bootstrap.Generation,
-			}
-			compData, _ := json.MarshalIndent(comp, "", "  ")
-			if err := os.WriteFile(completionPath, compData, 0o644); err != nil {
-				return "", fmt.Errorf("write completion after recovery: %w", err)
-			}
-			_ = os.Remove(requestPath)
-			return repositoryActionPublished, nil
-		}
-	}
-
-	// Perform the actual publication.
-	action, err := publishTrustedRootUpdateWithHooks(statePath, hooks)
-	if err != nil {
-		return "", err
-	}
-
-	// Record completion before removing request.
-	bootstrap, _ = loadActiveTrustGeneration(statePath)
-	comp := publishCompletion{
-		SchemaVersion: 1,
-		OperationID:   req.OperationID,
-		CompletedAt:   time.Now().UTC(),
-		Generation:    bootstrap.Generation,
-	}
-	compData, _ := json.MarshalIndent(comp, "", "  ")
-	if err := os.WriteFile(completionPath, compData, 0o644); err != nil {
-		return "", fmt.Errorf("write completion journal: %w", err)
-	}
-
-	// Remove request file last — if we crash here, next restart sees
-	// completion record with matching ID and skips.
-	_ = os.Remove(requestPath)
-
-	return action, nil
-}
-
-// publishTrustedRootUpdate advances the trust generation by adding inactive
-// standby verification material, then publishes new TUF targets that contain
-// both old and new verification entries. SigningConfig routing remains unchanged.
-// This is the additive trust publication primitive used before any signer is
-// activated (Steps 9-13).
-func publishTrustedRootUpdate(statePath string) (repositoryAction, error) {
-	return publishTrustedRootUpdateWithHooks(statePath, publicationHooks{})
-}
-
-func publishTrustedRootUpdateWithHooks(
-	statePath string,
-	hooks publicationHooks,
-) (repositoryAction, error) {
-	stateLock, err := acquireStateLock(statePath, 30*time.Second, "tuf-publish-trusted-root")
+	// Acquire the shared state lock for the entire dispatch lifecycle.
+	stateLock, err := acquireStateLock(statePath, 30*time.Second, "tuf-publish-dispatch")
 	if err != nil {
 		return "", err
 	}
 	defer stateLock.release()
 
+	// Check if this operation was already completed (crash after completion
+	// write but before request file removal).
+	comp, err := loadAndValidateCompletion(statePath)
+	if err != nil {
+		// Malformed/corrupted completion file is ambiguous — fail loudly.
+		return "", fmt.Errorf("ambiguous completion state: %w", err)
+	}
+	if comp != nil && comp.OperationID == req.OperationID {
+		// Same operation already completed. Remove request and return success.
+		_ = os.Remove(requestPath)
+		return repositoryActionPublished, nil
+	}
+
+	// Recover any interrupted TUF/generation state (lock-free internal).
+	outcome, err := recoverTUFStateLocked(statePath, hooks)
+	if err != nil {
+		return "", fmt.Errorf("recover TUF state: %w", err)
+	}
+
+	// After recovery, determine if publication already completed.
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		return "", fmt.Errorf("load generation after recovery: %w", err)
+	}
+
+	if bootstrap.Generation > 1 {
+		switch outcome {
+		case recoveryForwardCompleted:
+			// Recovery forward-completed an interrupted publish. This must be
+			// the same operation (since no other code path exists). Verify
+			// trust domain matches and write completion.
+			if req.TrustDomainID != "" {
+				domain, loadErr := loadTrustDomain(statePath)
+				if loadErr == nil && domain.TrustDomainID != req.TrustDomainID {
+					return "", fmt.Errorf("request trust domain %q does not match active %q", req.TrustDomainID, domain.TrustDomainID)
+				}
+			}
+			layout := newTUFLayout(statePath)
+			state, stateErr := loadPublicationState(layout)
+			if stateErr != nil {
+				return "", fmt.Errorf("load publication state for completion: %w", stateErr)
+			}
+			newComp := publishCompletion{
+				OperationID:    req.OperationID,
+				TrustDomainID:  req.TrustDomainID,
+				CompletedAt:    time.Now().UTC(),
+				Generation:     bootstrap.Generation,
+				GenerationID:   bootstrap.GenerationID,
+				PublicationID:  state.Active.ID,
+				ManifestSHA256: state.Active.ManifestSHA256,
+			}
+			if err := writeCompletion(statePath, newComp); err != nil {
+				return "", err
+			}
+			_ = os.Remove(requestPath)
+			return repositoryActionPublished, nil
+
+		case recoveryNoop, recoveryRolledBack:
+			// Gen > 1 but recovery did NOT forward-complete. Either:
+			// - A prior operation completed (completion exists with different ID)
+			// - Or completion is missing/corrupt with gen > 1 (ambiguous)
+			if comp != nil {
+				// Different operation ID completed previously. This is a new
+				// forbidden second request.
+			} else {
+				// No valid completion but gen > 1. This is ambiguous —
+				// we cannot prove this request caused the generation advance.
+				return "", fmt.Errorf(
+					"ambiguous state: generation %d with no valid completion record; "+
+						"cannot determine if operation %q already completed or is new",
+					bootstrap.Generation, req.OperationID,
+				)
+			}
+		}
+	}
+
+	// Perform the actual publication (lock-free internal — we hold the lock).
+	action, err := publishTrustedRootLocked(statePath, hooks)
+	if err != nil {
+		return "", err
+	}
+
+	// Reload bootstrap for completion record.
+	bootstrap, err = loadActiveTrustGeneration(statePath)
+	if err != nil {
+		return "", fmt.Errorf("load generation for completion: %w", err)
+	}
+	layout := newTUFLayout(statePath)
+	state, err := loadPublicationState(layout)
+	if err != nil {
+		return "", fmt.Errorf("load publication state for completion: %w", err)
+	}
+
+	// Write completion atomically before removing request.
+	newComp := publishCompletion{
+		OperationID:    req.OperationID,
+		TrustDomainID:  req.TrustDomainID,
+		CompletedAt:    time.Now().UTC(),
+		Generation:     bootstrap.Generation,
+		GenerationID:   bootstrap.GenerationID,
+		PublicationID:  state.Active.ID,
+		ManifestSHA256: state.Active.ManifestSHA256,
+	}
+	if err := writeCompletion(statePath, newComp); err != nil {
+		return "", err
+	}
+
+	// Remove request file last.
+	if err := os.Remove(requestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("remove request file: %w", err)
+	}
+
+	return action, nil
+}
+
+// loadTrustDomain loads the immutable trust-domain.json.
+func loadTrustDomain(statePath string) (trustDomainManifest, error) {
+	data, err := os.ReadFile(filepath.Join(statePath, "trust-domain.json"))
+	if err != nil {
+		return trustDomainManifest{}, err
+	}
+	var domain trustDomainManifest
+	if err := json.Unmarshal(data, &domain); err != nil {
+		return trustDomainManifest{}, err
+	}
+	return domain, nil
+}
+
+// publishTrustedRootLocked is the lock-free internal publish implementation.
+// The caller MUST hold the state lock.
+// publishTrustedRootLocked is the lock-free internal publish implementation.
+// The caller MUST hold the state lock.
+func publishTrustedRootLocked(
+	statePath string,
+	hooks publicationHooks,
+) (repositoryAction, error) {
 	// Load and validate current trust generation.
 	bootstrap, err := loadActiveTrustGeneration(statePath)
 	if err != nil {
@@ -172,10 +301,6 @@ func publishTrustedRootUpdateWithHooks(
 	}
 
 	// Reject repeated invocation: this command is one-shot per trust domain.
-	// A second invocation would overwrite the prior standby key, violating
-	// "retain historical verification material by default." Accumulating
-	// arbitrary standby material is deferred to Steps 9-13 which introduce
-	// real rotating keys with stable unique identities.
 	if bootstrap.Generation > 1 {
 		return "", fmt.Errorf(
 			"publish-trusted-root already completed (generation %d); "+
@@ -226,8 +351,6 @@ func publishTrustedRootUpdateWithHooks(
 	}
 
 	// Publish the new targets through the existing transactional framework.
-	// Pass both old and new fingerprints since the generation advance changes
-	// the source fingerprint, and the previous publication needs the old one.
 	if err := publishNewTargets(layout, state, newGenPath, newBootstrap, sourceFingerprint, newSourceFingerprint, hooks); err != nil {
 		return "", fmt.Errorf("publish new targets: %w", err)
 	}
@@ -238,6 +361,27 @@ func publishTrustedRootUpdateWithHooks(
 	}
 
 	return repositoryActionPublished, nil
+}
+
+// publishTrustedRootUpdate advances the trust generation by adding inactive
+// standby verification material, then publishes new TUF targets that contain
+// both old and new verification entries. SigningConfig routing remains unchanged.
+// This is the additive trust publication primitive used before any signer is
+// activated (Steps 9-13).
+func publishTrustedRootUpdate(statePath string) (repositoryAction, error) {
+	return publishTrustedRootUpdateWithHooks(statePath, publicationHooks{})
+}
+
+func publishTrustedRootUpdateWithHooks(
+	statePath string,
+	hooks publicationHooks,
+) (repositoryAction, error) {
+	stateLock, err := acquireStateLock(statePath, 30*time.Second, "tuf-publish-trusted-root")
+	if err != nil {
+		return "", err
+	}
+	defer stateLock.release()
+	return publishTrustedRootLocked(statePath, hooks)
 }
 
 // advanceTrustGeneration creates a new generation N+1 that contains all

@@ -184,6 +184,43 @@ func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
 	}, nil
 }
 
+// loadBootstrapFromGeneration constructs a bootstrapManifest from a generation
+// directory for fingerprint computation. Used for prior-generation fingerprint
+// derivation during recovery validation.
+func loadBootstrapFromGeneration(statePath, generationPath, generationID string) (bootstrapManifest, error) {
+	manifestPath := filepath.Join(generationPath, "manifest.json")
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return bootstrapManifest{}, err
+	}
+	var gen generationManifest
+	if err := json.Unmarshal(manifestBytes, &gen); err != nil {
+		return bootstrapManifest{}, err
+	}
+	domainPath := filepath.Join(statePath, "trust-domain.json")
+	domainBytes, err := os.ReadFile(domainPath)
+	if err != nil {
+		return bootstrapManifest{}, err
+	}
+	var domain trustDomainManifest
+	if err := json.Unmarshal(domainBytes, &domain); err != nil {
+		return bootstrapManifest{}, err
+	}
+	return bootstrapManifest{
+		SchemaVersion:        4,
+		CreatedAtUTC:         gen.CreatedAtUTC,
+		FulcioRootSHA256:     gen.FulcioRootSHA256,
+		CtLogPublicKeySHA256: gen.CtLogPublicKeySHA256,
+		RekorPublicKeySHA256: gen.RekorPublicKeySHA256,
+		TsaRootSHA256:        gen.TsaRootSHA256,
+		TsaLeafSHA256:        gen.TsaLeafSHA256,
+		OIDCKeyID:            gen.OIDCKeyID,
+		TrustDomainID:        domain.TrustDomainID,
+		Generation:           gen.Generation,
+		GenerationID:         generationID,
+	}, nil
+}
+
 func validateGenerationState(
 	statePath string,
 	generationPath string,

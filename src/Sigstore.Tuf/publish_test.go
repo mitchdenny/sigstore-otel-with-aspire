@@ -676,7 +676,12 @@ func TestCrossGenRejectsTamperedDomainInPreparingForward(t *testing.T) {
 // writeTestPublishRequest creates a schema-versioned request file with unique ID.
 func writeTestPublishRequest(t *testing.T, statePath, opID string) {
 	t.Helper()
-	req := publishRequest{SchemaVersion: 1, OperationID: opID}
+	// Load trust domain ID from state for the request.
+	domain, err := loadTrustDomain(statePath)
+	if err != nil {
+		t.Fatalf("load trust domain for request: %v", err)
+	}
+	req := publishRequest{SchemaVersion: 1, OperationID: opID, TrustDomainID: domain.TrustDomainID}
 	data, _ := json.Marshal(req)
 	if err := os.WriteFile(filepath.Join(statePath, publishRequestFile), data, 0o644); err != nil {
 		t.Fatal(err)
