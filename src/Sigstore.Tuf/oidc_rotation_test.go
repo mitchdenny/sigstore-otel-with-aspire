@@ -25,6 +25,7 @@ func TestOIDCRotationAppendsKeysAndPreservesImmutableHistory(t *testing.T) {
 		t.Fatalf("first action = %q, want %q", action, repositoryActionPublished)
 	}
 	assertOIDCRotationGeneration(t, statePath, 2, 2, first.OperationID)
+	assertGenerationManifestReadOnly(t, statePath, "generation-00000002")
 	if current := readTree(t, filepath.Join(
 		statePath,
 		"generations",
@@ -40,6 +41,7 @@ func TestOIDCRotationAppendsKeysAndPreservesImmutableHistory(t *testing.T) {
 		t.Fatalf("second action = %q, want %q", action, repositoryActionPublished)
 	}
 	assertOIDCRotationGeneration(t, statePath, 3, 3, second.OperationID)
+	assertGenerationManifestReadOnly(t, statePath, "generation-00000003")
 	if current := readTree(t, filepath.Join(
 		statePath,
 		"generations",

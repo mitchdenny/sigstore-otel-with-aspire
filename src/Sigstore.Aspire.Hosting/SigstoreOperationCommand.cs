@@ -22,6 +22,7 @@ internal static class SigstoreOperationCommand
     public const string RotateOidcSigningKeyCommand = "rotate-oidc-signing-key";
     public const string RotateTimestampAuthorityCommand =
         "rotate-timestamp-authority";
+    public const string RotateFulcioCaCommand = "rotate-fulcio-ca";
 
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
@@ -221,6 +222,18 @@ internal static class SigstoreOperationCommand
                 : ResourceCommandState.Disabled;
     }
 
+    internal static ResourceCommandState GetFulcioRotationCommandState(
+        SigstoreResource resource)
+    {
+        var presentation = resource.GetPresentation();
+        return presentation.Operation is null
+            && presentation.RuntimeHealth.State == "Healthy"
+            && (presentation.Recovery is null
+                || presentation.Recovery.Command == RotateFulcioCaCommand)
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
     internal static ExecuteCommandResult CreateResult(
         SigstoreOperationResult result)
     {
@@ -239,7 +252,7 @@ internal static class SigstoreOperationCommand
     }
 }
 
-internal sealed class SigstoreOperationExecutor(
+internal sealed partial class SigstoreOperationExecutor(
     SigstoreResource resource,
     ISigstoreOperationRuntime runtime,
     ISigstoreStateInspector stateInspector,
@@ -5146,6 +5159,8 @@ internal sealed class SigstoreOperationExecutor(
             set;
         }
 
+        public FulcioRotationEvidence? FulcioRotation { get; set; }
+
         public bool HasFailures => Errors.Count != 0;
 
         public async Task ReportAsync(
@@ -5240,7 +5255,8 @@ internal sealed class SigstoreOperationExecutor(
                     CommittedStatePreserved,
                     Errors,
                     OidcRotation,
-                    TimestampAuthorityRotation));
+                    TimestampAuthorityRotation,
+                    FulcioRotation));
     }
 }
 
@@ -5490,6 +5506,37 @@ internal interface ISigstoreOperationRuntime
                 trustedAuthorities,
             CancellationToken cancellationToken);
 
+    Task<SigstoreFulcioStatus> ReadFulcioStatusAsync(
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+
+    Task<SigstoreFulcioIssuanceProof> ProveFulcioIssuanceAsync(
+        string oidcToken,
+        string subject,
+        string expectedRootSha256,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+
+    Task<SigstoreCtCheckpoint> ReadCtCheckpointAsync(
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+
+    Task<long> ReadArtifactHeadAsync(
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+
+    Task<SigstoreArtifactEvidence> FindArtifactAsync(
+        long minimumExclusiveId,
+        string expectedRootSha256,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+
+    Task<SigstoreClientArtifactVerification> VerifyArtifactAsync(
+        SigstoreClientRegistration client,
+        SigstoreArtifactEvidence artifact,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+
     Task PublishParentStateAsync(SigstoreResource resource);
 }
 
@@ -5581,6 +5628,102 @@ internal sealed class AspireSigstoreOperationRuntime
                 response,
                 trustedAuthorities));
     }
+
+    public async Task<SigstoreFulcioStatus> ReadFulcioStatusAsync(
+        CancellationToken cancellationToken)
+    {
+        var fulcio = await _resource.Components.Fulcio
+            .GetEndpoint("http")
+            .GetValueAsync(cancellationToken)
+            ?? throw new InvalidOperationException(
+                "The Fulcio endpoint is not allocated.");
+        return await SigstoreFulcio.ReadStatusAsync(
+            _resource.StatePath,
+            new Uri(fulcio, UriKind.Absolute),
+            cancellationToken);
+    }
+
+    public async Task<SigstoreFulcioIssuanceProof>
+        ProveFulcioIssuanceAsync(
+            string oidcToken,
+            string subject,
+            string expectedRootSha256,
+            CancellationToken cancellationToken)
+    {
+        var endpoint = await _resource.Components.Fulcio
+            .GetEndpoint("http")
+            .GetValueAsync(cancellationToken)
+            ?? throw new InvalidOperationException(
+                "The Fulcio endpoint is not allocated.");
+        using var root = SigstoreFulcio.ReadRootByFingerprint(
+            _resource.StatePath,
+            expectedRootSha256);
+        using var ctKey = SigstoreFulcio.ReadCtPublicKey(
+            _resource.StatePath);
+        return await SigstoreFulcio.ProveIssuanceAsync(
+            new Uri(endpoint, UriKind.Absolute),
+            oidcToken,
+            subject,
+            root,
+            ctKey,
+            cancellationToken);
+    }
+
+    public Task<SigstoreCtCheckpoint> ReadCtCheckpointAsync(
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var ctKey = SigstoreFulcio.ReadCtPublicKey(
+            _resource.StatePath);
+        return Task.FromResult(
+            SigstoreFulcio.ReadCheckpoint(
+                _resource.StatePath,
+                ctKey));
+    }
+
+    public async Task<long> ReadArtifactHeadAsync(
+        CancellationToken cancellationToken)
+    {
+        var endpoint = await _resource.ArtifactStoreEndpoint.GetValueAsync(
+            cancellationToken)
+            ?? throw new InvalidOperationException(
+                "The artifact-store endpoint is not allocated.");
+        return await SigstoreArtifact.ReadHeadAsync(
+            new Uri(endpoint, UriKind.Absolute),
+            cancellationToken);
+    }
+
+    public async Task<SigstoreArtifactEvidence> FindArtifactAsync(
+        long minimumExclusiveId,
+        string expectedRootSha256,
+        CancellationToken cancellationToken)
+    {
+        var endpoint = await _resource.ArtifactStoreEndpoint.GetValueAsync(
+            cancellationToken)
+            ?? throw new InvalidOperationException(
+                "The artifact-store endpoint is not allocated.");
+        using var root = SigstoreFulcio.ReadRootByFingerprint(
+            _resource.StatePath,
+            expectedRootSha256);
+        using var ctKey = SigstoreFulcio.ReadCtPublicKey(
+            _resource.StatePath);
+        return await SigstoreArtifact.FindLatestForRootAsync(
+            new Uri(endpoint, UriKind.Absolute),
+            minimumExclusiveId,
+            root,
+            ctKey,
+            SigstoreDefaults.ExpectedIdentity,
+            cancellationToken);
+    }
+
+    public Task<SigstoreClientArtifactVerification> VerifyArtifactAsync(
+        SigstoreClientRegistration client,
+        SigstoreArtifactEvidence artifact,
+        CancellationToken cancellationToken) =>
+        SigstoreArtifact.VerifyWithClientAsync(
+            client,
+            artifact,
+            cancellationToken);
 
     public async Task<SigstoreResourceInstanceSnapshot> WaitForSnapshotAsync(
         IResource resource,
@@ -5679,6 +5822,22 @@ internal interface ISigstoreStateInspector
     string ReadTrustStateFingerprint(string statePath);
 
     string ReadTrustMaterialFingerprint(string statePath);
+
+    FulcioCaMaterialInfo EnsureFulcioCaRotationCandidate(
+        string candidatePath) =>
+        SigstoreStateBootstrapper.EnsureFulcioCaRotationCandidate(
+            candidatePath);
+
+    FulcioRuntimeProjectionInfo ActivateFulcioRuntimeProjection(
+        string statePath,
+        string operationId,
+        string priorFulcioRootSha256,
+        string newFulcioRootSha256) =>
+        SigstoreStateBootstrapper.ActivateFulcioRuntimeProjection(
+            statePath,
+            operationId,
+            priorFulcioRootSha256,
+            newFulcioRootSha256);
 }
 
 internal sealed class SigstoreFileStateInspector : ISigstoreStateInspector
@@ -5766,4 +5925,5 @@ internal sealed record SigstoreOperationResult(
     bool? CommittedStatePreserved,
     IReadOnlyList<SigstoreOperationError> Errors,
     OidcRotationEvidence? OidcRotation = null,
-    TimestampAuthorityRotationEvidence? TimestampAuthorityRotation = null);
+    TimestampAuthorityRotationEvidence? TimestampAuthorityRotation = null,
+    FulcioRotationEvidence? FulcioRotation = null);

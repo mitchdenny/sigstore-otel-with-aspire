@@ -62,6 +62,7 @@ builder.Services
 builder.Services.AddSingleton(options);
 builder.Services.AddSingleton(artifactStoreClient);
 builder.Services.AddSingleton(sigstoreRuntime);
+builder.Services.AddSingleton<ArtifactVerificationService>();
 builder.Services.AddHostedService<TrustStatusInitializer>();
 builder.Services.AddHostedService<ArtifactProducer>();
 builder.Services.AddHostedService<ArtifactValidator>();
@@ -87,6 +88,42 @@ app.MapGet(
                 error = "trust initialization has not completed"
             },
             statusCode: StatusCodes.Status503ServiceUnavailable));
+app.MapGet(
+    "/artifacts/{id:long}/verify",
+    async (
+        long id,
+        ArtifactVerificationService verifier,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            return Results.Ok(
+                await verifier.VerifyAsync(
+                    id,
+                    cancellationToken));
+        }
+        catch (ArtifactNotReadyException exception)
+        {
+            return Results.Json(
+                new { error = exception.Message },
+                statusCode: 425);
+        }
+        catch (ArtifactMissingException exception)
+        {
+            return Results.NotFound(
+                new { error = exception.Message });
+        }
+        catch (Exception exception)
+            when (exception is InvalidDataException
+                or InvalidOperationException
+                or JsonException
+                or CryptographicException
+                or HttpRequestException)
+        {
+            return Results.UnprocessableEntity(
+                new { error = exception.Message });
+        }
+    });
 
 await app.RunAsync();
 
@@ -209,7 +246,7 @@ internal sealed class ArtifactProducer(
 internal sealed class ArtifactValidator(
     DemoOptions options,
     ArtifactStoreClient artifactStore,
-    SigstoreRuntime sigstore,
+    ArtifactVerificationService verifier,
     ILogger<ArtifactValidator> logger) : BackgroundService
 {
     private const int MaximumPendingAttempts = 5;
@@ -315,58 +352,17 @@ internal sealed class ArtifactValidator(
     private async Task<bool> TryValidateNextAsync(
         CancellationToken cancellationToken)
     {
-        var artifact = await artifactStore.DownloadArtifactAsync(
-            nextArtifactId,
-            cancellationToken);
-        if (artifact is null)
-        {
-            throw new ArtifactMissingException(
-                nextArtifactId,
-                "artifact content");
-        }
-
-        var bundleJson = await artifactStore.DownloadSignatureAsync(
-            nextArtifactId,
-            cancellationToken);
-        if (bundleJson is null)
-        {
-            throw new ArtifactMissingException(
-                nextArtifactId,
-                "artifact signature");
-        }
-
         using var activity = DemoTelemetry.Source.StartActivity(
             "artifact.validate",
             ActivityKind.Consumer);
         activity?.SetTag("artifact.id", nextArtifactId);
-        activity?.SetTag("artifact.size", artifact.Length);
         activity?.SetTag("client.language", "dotnet");
 
-        var bundle = SigstoreBundle.Deserialize(bundleJson);
-        await using var artifactStream = new MemoryStream(
-            artifact,
-            writable: false);
-        var (success, result) =
-            await sigstore.Verifier.TryVerifyStreamAsync(
-                artifactStream,
-                bundle,
-                sigstore.VerificationPolicy,
-                cancellationToken);
-
-        if (!success)
-        {
-            var reason =
-                result?.FailureReason
-                ?? "No failure reason was returned.";
-            activity?.SetStatus(
-                ActivityStatusCode.Error,
-                reason);
-            logger.LogError(
-                "Signature verification failed for artifact {ArtifactId}: {Reason}",
-                nextArtifactId,
-                reason);
-            return false;
-        }
+        var evidence = await verifier.VerifyAsync(
+            nextArtifactId,
+            cancellationToken);
+        activity?.SetTag("artifact.sha256", evidence.ArtifactSha256);
+        activity?.SetTag("bundle.sha256", evidence.BundleSha256);
 
         DemoTelemetry.ArtifactsVerified.Add(
             1,
@@ -374,9 +370,9 @@ internal sealed class ArtifactValidator(
                 "client.language",
                 "dotnet"));
         logger.LogInformation(
-            "Validated artifact {ArtifactId} ({ArtifactSize} bytes).",
+            "Validated artifact {ArtifactId} ({ArtifactSha256}).",
             nextArtifactId,
-            artifact.Length);
+            evidence.ArtifactSha256);
         return true;
     }
 
@@ -411,6 +407,84 @@ internal sealed class ArtifactValidator(
             reason);
     }
 }
+
+internal sealed class ArtifactVerificationService(
+    ArtifactStoreClient artifactStore,
+    SigstoreRuntime sigstore)
+{
+    public async Task<ArtifactVerificationEvidence> VerifyAsync(
+        long artifactId,
+        CancellationToken cancellationToken)
+    {
+        if (artifactId <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(artifactId),
+                "Artifact ID must be positive.");
+        }
+
+        var artifact = await artifactStore.DownloadArtifactAsync(
+            artifactId,
+            cancellationToken)
+            ?? throw new ArtifactMissingException(
+                artifactId,
+                "artifact content");
+        var bundleJson = await artifactStore.DownloadSignatureAsync(
+            artifactId,
+            cancellationToken)
+            ?? throw new ArtifactMissingException(
+                artifactId,
+                "artifact signature");
+        var trust = sigstore.TrustStatus
+            ?? throw new InvalidOperationException(
+                "Sigstore trust has not been initialized.");
+
+        var bundle = SigstoreBundle.Deserialize(bundleJson);
+        await using var artifactStream = new MemoryStream(
+            artifact,
+            writable: false);
+        var (success, result) =
+            await sigstore.Verifier.TryVerifyStreamAsync(
+                artifactStream,
+                bundle,
+                sigstore.VerificationPolicy,
+                cancellationToken);
+        if (!success)
+        {
+            throw new InvalidDataException(
+                result?.FailureReason
+                ?? "Signature verification failed without a reason.");
+        }
+
+        return new ArtifactVerificationEvidence(
+            1,
+            "dotnet-client",
+            "dotnet",
+            true,
+            artifactId,
+            Hash(artifact),
+            Hash(Encoding.UTF8.GetBytes(bundleJson)),
+            trust.Generation,
+            trust.GenerationId,
+            trust.TrustedRootSha256);
+    }
+
+    private static string Hash(ReadOnlySpan<byte> value) =>
+        Convert.ToHexString(SHA256.HashData(value))
+            .ToLowerInvariant();
+}
+
+internal sealed record ArtifactVerificationEvidence(
+    int SchemaVersion,
+    string Resource,
+    string Language,
+    bool Verified,
+    long ArtifactId,
+    string ArtifactSha256,
+    string BundleSha256,
+    int Generation,
+    string GenerationId,
+    string TrustedRootSha256);
 
 internal sealed class ArtifactStoreClient(
     HttpClient httpClient,

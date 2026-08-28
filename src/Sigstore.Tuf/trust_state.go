@@ -18,6 +18,11 @@ const (
 	trustTransitionSchemaVersion = 1
 	initialGeneration            = 1
 	initialGenerationID          = "generation-00000001"
+
+	// generationManifestMode matches the read-only mode the C# bootstrapper
+	// gives immutable generation manifests, so a generation written by this
+	// worker satisfies the same invariant when C# validates it.
+	generationManifestMode = 0o444
 )
 
 type trustDomainManifest struct {
@@ -53,6 +58,10 @@ type generationManifest struct {
 	TSAPriorGenerationID        string            `json:"tsaPriorGenerationId,omitempty"`
 	TSAPriorRootSHA256          string            `json:"tsaPriorRootSha256,omitempty"`
 	TSAPriorLeafSHA256          string            `json:"tsaPriorLeafSha256,omitempty"`
+	FulcioRotationOperationID   string            `json:"fulcioRotationOperationId,omitempty"`
+	FulcioPriorGeneration       int               `json:"fulcioPriorGeneration,omitempty"`
+	FulcioPriorGenerationID     string            `json:"fulcioPriorGenerationId,omitempty"`
+	FulcioPriorRootSHA256       string            `json:"fulcioPriorRootSha256,omitempty"`
 	Files                       map[string]string `json:"files"`
 }
 
@@ -77,6 +86,35 @@ type trustTransitionJournal struct {
 	TrustDomain               trustDomainManifest  `json:"trustDomain"`
 	CandidateManifest         generationManifest   `json:"candidateManifest"`
 	Failure                   *string              `json:"failure,omitempty"`
+}
+
+// writeGenerationManifest writes an immutable generation manifest and then
+// explicitly applies its read-only mode.
+//
+// The mode argument to os.WriteFile is only a creation hint: it is ignored
+// when the file already exists, and it is not honored at all by some
+// filesystems this state directory legitimately lives on — notably Docker
+// Desktop bind mounts on macOS, which materialize host files as 0644
+// regardless of what was requested. The C# bootstrapper enforces that
+// generation manifests are read-only, so the mode is corrected explicitly
+// here, before the manifest is validated and before the staged generation is
+// renamed into its committed location.
+func writeGenerationManifest(path string, data []byte) error {
+	if _, err := os.Stat(path); err == nil {
+		// An interrupted attempt can leave a read-only manifest behind.
+		if err := os.Chmod(path, 0o600); err != nil {
+			return fmt.Errorf("prepare generation manifest for rewrite: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect generation manifest: %w", err)
+	}
+	if err := os.WriteFile(path, data, generationManifestMode); err != nil {
+		return fmt.Errorf("write generation manifest: %w", err)
+	}
+	if err := os.Chmod(path, generationManifestMode); err != nil {
+		return fmt.Errorf("set generation manifest mode: %w", err)
+	}
+	return nil
 }
 
 func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
@@ -308,6 +346,9 @@ func validateGenerationState(
 	}
 	if err := validateTSAGenerationMaterial(generationPath, generation); err != nil {
 		return fmt.Errorf("validate TSA generation material: %w", err)
+	}
+	if err := validateFulcioGenerationMaterial(generationPath, generation); err != nil {
+		return fmt.Errorf("validate Fulcio generation material: %w", err)
 	}
 	ctState, err := os.ReadFile(filepath.Join(statePath, "data", "ctlog", "bootstrap-state"))
 	if err != nil {

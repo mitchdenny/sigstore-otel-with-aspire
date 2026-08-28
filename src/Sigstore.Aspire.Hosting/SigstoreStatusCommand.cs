@@ -102,7 +102,8 @@ public sealed record SigstoreAggregateTrustStatus(
     IReadOnlyList<SigstoreStatusError> Errors,
     SigstoreTimestampAuthorityStatus? TimestampAuthority = null,
     SigstoreActiveOperationStatus? Operation = null,
-    SigstoreRecoveryStatus? Recovery = null);
+    SigstoreRecoveryStatus? Recovery = null,
+    SigstoreFulcioStatus? Fulcio = null);
 
 internal sealed record PublishedTrustStatus(
     int SchemaVersion,
@@ -124,6 +125,10 @@ internal sealed record GenerationManifestStatus(
     int SourceSchemaVersion,
     string? SourceManifestSha256,
     string FulcioRootSha256,
+    string? FulcioRotationOperationId,
+    int FulcioPriorGeneration,
+    string? FulcioPriorGenerationId,
+    string? FulcioPriorRootSha256,
     string CtLogPublicKeySha256,
     string RekorPublicKeySha256,
     string TsaRootSha256,
@@ -241,6 +246,7 @@ internal static class SigstoreStatusCommand
         SigstoreDiskTrustStatus? disk = null;
         SigstoreServedTrustStatus? served = null;
         SigstoreTimestampAuthorityStatus? timestampAuthority = null;
+        SigstoreFulcioStatus? fulcio = null;
 
         try
         {
@@ -332,6 +338,69 @@ internal static class SigstoreStatusCommand
         {
             try
             {
+                var fulcioEndpoint = await resource.Components.Fulcio
+                    .GetEndpoint("http")
+                    .GetValueAsync(cancellationToken)
+                    ?? throw new SigstoreStatusException(
+                        "The Fulcio endpoint is not allocated.");
+                fulcio = await SigstoreFulcio.ReadStatusAsync(
+                    resource.StatePath,
+                    new Uri(fulcioEndpoint, UriKind.Absolute),
+                    cancellationToken);
+                if (!fulcio.ActiveCertificateMatchesPrivateKey)
+                {
+                    errors.Add(
+                        new(
+                            "fulcio",
+                            "the active Fulcio root certificate and key do not match."));
+                }
+                if (!fulcio.RuntimeFulcioMatchesActive)
+                {
+                    errors.Add(
+                        new(
+                            "fulcio",
+                            "activation is pending: the component runtime " +
+                            "projection does not match the active generation."));
+                }
+                if (!fulcio.LiveRootMatchesActive)
+                {
+                    errors.Add(
+                        new(
+                            "fulcio",
+                            "activation is pending: running root " +
+                            $"{fulcio.LiveRootSha256}, active generation " +
+                            $"{fulcio.ActiveRootSha256}."));
+                }
+                if (!fulcio.TesseractAcceptedRootsMatch)
+                {
+                    errors.Add(
+                        new(
+                            "tesseract",
+                            "the accepted-root bundle does not exactly match " +
+                            "the ordered Fulcio TrustedRoot history."));
+                }
+                if (fulcio.TrustedRoots.Count == 0
+                    || fulcio.TrustedRoots[^1].RootSha256
+                        != fulcio.ActiveRootSha256)
+                {
+                    errors.Add(
+                        new(
+                            "fulcio",
+                            "the active Fulcio root is not the final additive " +
+                            "TrustedRoot certificate authority."));
+                }
+            }
+            catch (Exception exception)
+                when (IsExpectedStatusFailure(exception))
+            {
+                errors.Add(new("fulcio", exception.Message));
+            }
+        }
+
+        if (disk is not null)
+        {
+            try
+            {
                 var trustedAuthorities =
                     SigstoreTimestampAuthority.ReadTrustedAuthorities(
                         resource.StatePath);
@@ -409,6 +478,7 @@ internal static class SigstoreStatusCommand
             && disk is not null
             && served is not null
             && timestampAuthority is not null
+            && fulcio is not null
             && clients.Count == registrations.Clients.Count;
         var reason = errors.Count == 0
             ? null
@@ -445,7 +515,8 @@ internal static class SigstoreStatusCommand
                     recovery.Phase,
                     recovery.DisplayState,
                     recovery.Message,
-                    recovery.UpdatedAtUtc));
+                    recovery.UpdatedAtUtc),
+            fulcio);
     }
 
     internal static SigstoreDiskTrustStatus ReadDiskStatus(string statePath)
@@ -522,6 +593,7 @@ internal static class SigstoreStatusCommand
         ValidateGenerationFiles(
             generationPath,
             generationManifest.Files);
+        ValidateFulcioRotationMetadata(generationManifest);
         ValidateTimestampRotationMetadata(generationManifest);
         var generationManifestHash = Hash(generationManifestBytes);
 
@@ -562,7 +634,13 @@ internal static class SigstoreStatusCommand
                 && generationManifest.OidcRotationOperationId is null
                 && (transition.Operation != "tsa-rotation"
                     || transition.TransitionId
-                        != generationManifest.TsaRotationOperationId))
+                        != generationManifest.TsaRotationOperationId)
+            || generationManifest.FulcioRotationOperationId is not null
+                && generationManifest.FulcioPriorGeneration
+                    == generationManifest.Generation - 1
+                && (transition.Operation != "fulcio-rotation"
+                    || transition.TransitionId
+                        != generationManifest.FulcioRotationOperationId))
         {
             throw new SigstoreStatusException(
                 "The active generation does not match the committed transition.");
@@ -815,6 +893,10 @@ internal static class SigstoreStatusCommand
             "transition",
             "migration"
         };
+        if (Directory.Exists(Path.Combine(statePath, "runtime")))
+        {
+            relativePaths.Add("runtime");
+        }
         if (includeTuf)
         {
             relativePaths.Add("tuf");
@@ -1169,6 +1251,14 @@ internal static class SigstoreStatusCommand
         && first.SourceSchemaVersion == second.SourceSchemaVersion
         && first.SourceManifestSha256 == second.SourceManifestSha256
         && first.FulcioRootSha256 == second.FulcioRootSha256
+        && first.FulcioRotationOperationId
+            == second.FulcioRotationOperationId
+        && first.FulcioPriorGeneration
+            == second.FulcioPriorGeneration
+        && first.FulcioPriorGenerationId
+            == second.FulcioPriorGenerationId
+        && first.FulcioPriorRootSha256
+            == second.FulcioPriorRootSha256
         && first.CtLogPublicKeySha256 == second.CtLogPublicKeySha256
         && first.RekorPublicKeySha256 == second.RekorPublicKeySha256
         && first.TsaRootSha256 == second.TsaRootSha256
@@ -1196,6 +1286,39 @@ internal static class SigstoreStatusCommand
         && first.TsaPriorLeafSha256
             == second.TsaPriorLeafSha256
         && DictionariesEqual(first.Files, second.Files);
+
+    private static void ValidateFulcioRotationMetadata(
+        GenerationManifestStatus generation)
+    {
+        if (generation.FulcioRotationOperationId is null)
+        {
+            if (generation.FulcioPriorGeneration != 0
+                || generation.FulcioPriorGenerationId is not null
+                || generation.FulcioPriorRootSha256 is not null)
+            {
+                throw new SigstoreStatusException(
+                    "The active generation has partial Fulcio rotation metadata.");
+            }
+            return;
+        }
+        if (!Guid.TryParseExact(
+                generation.FulcioRotationOperationId,
+                "N",
+                out _)
+            || generation.FulcioRotationOperationId.Any(char.IsUpper)
+            || generation.FulcioPriorGeneration
+                != generation.Generation - 1
+            || generation.FulcioPriorGenerationId
+                != $"generation-{generation.FulcioPriorGeneration:D8}"
+            || !IsLowerHexSha256(
+                generation.FulcioPriorRootSha256 ?? "")
+            || generation.FulcioPriorRootSha256
+                == generation.FulcioRootSha256)
+        {
+            throw new SigstoreStatusException(
+                "The active generation has invalid Fulcio rotation metadata.");
+        }
+    }
 
     private static void ValidateTimestampRotationMetadata(
         GenerationManifestStatus generation)

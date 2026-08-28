@@ -1,4 +1,4 @@
-import { randomBytes, randomInt } from 'node:crypto';
+import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -20,6 +20,10 @@ const REQUEST_TIMEOUT_MILLISECONDS = 30_000;
 const PRODUCE_INTERVAL_MILLISECONDS = 10_000;
 const POLL_INTERVAL_MILLISECONDS = 2_000;
 const MAXIMUM_PENDING_ATTEMPTS = 5;
+
+function sha256Hex(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
 
 class ArtifactProtocolError extends Error {}
 
@@ -223,6 +227,18 @@ async function validateArtifact(artifactID) {
     },
   );
   console.log(`Validated artifact ${artifactID} (${artifact.length} bytes).`);
+  return {
+    schemaVersion: 1,
+    resource: 'javascript-client',
+    language: 'javascript',
+    verified: true,
+    artifactId: artifactID,
+    artifactSha256: sha256Hex(artifact),
+    bundleSha256: sha256Hex(Buffer.from(bundleJSON)),
+    generation: trustStatus.generation,
+    generationId: trustStatus.generationId,
+    trustedRootSha256: trustStatus.trustedRootSha256,
+  };
 }
 
 async function skipArtifact(artifactID, reason, attempts) {
@@ -542,7 +558,42 @@ artifactStore = new ArtifactStore(config.artifactStoreURL);
   },
 ));
 
-const server = createServer((request, response) => {
+const server = createServer(async (request, response) => {
+  const requestURL = new URL(request.url ?? '/', 'http://localhost');
+  const verificationMatch =
+    /^\/artifacts\/([1-9][0-9]*)\/verify$/.exec(requestURL.pathname);
+  if (verificationMatch !== null) {
+    if (request.method !== 'GET') {
+      response.writeHead(405);
+      response.end();
+      return;
+    }
+    try {
+      const evidence = await validateArtifact(
+        Number.parseInt(verificationMatch[1], 10),
+      );
+      const body = JSON.stringify(evidence);
+      response.writeHead(200, {
+        'Content-Length': Buffer.byteLength(body),
+        'Content-Type': 'application/json',
+      });
+      response.end(body);
+    } catch (error) {
+      const body = JSON.stringify({
+        error: error instanceof Error ? error.message : String(error),
+      });
+      response.writeHead(
+        error instanceof ArtifactMissing ? 404 : 422,
+        {
+          'Content-Length': Buffer.byteLength(body),
+          'Content-Type': 'application/json',
+        },
+      );
+      response.end(body);
+    }
+    return;
+  }
+
   if (request.url === '/trust/status') {
     const ready = !stopController.signal.aborted && workersHealthy;
     const body = JSON.stringify({
@@ -552,6 +603,7 @@ const server = createServer((request, response) => {
         ? null
         : (lastWorkerError ?? 'client is stopping'),
     });
+
     response.writeHead(ready ? 200 : 503, {
       'Content-Length': Buffer.byteLength(body),
       'Content-Type': 'application/json',

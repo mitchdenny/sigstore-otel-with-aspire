@@ -135,6 +135,16 @@ func main() {
 		return
 	}
 
+	fulcioRotationRequest := filepath.Join(statePath, fulcioRotationRequestFile)
+	if pathExists(fulcioRotationRequest) {
+		action, err := dispatchFulcioRotation(statePath)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		fmt.Printf("%s Sigstore TUF repository at %s.\n", action, filepath.Join(statePath, "tuf"))
+		return
+	}
+
 	rotationRequest := filepath.Join(statePath, "rotate-root.request")
 	if pathExists(rotationRequest) {
 		action, err := rotateTUFRootKey(statePath)
@@ -765,8 +775,17 @@ func writeJSON(path string, value any, mode fs.FileMode) error {
 		return fmt.Errorf("marshal %s: %w", filepath.Base(path), err)
 	}
 	data = append(data, '\n')
+	// Immutable metadata is written read-only, so replace rather than reopen.
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("replace %s: %w", filepath.Base(path), err)
+	}
 	if err := os.WriteFile(path, data, mode); err != nil {
 		return fmt.Errorf("write %s: %w", filepath.Base(path), err)
+	}
+	// Creation mode is a hint only, and is not honored by every filesystem
+	// this state directory can live on, so apply it explicitly.
+	if err := os.Chmod(path, mode); err != nil {
+		return fmt.Errorf("set %s mode: %w", filepath.Base(path), err)
 	}
 	return nil
 }

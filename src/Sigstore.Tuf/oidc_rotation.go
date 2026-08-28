@@ -421,6 +421,10 @@ func rotateOidcGeneration(
 		TSAPriorGenerationID:        currentManifest.TSAPriorGenerationID,
 		TSAPriorRootSHA256:          currentManifest.TSAPriorRootSHA256,
 		TSAPriorLeafSHA256:          currentManifest.TSAPriorLeafSHA256,
+		FulcioRotationOperationID:   currentManifest.FulcioRotationOperationID,
+		FulcioPriorGeneration:       currentManifest.FulcioPriorGeneration,
+		FulcioPriorGenerationID:     currentManifest.FulcioPriorGenerationID,
+		FulcioPriorRootSHA256:       currentManifest.FulcioPriorRootSHA256,
 		Files:                       newFiles,
 	}
 
@@ -431,7 +435,7 @@ func rotateOidcGeneration(
 	}
 	manifestBytes = append(manifestBytes, '\n')
 	manifestPath := filepath.Join(stagingGenerationPath, "manifest.json")
-	if err := os.WriteFile(manifestPath, manifestBytes, 0o644); err != nil {
+	if err := writeGenerationManifest(manifestPath, manifestBytes); err != nil {
 		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("write OIDC rotation generation manifest: %w", err)
 	}

@@ -134,6 +134,14 @@ The trust-domain identity is separate from its active key generation:
 |       |-- old-response.tsr
 |       `-- candidate/public/           # public chain evidence retained
 |-- rotate-timestamp-authority.completed
+|-- fulcio-rotation/
+|   `-- <operation-id>/
+|       |-- command.json
+|       `-- candidate/public/fulcio/root.pem
+|-- rotate-fulcio-ca.completed
+|-- runtime/
+|   |-- fulcio/                         # active CA + CT public key only
+|   `-- tesseract/                      # CT private key + accepted roots only
 |-- migration/
 |   `-- bootstrap-manifest.schema-4.json  # migrated state only
 |-- data/
@@ -217,6 +225,11 @@ The initial protocol is deliberately small:
 - `GET /artifacts/{id}/signature` downloads the bundle only after sealing.
 - `GET /artifacts/head` returns `{"id": n}`, where `n` is the highest sealed
   artifact ID, or `0` when no artifacts have been sealed.
+- Every language client exposes
+  `GET /artifacts/{id}/verify` on its own local endpoint. It runs that
+  language's normal verifier and returns operation-bound artifact, bundle, trust
+  generation, and TrustedRoot hashes. Rotation commands use this endpoint for
+  deterministic cross-language evidence; it does not rewrite bundle bytes.
 
 An unknown ID returns `404 Not Found`. An existing reservation that has not yet
 been sealed returns `425 Too Early` with `Retry-After: 2`; validators honor that
@@ -333,6 +346,13 @@ after an interrupted mutation it includes the durable recovery phase. A
 running old signer against already-published additive trust is reported
 explicitly as activation pending rather than Healthy.
 
+The `fulcio` payload validates the active root certificate/key pair, every
+ordered historical Fulcio CA in TrustedRoot, the component-scoped runtime
+projection, Tesseract's deterministic accepted-root bundle, the root reported
+by Fulcio's read-only API, the unchanged CT key/log ID, and a signed CT
+checkpoint. The parent is not Healthy while disk, served TUF, clients,
+Tesseract roots, or the live Fulcio issuer disagree.
+
 The parent state is event-driven and aggregates all 14 long-running resources:
 the seven Sigstore services, `shady-blob-store`, and six clients. It shows
 **Healthy** only when all 14 are running and healthy, **Starting** while initial
@@ -342,7 +362,7 @@ the parent to **Healthy** without changing trust state.
 
 ## Dashboard operations
 
-The parent also exposes six confirmed, progress-reporting operations in the
+The parent also exposes seven confirmed, progress-reporting operations in the
 dashboard and through the Aspire CLI:
 
 ```bash
@@ -352,6 +372,7 @@ aspire resource sigstore rotate-tuf-root | jq
 aspire resource sigstore publish-trusted-root | jq
 aspire resource sigstore rotate-oidc-signing-key | jq
 aspire resource sigstore rotate-timestamp-authority | jq
+aspire resource sigstore rotate-fulcio-ca | jq
 ```
 
 `refresh-tuf` starts a new instance of the existing `tuf-bootstrap` one-shot
@@ -529,3 +550,71 @@ old-TSA artifact `315` and new-TSA artifact `382`; Python required a targeted
 verification in its restarted container because its normal sequential worker
 remained visibly blocked by the known omitted-index-zero bundle parsing issue.
 Rotation does not rewrite that bundle or use a public Sigstore fallback.
+
+## Fulcio CA Rotation (Step 11)
+
+`rotate-fulcio-ca` replaces the local file CA without creating a verification
+or CT-acceptance gap:
+
+```bash
+aspire resource sigstore rotate-fulcio-ca
+```
+
+The confirmed command is non-cancelable after its durable request is written.
+It retains an old-CA artifact and CT checkpoint, generates an operation-bound
+ECDSA P-256 CA candidate, and starts the existing one-shot TUF worker. The
+worker commits immutable generation N+1, appends the new CA to TrustedRoot,
+replaces the active `fulcio_v1.crt.pem` alias, rebuilds only the combined client
+trust/status targets, and advances targets, snapshot, and timestamp through the
+normal preparing/committed publication transaction. TUF root/bootstrap,
+SigningConfig routes, CT/Rekor/TSA/standby entries, and every non-Fulcio
+generation byte remain unchanged.
+
+Activation is deliberately split from publication:
+
+1. All six clients restart in sorted resource-name order and report the
+   additive N+1 trust.
+2. The retained old-CA artifact is verified through each language's normal
+   verifier.
+3. Tesseract restarts exactly once with the deterministic old-then-new accepted
+   root bundle.
+4. Fulcio remains on its old in-memory signer and obtains a cryptographically
+   verified embedded SCT from that replacement Tesseract instance.
+5. Only then is the operation-bound Fulcio runtime projection promoted and
+   Fulcio restarted exactly once.
+6. Real new-CA issuance must chain to the candidate and carry an SCT signed by
+   the unchanged CT log key. A later artifact containing Rekor and RFC3161
+   material must validate in all six languages before success.
+
+Fulcio and Tesseract no longer mount replaceable generation subtrees or the
+whole private state root. `runtime/fulcio` contains exactly the active
+certificate, encrypted key, password, and CT public key.
+`runtime/tesseract` contains exactly its unchanged CT private key and the
+ordered accepted-root bundle. Both are stable real directories, so a child
+restart reopens switched bytes without exposing unrelated private keys.
+
+Candidate generation, immutable generation commit, TUF preparation/commit,
+generation switch, each client, Tesseract restart, old-CA SCT proof, Fulcio
+runtime promotion/restart, new-CA SCT proof, both six-language artifact proofs,
+CT checkpoint, and final completion are durable replay boundaries. Before the
+old-CA overlap proof, the active Fulcio runtime remains on the old issuer.
+After promotion, recovery only proceeds forward. A mismatched operation,
+generation, root, runtime projection, container identity, CT key/checkpoint,
+artifact hash, or publication is rejected rather than guessed.
+
+The known Python omitted-index-zero bundle issue remains visible and is not
+normalized or masked. The targeted verification endpoint uses the same
+generation-pinned Python verifier and is used only to prove the selected old
+and new artifacts directly.
+
+Focused validation passes all 63 Bootstrap tests and 32 Hosting tests, the
+uncached TUF/Go suite and `go vet`, AppHost and .NET client builds, Go,
+JavaScript, Python-container, Java-container, and Rust client gates, and
+`git diff --check`. A non-isolated recovery run completed generation 1 to 2
+with all 33 structured postconditions passing: Tesseract and Fulcio each
+changed exactly once after six sorted client replacements, protected services
+kept their identities, the CT log ID/origin remained unchanged while its tree
+advanced, and old artifact 14 plus new artifact 70 passed all six targeted
+native verifiers. Dynamic fingerprints and container IDs are run-scoped and
+are reported with the validation commit rather than treated as static
+configuration.

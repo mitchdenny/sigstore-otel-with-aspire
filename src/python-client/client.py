@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
 import signal
 import sys
@@ -460,12 +461,14 @@ class ArtifactValidator:
         stop_event: threading.Event,
         artifact_store: ArtifactStoreClient,
         verifier: Verifier,
+        trust_status: dict[str, object],
         telemetry: Telemetry,
     ) -> None:
         self._config = config
         self._stop_event = stop_event
         self._artifact_store = artifact_store
         self._verifier = verifier
+        self._trust_status = trust_status
         self._policy = Identity(
             identity=config.expected_identity,
             issuer=config.expected_issuer,
@@ -540,6 +543,22 @@ class ArtifactValidator:
             self._stop_event.wait(retry_after_seconds)
 
     def _try_validate(self, artifact_id: int) -> bool:
+        evidence = self.verify_artifact(artifact_id)
+
+        self._telemetry.artifacts_verified.add(
+            1,
+            {"client.language": "python"},
+        )
+        self._logger.info(
+            "Validated artifact %s (%s).",
+            artifact_id,
+            evidence["artifactSha256"],
+        )
+        return True
+
+    def verify_artifact(self, artifact_id: int) -> dict[str, object]:
+        if artifact_id <= 0:
+            raise ArtifactProtocolError("Artifact ID must be positive.")
         artifact = self._artifact_store.download_artifact(artifact_id)
         if artifact is None:
             raise ArtifactMissing(
@@ -570,16 +589,22 @@ class ArtifactValidator:
                 self._policy,
             )
 
-        self._telemetry.artifacts_verified.add(
-            1,
-            {"client.language": "python"},
-        )
-        self._logger.info(
-            "Validated artifact %s (%s bytes).",
-            artifact_id,
-            len(artifact),
-        )
-        return True
+        return {
+            "schemaVersion": 1,
+            "resource": "python-client",
+            "language": "python",
+            "verified": True,
+            "artifactId": artifact_id,
+            "artifactSha256": hashlib.sha256(artifact).hexdigest(),
+            "bundleSha256": hashlib.sha256(
+                bundle_json.encode("utf-8")
+            ).hexdigest(),
+            "generation": self._trust_status["generation"],
+            "generationId": self._trust_status["generationId"],
+            "trustedRootSha256": self._trust_status[
+                "trustedRootSha256"
+            ],
+        }
 
     def _skip_artifact(
         self,
@@ -614,9 +639,53 @@ class HealthHandler(BaseHTTPRequestHandler):
     stop_event: threading.Event
     workers: list[threading.Thread]
     trust_status: dict[str, object]
+    artifact_validator: ArtifactValidator
     last_error: str | None = None
 
     def do_GET(self) -> None:
+        verification_match = re.fullmatch(
+            r"/artifacts/([1-9][0-9]*)/verify",
+            self.path,
+        )
+        if verification_match is not None:
+            try:
+                payload = self.artifact_validator.verify_artifact(
+                    int(verification_match.group(1))
+                )
+                body = json.dumps(
+                    payload,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                status = HTTPStatus.OK
+            except ArtifactMissing as exception:
+                body = json.dumps(
+                    {"error": str(exception)},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                status = HTTPStatus.NOT_FOUND
+            except (
+                ArtifactNotReady,
+                ArtifactProtocolError,
+                OSError,
+                requests.RequestException,
+                SigstoreError,
+                ValueError,
+            ) as exception:
+                body = json.dumps(
+                    {"error": str(exception)},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                status = HTTPStatus.UNPROCESSABLE_ENTITY
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if self.path == "/trust/status":
             ready = (
                 not self.stop_event.is_set()
@@ -911,6 +980,7 @@ def main() -> int:
             stop_event,
             artifact_store,
             verifier,
+            trust_status,
             telemetry,
         )
         workers = [
@@ -927,6 +997,7 @@ def main() -> int:
         HealthHandler.stop_event = stop_event
         HealthHandler.workers = workers
         HealthHandler.trust_status = trust_status
+        HealthHandler.artifact_validator = validator
         health_server = ThreadingHTTPServer(
             ("0.0.0.0", config.port),
             HealthHandler,

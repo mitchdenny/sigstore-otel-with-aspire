@@ -31,6 +31,14 @@ public static class SigstoreResourceBuilderExtensions
         var activePublicPath = Path.Combine(
             activeGenerationPath,
             "public");
+        var fulcioRuntimePath = Path.Combine(
+            statePath,
+            "runtime",
+            "fulcio");
+        var tesseractRuntimePath = Path.Combine(
+            statePath,
+            "runtime",
+            "tesseract");
 
         var parent = builder
             .AddResource(
@@ -121,6 +129,16 @@ public static class SigstoreResourceBuilderExtensions
                         context),
                 commandOptions:
                     SigstoreTimestampAuthorityRotationCommand.CreateOptions(
+                        parent.Resource))
+            .WithCommand(
+                name: SigstoreOperationCommand.RotateFulcioCaCommand,
+                displayName: "Rotate Fulcio CA",
+                executeCommand: context =>
+                    SigstoreFulcioRotationCommand.ExecuteAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreFulcioRotationCommand.CreateOptions(
                         parent.Resource))
             .OnInitializeResource(
                (resource, context, cancellationToken) =>
@@ -222,22 +240,18 @@ public static class SigstoreResourceBuilderExtensions
                 "v0.1.2")
             .WithContainerRuntimeArgs("--user", "root")
             .WithBindMount(
-                activePrivatePath,
-                "/var/lib/sigstore/private",
+                tesseractRuntimePath,
+                "/var/lib/sigstore/tesseract",
                 isReadOnly: true)
             .WithBindMount(
-                activePublicPath,
-                "/var/lib/sigstore/public",
-                isReadOnly: true)
-            .WithBindMount(
-                Path.Combine(statePath, "data"),
-                "/var/lib/sigstore/data")
+                Path.Combine(statePath, "data", "ctlog"),
+                "/var/lib/sigstore/data/ctlog")
             .WithArgs(
-                "--private_key=/var/lib/sigstore/private/ctlog/privkey.pem",
+                "--private_key=/var/lib/sigstore/tesseract/privkey.pem",
                 // The origin is the signed log identity; its endpoint port is separate.
                 "--origin=tesseract-sigstore.dev.localhost",
                 "--storage_dir=/var/lib/sigstore/data/ctlog",
-                "--roots_pem_file=/var/lib/sigstore/public/fulcio/root.pem",
+                "--roots_pem_file=/var/lib/sigstore/tesseract/accepted-roots.pem",
                 "--ext_key_usages=CodeSigning",
                 "--http_endpoint=0.0.0.0:6962",
                 "--slog_level=1")
@@ -266,12 +280,8 @@ public static class SigstoreResourceBuilderExtensions
                 "--add-host",
                 "oidc-sigstore.dev.localhost:host-gateway")
             .WithBindMount(
-                activePrivatePath,
-                "/var/lib/sigstore/private",
-                isReadOnly: true)
-            .WithBindMount(
-                activePublicPath,
-                "/var/lib/sigstore/public",
+                fulcioRuntimePath,
+                "/var/lib/sigstore/fulcio",
                 isReadOnly: true)
             .WithBindMount(
                 Path.Combine(
@@ -287,15 +297,15 @@ public static class SigstoreResourceBuilderExtensions
                 "--grpc-host=0.0.0.0",
                 "--grpc-port=5554",
                 "--ca=fileca",
-                "--fileca-cert=/var/lib/sigstore/public/fulcio/root.pem",
-                "--fileca-key=/var/lib/sigstore/private/fulcio/root.key",
+                "--fileca-cert=/var/lib/sigstore/fulcio/root.pem",
+                "--fileca-key=/var/lib/sigstore/fulcio/root.key",
                 "--fileca-watch=false",
                 "--ct-log-url",
                 tesseract.GetEndpoint(
                     "http",
                     KnownNetworkIdentifiers.DefaultAspireContainerNetwork),
                 "--ct-log-origin=tesseract-sigstore.dev.localhost",
-                "--ct-log-public-key-path=/var/lib/sigstore/public/ctlog/pubkey.pem",
+                "--ct-log-public-key-path=/var/lib/sigstore/fulcio/ctlog.pub",
                 "--config-path=/etc/fulcio-config/config.yaml")
             .WithDeveloperCertificateTrust(true)
             .WithHttpEndpoint(
@@ -519,6 +529,21 @@ public static class SigstoreResourceBuilderExtensions
         ArgumentNullException.ThrowIfNull(requiredResource);
 
         sigstore.Resource.RegisterRequiredResource(requiredResource.Resource);
+        return sigstore;
+    }
+
+    public static IResourceBuilder<SigstoreResource> WithArtifactStore(
+        this IResourceBuilder<SigstoreResource> sigstore,
+        IResourceBuilder<ContainerResource> artifactStore,
+        string endpointName = "http")
+    {
+        ArgumentNullException.ThrowIfNull(sigstore);
+        ArgumentNullException.ThrowIfNull(artifactStore);
+        ArgumentException.ThrowIfNullOrWhiteSpace(endpointName);
+
+        sigstore.Resource.SetArtifactStore(
+            artifactStore.Resource,
+            artifactStore.GetEndpoint(endpointName));
         return sigstore;
     }
 

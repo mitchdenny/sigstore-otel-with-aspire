@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Sigstore.Bootstrap;
 
@@ -65,10 +66,30 @@ internal static partial class SigstoreStateBootstrapper
         TsaCertificateChainPath
     ];
 
+    private static readonly string[] FulcioRotationCandidateFiles =
+    [
+        FulcioPrivateKeyPath,
+        FulcioPrivateKeyPasswordPath,
+        FulcioRootCertificatePath
+    ];
+
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
         {
             WriteIndented = true
+        };
+
+    /// <summary>
+    /// Options for reading trust metadata that either the C# bootstrapper or
+    /// the Go worker may have written. Unknown members are rejected so
+    /// injected fields cannot ride along unnoticed, but no constraint is
+    /// placed on property order or on whether absent optional members were
+    /// emitted as explicit nulls.
+    /// </summary>
+    private static readonly JsonSerializerOptions PortableJsonOptions =
+        new(JsonSerializerDefaults.Web)
+        {
+            UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
         };
 
     public static BootstrapResult EnsureInitialized(string statePath)
@@ -449,6 +470,217 @@ internal static partial class SigstoreStateBootstrapper
         return ValidateTimestampAuthority(candidatePath);
     }
 
+    /// <summary>
+    /// Deterministically materializes the Fulcio certificate-authority
+    /// rotation candidate at <paramref name="candidatePath"/>. Generation is
+    /// atomic: material is produced in a sibling staging directory, fully
+    /// validated, and only then renamed into place, so a crash can never
+    /// expose a half-written candidate. An already-present candidate is never
+    /// regenerated; it is re-validated and its identity returned, which makes
+    /// the operation idempotent and makes tampering a hard failure.
+    /// </summary>
+    internal static FulcioCaMaterialInfo
+        EnsureFulcioCaRotationCandidate(string candidatePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidatePath);
+        candidatePath = Path.GetFullPath(candidatePath);
+        var parentPath = Directory.GetParent(candidatePath)?.FullName
+            ?? throw new InvalidOperationException(
+                $"Cannot determine the parent directory for '{candidatePath}'.");
+        Directory.CreateDirectory(parentPath);
+
+        if (Directory.Exists(candidatePath))
+        {
+            ValidateFulcioRotationCandidateFileSet(candidatePath);
+            return ValidateFulcioCertificateAuthority(candidatePath);
+        }
+        if (File.Exists(candidatePath))
+        {
+            throw new InvalidDataException(
+                $"Fulcio rotation candidate '{candidatePath}' is not a " +
+                "directory.");
+        }
+
+        var stagingPath = candidatePath + ".staging";
+        if (Directory.Exists(stagingPath))
+        {
+            Directory.Delete(stagingPath, recursive: true);
+        }
+        else if (File.Exists(stagingPath))
+        {
+            throw new InvalidDataException(
+                $"Fulcio rotation staging path '{stagingPath}' is not a " +
+                "directory.");
+        }
+
+        try
+        {
+            Directory.CreateDirectory(stagingPath);
+            GenerateFulcioRoot(stagingPath);
+            ValidateFulcioRotationCandidateFileSet(stagingPath);
+            _ = ValidateFulcioCertificateAuthority(stagingPath);
+            Directory.Move(stagingPath, candidatePath);
+        }
+        catch
+        {
+            if (Directory.Exists(stagingPath))
+            {
+                Directory.Delete(stagingPath, recursive: true);
+            }
+            throw;
+        }
+
+        ValidateFulcioRotationCandidateFileSet(candidatePath);
+        return ValidateFulcioCertificateAuthority(candidatePath);
+    }
+
+    /// <summary>
+    /// Validates a Fulcio certificate-authority material tree — a generation
+    /// directory or a rotation candidate — against the exact profile this
+    /// bootstrapper produces: an encrypted ECDSA P-256 private key whose
+    /// password decrypts it, a self-signed ECDSA-SHA256 root carrying a
+    /// critical CA basic-constraints extension without a path-length
+    /// constraint, exactly the critical
+    /// DigitalSignature|KeyCertSign|CrlSign key usage, a subject key
+    /// identifier, and a currently valid validity window.
+    /// </summary>
+    internal static FulcioCaMaterialInfo
+        ValidateFulcioCertificateAuthority(string rootPath)
+        => ValidateFulcioCertificateAuthority(
+            Resolve(rootPath, FulcioPrivateKeyPath),
+            Resolve(rootPath, FulcioPrivateKeyPasswordPath),
+            Resolve(rootPath, FulcioRootCertificatePath));
+
+    /// <summary>
+    /// Path-explicit overload used for the flat component-scoped runtime
+    /// projection, where the same three artifacts live side by side rather
+    /// than under the generation's private/public trees.
+    /// </summary>
+    internal static FulcioCaMaterialInfo
+        ValidateFulcioCertificateAuthority(
+            string privateKeyPath,
+            string passwordPath,
+            string certificatePath)
+    {
+        using var privateKey = LoadEncryptedEcdsaKey(
+            privateKeyPath,
+            passwordPath);
+        using var certificate = X509Certificate2.CreateFromPem(
+            File.ReadAllText(certificatePath));
+        using var certificatePublicKey =
+            certificate.GetECDsaPublicKey()
+            ?? throw new InvalidDataException(
+                "The Fulcio root certificate does not contain an ECDSA key.");
+
+        var publicKeyBytes = certificatePublicKey.ExportSubjectPublicKeyInfo();
+        EnsureKeyBytesEqual(
+            "Fulcio root certificate and private key",
+            privateKey.ExportSubjectPublicKeyInfo(),
+            publicKeyBytes);
+
+        if (certificatePublicKey.KeySize != 256
+            || certificate.SignatureAlgorithm.Value
+                != "1.2.840.10045.4.3.2")
+        {
+            throw new InvalidDataException(
+                "The Fulcio root must use ECDSA P-256 with SHA-256.");
+        }
+
+        var basicConstraints = certificate.Extensions
+            .OfType<X509BasicConstraintsExtension>()
+            .SingleOrDefault();
+        if (basicConstraints is null
+            || !basicConstraints.Critical
+            || !basicConstraints.CertificateAuthority
+            || basicConstraints.HasPathLengthConstraint)
+        {
+            throw new InvalidDataException(
+                "The Fulcio root certificate must carry critical certificate " +
+                "authority basic constraints without a path-length " +
+                "constraint.");
+        }
+
+        var keyUsage = certificate.Extensions
+            .OfType<X509KeyUsageExtension>()
+            .SingleOrDefault();
+        if (keyUsage is null
+            || !keyUsage.Critical
+            || keyUsage.KeyUsages
+                != (X509KeyUsageFlags.DigitalSignature
+                    | X509KeyUsageFlags.KeyCertSign
+                    | X509KeyUsageFlags.CrlSign))
+        {
+            throw new InvalidDataException(
+                "The Fulcio root certificate has invalid key usage.");
+        }
+
+        if (!certificate.Extensions
+            .OfType<X509SubjectKeyIdentifierExtension>()
+            .Any())
+        {
+            throw new InvalidDataException(
+                "The Fulcio root certificate is missing a subject key " +
+                "identifier.");
+        }
+
+        if (!certificate.SubjectName.RawData.SequenceEqual(
+                certificate.IssuerName.RawData))
+        {
+            throw new InvalidDataException(
+                "The Fulcio root certificate is not self-issued.");
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (now < certificate.NotBefore
+            || now >= certificate.NotAfter)
+        {
+            throw new InvalidDataException(
+                "The Fulcio root certificate is not currently valid.");
+        }
+
+        using var chain = new X509Chain();
+        chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        chain.ChainPolicy.CustomTrustStore.Add(certificate);
+        chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        if (!chain.Build(certificate))
+        {
+            var failures = string.Join(
+                ", ",
+                chain.ChainStatus.Select(
+                    status => status.StatusInformation.Trim()));
+            throw new InvalidDataException(
+                $"The Fulcio root certificate is not validly self-signed: " +
+                $"{failures}");
+        }
+
+        return new FulcioCaMaterialInfo(
+            Fingerprint(certificate.RawData),
+            Fingerprint(publicKeyBytes),
+            certificate.Subject,
+            certificate.NotBefore.ToUniversalTime(),
+            certificate.NotAfter.ToUniversalTime());
+    }
+
+    private static void ValidateFulcioRotationCandidateFileSet(
+        string rootPath)
+    {
+        var actual = Directory.EnumerateFiles(
+                rootPath,
+                "*",
+                SearchOption.AllDirectories)
+            .Select(path => Path.GetRelativePath(rootPath, path)
+                .Replace(Path.DirectorySeparatorChar, '/'))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (!actual.SequenceEqual(
+                FulcioRotationCandidateFiles.Order(StringComparer.Ordinal),
+                StringComparer.Ordinal))
+        {
+            throw new InvalidDataException(
+                "The Fulcio rotation candidate has an unexpected file set.");
+        }
+    }
+
     private static BootstrapManifest ValidateLegacyState(string rootPath)
     {
         foreach (var relativePath in LegacyRequiredStateFiles)
@@ -739,43 +971,7 @@ internal static partial class SigstoreStateBootstrapper
     }
 
     private static string ValidateFulcioRoot(string rootPath)
-    {
-        using var privateKey = LoadEncryptedEcdsaKey(
-            Resolve(rootPath, FulcioPrivateKeyPath),
-            Resolve(rootPath, FulcioPrivateKeyPasswordPath));
-        using var certificate = X509Certificate2.CreateFromPem(
-            File.ReadAllText(
-                Resolve(rootPath, FulcioRootCertificatePath)));
-        using var certificatePublicKey =
-            certificate.GetECDsaPublicKey()
-            ?? throw new InvalidDataException(
-                "The Fulcio root certificate does not contain an ECDSA key.");
-
-        EnsureKeyBytesEqual(
-            "Fulcio root certificate and private key",
-            privateKey.ExportSubjectPublicKeyInfo(),
-            certificatePublicKey.ExportSubjectPublicKeyInfo());
-
-        var basicConstraints = certificate.Extensions
-            .OfType<X509BasicConstraintsExtension>()
-            .SingleOrDefault();
-        if (basicConstraints is null
-            || !basicConstraints.CertificateAuthority)
-        {
-            throw new InvalidDataException(
-                "The Fulcio root certificate is not a certificate authority.");
-        }
-
-        var now = DateTimeOffset.UtcNow;
-        if (now < certificate.NotBefore
-            || now > certificate.NotAfter)
-        {
-            throw new InvalidDataException(
-                "The Fulcio root certificate is not currently valid.");
-        }
-
-        return Fingerprint(certificate.RawData);
-    }
+        => ValidateFulcioCertificateAuthority(rootPath).RootSha256;
 
     private static string ValidateEcdsaKeyPair(
         string rootPath,
