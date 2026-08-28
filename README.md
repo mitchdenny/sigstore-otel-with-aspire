@@ -425,3 +425,26 @@ Cross-generation recovery is automatic: a crash at any point between generation
 advance and completion is detected on next startup and either rolled back (if
 TUF still serves the prior generation) or forward-completed (if TUF already
 committed the new generation's publication).
+
+## OIDC Signing-Key Rotation (Step 9)
+
+The `rotate-oidc-signing-key` command rotates the local OIDC issuer's signing key
+while maintaining overlapping JWKS for token verification continuity:
+
+```bash
+aspire resource sigstore rotate-oidc-signing-key
+```
+
+The command:
+1. Captures a pre-rotation token and baseline OIDC/Fulcio container identities
+2. Dispatches a Go TUF worker that creates generation N+1 with a new RSA key,
+   overlapping JWKS (old+new public keys), and retained old private key
+3. Restarts OIDC (resolves new generation via active-generation symlink)
+4. Verifies new tokens use the new key ID
+5. Proves Fulcio accepts both old and new tokens without restart (JWKS refresh)
+6. Restarts all six clients for generation uptake
+
+Generation immutability is preserved: prior generation bytes remain unchanged.
+TrustedRoot and SigningConfig are not modified (OIDC keys are operational, not
+in client trust material). Fulcio discovers the new key via its JWKS endpoint
+refresh — no Fulcio restart required.

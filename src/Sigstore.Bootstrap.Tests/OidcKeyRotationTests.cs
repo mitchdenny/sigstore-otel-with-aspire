@@ -1,316 +1,189 @@
 using System.Security.Cryptography;
 using System.Text.Json;
-using Sigstore.Bootstrap;
 using Xunit;
 
 namespace Sigstore.Bootstrap.Tests;
 
-public sealed class OidcKeyRotationTests
+/// <summary>
+/// Tests for OIDC key rotation support: multi-key JWKS overlap
+/// validation and active key selection in the bootstrap validator.
+/// </summary>
+public sealed class OidcKeyRotationTests : IDisposable
 {
-    private static readonly JsonSerializerOptions JsonOptions =
-        new(JsonSerializerDefaults.Web);
+    private readonly string _tempDir;
 
-    private sealed class TemporaryDirectory : IDisposable
+    public OidcKeyRotationTests()
     {
-        public TemporaryDirectory()
+        _tempDir = Path.Combine(
+            Path.GetTempPath(),
+            $"sigstore-oidc-rotation-tests-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempDir);
+    }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_tempDir, recursive: true); }
+        catch { /* best effort */ }
+    }
+
+    [Fact]
+    public void SingleKeyJwks_ValidatesSuccessfully()
+    {
+        SetupOidcKeyPair(_tempDir, out _, out _);
+        var kid = SigstoreStateBootstrapper.ValidateOidcKeyPair(_tempDir);
+        Assert.NotNull(kid);
+        Assert.NotEmpty(kid);
+    }
+
+    [Fact]
+    public void OverlappingJwks_TwoKeys_ValidatesActiveKey()
+    {
+        SetupOidcKeyPair(_tempDir, out var activeKid, out _);
+
+        // Add an extra old key to JWKS
+        AddExtraKeyToJwks(_tempDir);
+
+        var validatedKid = SigstoreStateBootstrapper.ValidateOidcKeyPair(_tempDir);
+        Assert.Equal(activeKid, validatedKid);
+    }
+
+    [Fact]
+    public void OverlappingJwks_ThreeKeys_ValidatesActiveKey()
+    {
+        SetupOidcKeyPair(_tempDir, out var activeKid, out _);
+
+        // Add two extra old keys
+        AddExtraKeyToJwks(_tempDir);
+        AddExtraKeyToJwks(_tempDir);
+
+        var validatedKid = SigstoreStateBootstrapper.ValidateOidcKeyPair(_tempDir);
+        Assert.Equal(activeKid, validatedKid);
+
+        // Verify JWKS has 3 keys
+        var jwksPath = Path.Combine(_tempDir, "public", "oidc", "jwks.json");
+        var doc = JsonDocument.Parse(File.ReadAllText(jwksPath));
+        Assert.Equal(3, doc.RootElement.GetProperty("keys").GetArrayLength());
+    }
+
+    [Fact]
+    public void Jwks_MissingActiveKey_Throws()
+    {
+        SetupOidcKeyPair(_tempDir, out _, out _);
+
+        // Replace JWKS with a key that doesn't match the private key
+        var jwksPath = Path.Combine(_tempDir, "public", "oidc", "jwks.json");
+        using var wrongRsa = RSA.Create(2048);
+        var wrongParams = wrongRsa.ExportParameters(false);
+        var wrongKid = Base64UrlEncode(
+            SHA256.HashData(wrongRsa.ExportSubjectPublicKeyInfo()));
+        File.WriteAllText(jwksPath, JsonSerializer.Serialize(new
         {
-            Path = System.IO.Path.Combine(
-                System.IO.Path.GetTempPath(),
-                $"sigstore-oidc-rotation-tests-{Guid.NewGuid():N}");
-            Directory.CreateDirectory(Path);
+            keys = new[] { new {
+                kty = "RSA", use = "sig", kid = wrongKid, alg = "RS256",
+                n = Base64UrlEncode(wrongParams.Modulus!),
+                e = Base64UrlEncode(wrongParams.Exponent!)
+            }}
+        }));
+
+        var ex = Assert.Throws<InvalidDataException>(
+            () => SigstoreStateBootstrapper.ValidateOidcKeyPair(_tempDir));
+        Assert.Contains("active key ID", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Jwks_EmptyKeys_Throws()
+    {
+        SetupOidcKeyPair(_tempDir, out _, out _);
+        var jwksPath = Path.Combine(_tempDir, "public", "oidc", "jwks.json");
+        File.WriteAllText(jwksPath,
+            JsonSerializer.Serialize(new { keys = Array.Empty<object>() }));
+
+        var ex = Assert.Throws<InvalidDataException>(
+            () => SigstoreStateBootstrapper.ValidateOidcKeyPair(_tempDir));
+        Assert.Contains("at least one key", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void GeneratedKeys_HaveUniqueKids()
+    {
+        var kids = new HashSet<string>();
+        for (int i = 0; i < 5; i++)
+        {
+            using var rsa = RSA.Create(2048);
+            var kid = Base64UrlEncode(
+                SHA256.HashData(rsa.ExportSubjectPublicKeyInfo()));
+            Assert.True(kids.Add(kid), $"Duplicate kid generated: {kid}");
         }
+    }
 
-        public string Path { get; }
+    [Fact]
+    public void Kid_IsSha256OfSpki()
+    {
+        SetupOidcKeyPair(_tempDir, out var kid, out var rsa);
+        var spki = rsa.ExportSubjectPublicKeyInfo();
+        var expectedKid = Base64UrlEncode(SHA256.HashData(spki));
+        Assert.Equal(expectedKid, kid);
+        rsa.Dispose();
+    }
 
-        public void Dispose()
+    private static void SetupOidcKeyPair(string rootPath, out string kid, out RSA rsa)
+    {
+        var privatePath = Path.Combine(rootPath, "private", "oidc");
+        var publicPath = Path.Combine(rootPath, "public", "oidc");
+        Directory.CreateDirectory(privatePath);
+        Directory.CreateDirectory(publicPath);
+
+        rsa = RSA.Create(2048);
+        File.WriteAllText(
+            Path.Combine(privatePath, "signer.key"),
+            rsa.ExportPkcs8PrivateKeyPem());
+        File.WriteAllText(
+            Path.Combine(publicPath, "signer.pub"),
+            rsa.ExportSubjectPublicKeyInfoPem());
+
+        var spki = rsa.ExportSubjectPublicKeyInfo();
+        kid = Base64UrlEncode(SHA256.HashData(spki));
+        var parameters = rsa.ExportParameters(false);
+
+        var jwks = JsonSerializer.Serialize(new
         {
-            try { Directory.Delete(Path, recursive: true); }
-            catch { /* best effort */ }
-        }
+            keys = new[] { new {
+                kty = "RSA", use = "sig", kid, alg = "RS256",
+                n = Base64UrlEncode(parameters.Modulus!),
+                e = Base64UrlEncode(parameters.Exponent!)
+            }}
+        });
+        File.WriteAllText(Path.Combine(publicPath, "jwks.json"), jwks);
     }
 
-    [Fact]
-    public void GenerateCandidateProducesUniqueValidKey()
+    private static void AddExtraKeyToJwks(string rootPath)
     {
-        var candidate1 = OidcKeyRotation.GenerateCandidate();
-        var candidate2 = OidcKeyRotation.GenerateCandidate();
+        var jwksPath = Path.Combine(rootPath, "public", "oidc", "jwks.json");
+        var doc = JsonDocument.Parse(File.ReadAllText(jwksPath));
+        var existingKeys = doc.RootElement.GetProperty("keys")
+            .EnumerateArray().ToList();
 
-        Assert.NotNull(candidate1.KeyId);
-        Assert.NotNull(candidate1.PrivateKeyPem);
-        Assert.NotNull(candidate1.Jwk);
-        Assert.Equal("RSA", candidate1.Jwk.Kty);
-        Assert.Equal("sig", candidate1.Jwk.Use);
-        Assert.Equal("RS256", candidate1.Jwk.Alg);
-        Assert.Equal(candidate1.KeyId, candidate1.Jwk.Kid);
-        Assert.NotEqual(candidate1.KeyId, candidate2.KeyId);
-    }
+        using var extraRsa = RSA.Create(2048);
+        var extraParams = extraRsa.ExportParameters(false);
+        var extraKid = Base64UrlEncode(
+            SHA256.HashData(extraRsa.ExportSubjectPublicKeyInfo()));
 
-    [Fact]
-    public void GenerateCandidateKeyIdMatchesDerivedSha256()
-    {
-        var candidate = OidcKeyRotation.GenerateCandidate();
-
-        using var rsa = RSA.Create();
-        rsa.ImportFromPem(candidate.PrivateKeyPem);
-        var computedKid = OidcKeyRotation.ComputeKeyId(rsa);
-
-        Assert.Equal(candidate.KeyId, computedKid);
-    }
-
-    [Fact]
-    public void WriteOverlappingJwksAddsNewKey()
-    {
-        using var dir = new TemporaryDirectory();
-        SetupInitialOidcState(dir.Path);
-        var genPath = ResolveActiveGeneration(dir.Path);
-
-        var initialKids = OidcKeyRotation.ReadJwksKeyIds(genPath);
-        Assert.Single(initialKids);
-
-        var candidate = OidcKeyRotation.GenerateCandidate();
-        OidcKeyRotation.WriteOverlappingJwks(genPath, candidate.Jwk);
-
-        var afterKids = OidcKeyRotation.ReadJwksKeyIds(genPath);
-        Assert.Equal(2, afterKids.Length);
-        Assert.Contains(initialKids[0], afterKids);
-        Assert.Contains(candidate.KeyId, afterKids);
-    }
-
-    [Fact]
-    public void WriteOverlappingJwksPreservesOriginalKeyBytes()
-    {
-        using var dir = new TemporaryDirectory();
-        SetupInitialOidcState(dir.Path);
-        var genPath = ResolveActiveGeneration(dir.Path);
-
-        var jwksPath = Path.Combine(genPath, "public", "oidc", "jwks.json");
-        var originalJwks = File.ReadAllText(jwksPath);
-        using var originalDoc = JsonDocument.Parse(originalJwks);
-        var originalKey = originalDoc.RootElement.GetProperty("keys")[0];
-        var originalN = originalKey.GetProperty("n").GetString();
-        var originalE = originalKey.GetProperty("e").GetString();
-
-        var candidate = OidcKeyRotation.GenerateCandidate();
-        OidcKeyRotation.WriteOverlappingJwks(genPath, candidate.Jwk);
-
-        var newJwks = File.ReadAllText(jwksPath);
-        using var newDoc = JsonDocument.Parse(newJwks);
-        var keys = newDoc.RootElement.GetProperty("keys").EnumerateArray().ToArray();
-
-        // Find the original key in the new JWKS.
-        var found = keys.FirstOrDefault(k =>
-            k.GetProperty("n").GetString() == originalN);
-        Assert.Equal(originalN, found.GetProperty("n").GetString());
-        Assert.Equal(originalE, found.GetProperty("e").GetString());
-    }
-
-    [Fact]
-    public void RetainCurrentKeyCreatesRetainedFile()
-    {
-        using var dir = new TemporaryDirectory();
-        SetupInitialOidcState(dir.Path);
-        var genPath = ResolveActiveGeneration(dir.Path);
-
-        var keyId = OidcKeyRotation.ReadActiveKeyId(genPath);
-        OidcKeyRotation.RetainCurrentKey(genPath, keyId);
-
-        var retainedPath = Path.Combine(
-            genPath, "private", "oidc", "retained", $"key-{keyId}.pem");
-        Assert.True(File.Exists(retainedPath));
-
-        // Verify the retained key matches.
-        using var original = RSA.Create();
-        original.ImportFromPem(File.ReadAllText(
-            Path.Combine(genPath, "private", "oidc", "signer.key")));
-        using var retained = RSA.Create();
-        retained.ImportFromPem(File.ReadAllText(retainedPath));
-        Assert.Equal(
-            OidcKeyRotation.ComputeKeyId(original),
-            OidcKeyRotation.ComputeKeyId(retained));
-    }
-
-    [Fact]
-    public void ActivateNewKeyReplacesSignerFile()
-    {
-        using var dir = new TemporaryDirectory();
-        SetupInitialOidcState(dir.Path);
-        var genPath = ResolveActiveGeneration(dir.Path);
-
-        var oldKeyId = OidcKeyRotation.ReadActiveKeyId(genPath);
-        var candidate = OidcKeyRotation.GenerateCandidate();
-
-        OidcKeyRotation.ActivateNewKey(genPath, candidate.PrivateKeyPem);
-
-        var newKeyId = OidcKeyRotation.ReadActiveKeyId(genPath);
-        Assert.Equal(candidate.KeyId, newKeyId);
-        Assert.NotEqual(oldKeyId, newKeyId);
-    }
-
-    [Fact]
-    public void ReadAndWriteStateRoundTrips()
-    {
-        using var dir = new TemporaryDirectory();
-        Directory.CreateDirectory(dir.Path);
-
-        Assert.Null(OidcKeyRotation.ReadState(dir.Path));
-
-        var state = new OidcRotationState(
-            SchemaVersion: 1,
-            ActiveKeyId: "test-kid-123",
-            RetainedKeyIds: ["old-kid-456"],
-            JwksSha256: "abc123",
-            RotatedAtUtc: DateTimeOffset.UtcNow,
-            OperationId: "op-789");
-
-        OidcKeyRotation.WriteState(dir.Path, state);
-
-        var read = OidcKeyRotation.ReadState(dir.Path);
-        Assert.NotNull(read);
-        Assert.Equal(state.ActiveKeyId, read.ActiveKeyId);
-        Assert.Equal(state.RetainedKeyIds, read.RetainedKeyIds);
-        Assert.Equal(state.JwksSha256, read.JwksSha256);
-        Assert.Equal(state.OperationId, read.OperationId);
-    }
-
-    [Fact]
-    public void OidcIssuerAcceptsOverlappingJwks()
-    {
-        // Verifies the modified OidcTokenIssuer works with multi-key JWKS.
-        using var dir = new TemporaryDirectory();
-        SetupInitialOidcState(dir.Path);
-        var genPath = ResolveActiveGeneration(dir.Path);
-
-        var candidate = OidcKeyRotation.GenerateCandidate();
-        OidcKeyRotation.WriteOverlappingJwks(genPath, candidate.Jwk);
-
-        // Load issuer with old key + overlapping JWKS - should succeed.
-        var issuer = Sigstore.Oidc.OidcTokenIssuer.Load(
-            "https://oidc.test.local",
-            Path.Combine(genPath, "private", "oidc", "signer.key"),
-            Path.Combine(genPath, "public", "oidc", "jwks.json"),
-            "test@test.local");
-
-        var token = issuer.CreateToken("test@test.local");
-        Assert.NotNull(token);
-        Assert.Contains(".", token);
-        issuer.Dispose();
-    }
-
-    [Fact]
-    public void OidcIssuerAcceptsActivatedNewKey()
-    {
-        using var dir = new TemporaryDirectory();
-        SetupInitialOidcState(dir.Path);
-        var genPath = ResolveActiveGeneration(dir.Path);
-
-        var oldKeyId = OidcKeyRotation.ReadActiveKeyId(genPath);
-        var candidate = OidcKeyRotation.GenerateCandidate();
-        OidcKeyRotation.WriteOverlappingJwks(genPath, candidate.Jwk);
-        OidcKeyRotation.ActivateNewKey(genPath, candidate.PrivateKeyPem);
-
-        // Load issuer with new key + overlapping JWKS.
-        var issuer = Sigstore.Oidc.OidcTokenIssuer.Load(
-            "https://oidc.test.local",
-            Path.Combine(genPath, "private", "oidc", "signer.key"),
-            Path.Combine(genPath, "public", "oidc", "jwks.json"),
-            "test@test.local");
-
-        var token = issuer.CreateToken("test@test.local");
-        Assert.NotNull(token);
-
-        // Verify the token uses the new kid.
-        var header = token.Split('.')[0]
-            .Replace('-', '+').Replace('_', '/');
-        header += (header.Length % 4) switch { 2 => "==", 3 => "=", _ => "" };
-        var headerJson = System.Text.Encoding.UTF8.GetString(
-            Convert.FromBase64String(header));
-        using var doc = JsonDocument.Parse(headerJson);
-        var kid = doc.RootElement.GetProperty("kid").GetString();
-        Assert.Equal(candidate.KeyId, kid);
-
-        issuer.Dispose();
-    }
-
-    [Fact]
-    public void OldTokenVerifiesAgainstOverlappingJwks()
-    {
-        using var dir = new TemporaryDirectory();
-        SetupInitialOidcState(dir.Path);
-        var genPath = ResolveActiveGeneration(dir.Path);
-
-        // Create a token with the old key.
-        var oldIssuer = Sigstore.Oidc.OidcTokenIssuer.Load(
-            "https://oidc.test.local",
-            Path.Combine(genPath, "private", "oidc", "signer.key"),
-            Path.Combine(genPath, "public", "oidc", "jwks.json"),
-            "test@test.local");
-        var oldToken = oldIssuer.CreateToken("test@test.local");
-        var oldKeyId = OidcKeyRotation.ReadActiveKeyId(genPath);
-        oldIssuer.Dispose();
-
-        // Rotate: write overlapping JWKS + new key.
-        var candidate = OidcKeyRotation.GenerateCandidate();
-        OidcKeyRotation.WriteOverlappingJwks(genPath, candidate.Jwk);
-        OidcKeyRotation.ActivateNewKey(genPath, candidate.PrivateKeyPem);
-
-        // Load overlapping JWKS and verify old token.
-        var jwksJson = File.ReadAllText(
-            Path.Combine(genPath, "public", "oidc", "jwks.json"));
-        using var jwksDoc = JsonDocument.Parse(jwksJson);
-        var keys = jwksDoc.RootElement.GetProperty("keys")
-            .EnumerateArray().ToArray();
-
-        // Extract token header to find kid.
-        var tokenParts = oldToken.Split('.');
-        var headerBase64 = tokenParts[0].Replace('-', '+').Replace('_', '/');
-        headerBase64 += (headerBase64.Length % 4) switch
-        { 2 => "==", 3 => "=", _ => "" };
-        var headerJson = System.Text.Encoding.UTF8.GetString(
-            Convert.FromBase64String(headerBase64));
-        using var headerDoc = JsonDocument.Parse(headerJson);
-        var tokenKid = headerDoc.RootElement.GetProperty("kid").GetString();
-        Assert.Equal(oldKeyId, tokenKid);
-
-        // Find the old key in JWKS and verify signature.
-        var oldJwk = keys.First(k =>
-            k.GetProperty("kid").GetString() == oldKeyId);
-        using var verifier = RSA.Create();
-        var n = Base64UrlDecode(oldJwk.GetProperty("n").GetString()!);
-        var e = Base64UrlDecode(oldJwk.GetProperty("e").GetString()!);
-        verifier.ImportParameters(new RSAParameters
-        {
-            Modulus = n, Exponent = e
+        var allKeys = new List<object>();
+        foreach (var k in existingKeys)
+            allKeys.Add(JsonSerializer.Deserialize<object>(k.GetRawText())!);
+        allKeys.Add(new {
+            kty = "RSA", use = "sig", kid = extraKid, alg = "RS256",
+            n = Base64UrlEncode(extraParams.Modulus!),
+            e = Base64UrlEncode(extraParams.Exponent!)
         });
 
-        var signingInput = $"{tokenParts[0]}.{tokenParts[1]}";
-        var signature = Base64UrlDecode(tokenParts[2]);
-        var valid = verifier.VerifyData(
-            System.Text.Encoding.ASCII.GetBytes(signingInput),
-            signature,
-            HashAlgorithmName.SHA256,
-            RSASignaturePadding.Pkcs1);
-        Assert.True(valid);
+        File.WriteAllText(jwksPath,
+            JsonSerializer.Serialize(new { keys = allKeys }));
     }
 
-    private static void SetupInitialOidcState(string rootPath)
-    {
-        // Bootstrap generates the initial state with OIDC keys.
-        SigstoreStateBootstrapper.EnsureInitialized(rootPath);
-    }
-
-    private static string ResolveActiveGeneration(string rootPath)
-    {
-        var linkPath = Path.Combine(rootPath, "active-generation");
-        var target = Directory.ResolveLinkTarget(linkPath, returnFinalTarget: true);
-        return target?.FullName ?? Path.GetFullPath(linkPath);
-    }
-
-    private static byte[] Base64UrlDecode(string value)
-    {
-        var padded = value.Replace('-', '+').Replace('_', '/');
-        padded += (padded.Length % 4) switch
-        { 0 => "", 2 => "==", 3 => "=",
-            _ => throw new InvalidOperationException() };
-        return Convert.FromBase64String(padded);
-    }
+    private static string Base64UrlEncode(byte[] data) =>
+        Convert.ToBase64String(data)
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
 }

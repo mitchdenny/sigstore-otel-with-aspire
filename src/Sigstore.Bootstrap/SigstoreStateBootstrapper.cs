@@ -641,7 +641,7 @@ internal static partial class SigstoreStateBootstrapper
         return Fingerprint(publicKeyBytes);
     }
 
-    private static string ValidateOidcKeyPair(string rootPath)
+    internal static string ValidateOidcKeyPair(string rootPath)
     {
         using var privateKey = LoadRsaKey(
             Resolve(rootPath, OidcPrivateKeyPath));
@@ -666,13 +666,21 @@ internal static partial class SigstoreStateBootstrapper
             .EnumerateArray()
             .ToArray();
 
-        if (keys.Length != 1)
+        if (keys.Length < 1)
         {
             throw new InvalidDataException(
-                "The OIDC JWKS must contain exactly one key.");
+                "The OIDC JWKS must contain at least one key.");
         }
 
-        var key = keys[0];
+        var matchingKey = keys.FirstOrDefault(k =>
+            k.TryGetProperty("kid", out var kid) && kid.GetString() == expectedKeyId);
+        if (matchingKey.ValueKind == JsonValueKind.Undefined)
+        {
+            throw new InvalidDataException(
+                $"The OIDC JWKS does not contain the active key ID '{expectedKeyId}'.");
+        }
+
+        var key = matchingKey;
         EnsureEqual("OIDC key type", "RSA", key.GetProperty("kty").GetString());
         EnsureEqual("OIDC key use", "sig", key.GetProperty("use").GetString());
         EnsureEqual("OIDC algorithm", "RS256", key.GetProperty("alg").GetString());

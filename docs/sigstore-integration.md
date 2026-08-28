@@ -936,51 +936,79 @@ and prevents the command from completing.
 - Fulcio does not require restart.
 - Signing and validation traffic resumes without trust regression.
 
-### Implementation (Step 9 complete)
+### Implementation (Step 9 — in progress)
+
+**Architecture:** Go TUF worker creates generation N+1 with new OIDC key material;
+C# AppHost command orchestrates lifecycle via signal file and shared `state.lock`.
 
 **Command:** `rotate-oidc-signing-key` registered on the Sigstore parent resource.
 
-**State machine:**
+**Go worker (`oidc_rotation.go`):**
+- Dispatched via `rotate-oidc-signing-key.request` signal file (exactly-once, atomic CreateNew)
+- Acquires `state.lock`, validates request domain/operation/state coherence
+- Calls `rotateOidcGeneration`: copies current generation → adds new RSA 2048 key →
+  creates overlapping JWKS (old+new public keys) → writes exact manifest with new OidcKeyId
+  and updated file hashes → switches `active-generation` symlink via transition journal
+- Updates TUF `trust_status.v1.json`: increments Generation/ID/ManifestSHA256/TargetsVersion;
+  TrustedRoot/SigningConfig SHA256 remain unchanged (OIDC not in client trust material)
+- Writes atomic completion file, removes request signal
+
+**C# command phases (14 phases):**
 1. `preflight` — validate OIDC + Fulcio Running/Healthy, capture container IDs
-2. `generate-candidate` — create RSA 2048 key, derive kid via SHA-256(SPKI)
-3. `publish-overlap` — write overlapping JWKS (old+new public keys) atomically,
-   restart OIDC (old signer active), verify JWKS served with both kids
-4. `activate` — retain old key at `private/oidc/retained/key-<kid>.pem`,
-   atomically replace `signer.key`, restart OIDC (new signer active),
-   verify new tokens carry new kid
-5. `postconditions` — verify Fulcio container identity unchanged, test cert
-   issuance with new token and old pre-rotation token, verify JWKS overlap
-6. `complete` — write `oidc-rotation.json` state, report structured result
+2. `capture-old-token` — fetch token from current OIDC issuer, record kid/iat/exp
+3. `write-signal` — write request signal file (atomic CreateNew, exactly-once)
+4. `start-worker` — start TUF bootstrap worker container via ResourceCommandService
+5. `wait-worker` — wait for worker terminal success (generation N+1 committed)
+6. `postconditions` — verify generation advanced, OidcKeyId changed,
+   TrustDomain/TrustedRoot/SigningConfig unchanged
+7. `restart-oidc` — restart OIDC via ResourceCommandService (new container resolves
+   new generation through active-generation symlink)
+8. `verify-oidc-healthy` — wait Running/Healthy, verify new container identity
+9. `verify-new-token` — fetch token, assert new kid matches new OidcKeyId
+10. `verify-fulcio-stable` — confirm Fulcio container identity unchanged
+11. `prove-fulcio-issuance` — test Fulcio cert issuance with old pre-rotation token
+    AND new post-rotation token (both must succeed)
+12. `restart-clients` — restart all 6 signing/verification clients
+13. `aggregate` — wait all clients Running/Healthy
+14. `complete` — structured result with full evidence
 
-**Key layout:**
-- `active-generation/private/oidc/signer.key` — active signing key (atomic rename)
-- `active-generation/private/oidc/retained/key-<kid>.pem` — historical keys
-- `active-generation/public/oidc/jwks.json` — overlapping JWKS (all public keys)
-- `<state>/oidc-rotation.json` — rotation state (schema v1)
+**Key layout (generation N+1):**
+- `generations/generation-XXXXXXXX/private/oidc/signer.key` — new active signing key
+- `generations/generation-XXXXXXXX/private/oidc/retained/signer-<old-kid>.key` — retained old key
+- `generations/generation-XXXXXXXX/public/oidc/jwks.json` — overlapping JWKS (old+new)
+- `generations/generation-XXXXXXXX/public/oidc/signer.pub` — new public key
+- `generations/generation-XXXXXXXX/manifest.json` — exact file hashes, new OidcKeyId
+- `active-generation` → symlink to new generation
 
-**OIDC issuer changes:**
-- `ValidateJwks` now accepts multiple keys in JWKS
-- Finds the matching key by kid derived from the loaded private key
+**Generation immutability:** Prior generation remains byte-identical. New generation N+1
+contains all unchanged material (Fulcio, Rekor, TSA, CT) copied from N, plus new OIDC keys.
+Manifest hashes are exact for the complete new generation.
+
+**OIDC issuer (`OidcTokenIssuer.cs`):**
+- `ValidateJwks` accepts multiple keys in JWKS (overlap state)
+- Finds active signing key by kid derived from loaded private key SPKI
 - Validates all keys have unique kids, valid RSA/sig/RS256 fields
-- Serves all keys in JWKS response for overlap
+- Serves all keys in JWKS response for Fulcio discovery
 
-**Design decisions:**
-- Trust generation NOT advanced — OidcKeyId in GenerationManifest is a
-  bootstrap-time historical record. TrustedRoot/SigningConfig are unchanged.
-  Fulcio discovers OIDC keys via `.well-known/openid-configuration` → `/jwks`,
-  not through TUF. Client trust status remains byte-identical.
-- Atomic file operations (write-temp-then-rename) satisfy "never overwrite in
-  place" — new inode created, old container sees stale only if not restarted.
-- Two OIDC restarts: one for overlap publication (old signer + overlapping JWKS),
-  one for activation (new signer + same overlapping JWKS).
-- Fulcio is never restarted — JWKS refresh on next token verification discovers
-  the new kid from the served overlapping JWKS endpoint.
+**Bootstrap validator:**
+- `ValidateOidcKeyPair` generalized: requires ≥1 key in JWKS, active key ID must be
+  present with matching RSA parameters. Allows overlapping historical keys.
 
 **Recovery:**
-- Failure before activate: old signer remains active, overlapping JWKS published
-  but safe. Retry generates a new candidate.
-- Failure after activate: new signer on disk, OIDC may need manual restart.
-  State file indicates incomplete rotation for diagnostics.
+- Failure before worker start: no state mutation, retry safe
+- Worker failure: old generation remains active, old signer usable
+- Failure after generation commit but before OIDC restart: new generation on disk,
+  OIDC still runs old container (stale but functional). Retry forward-completes.
+- Failure after OIDC restart: postcondition validation gates success, retry safe
+
+**Design decisions:**
+- Trust generation IS advanced (N→N+1) — generation manifest OidcKeyId, file hashes,
+  and TUF trust_status generation metadata all change coherently
+- TrustedRoot/SigningConfig bytes unchanged — OIDC keys not in client trust material
+- Fulcio discovers new kid via JWKS endpoint refresh, never restarted
+- OIDC container mount resolves through `active-generation` symlink at container start
+- Exactly-once signal file prevents concurrent/duplicate rotations
+- All prior keys retained in generation for overlap/recovery (no retirement in Step 9)
 
 ## Step 10: Implement timestamp-authority rotation
 
