@@ -4457,6 +4457,8 @@ internal sealed partial class SigstoreOperationExecutor(
     private async Task<SigstoreOperationSnapshot> CaptureAsync(
         CancellationToken cancellationToken)
     {
+        stateInspector.EnsureActiveGenerationManifestReadOnly(
+            resource.StatePath);
         var tuf = stateInspector.ReadTufState(resource.StatePath);
         var trustStateSha256 = stateInspector.ReadTrustStateFingerprint(
             resource.StatePath);
@@ -5823,6 +5825,10 @@ internal interface ISigstoreStateInspector
 
     string ReadTrustMaterialFingerprint(string statePath);
 
+    void EnsureActiveGenerationManifestReadOnly(string statePath)
+    {
+    }
+
     FulcioCaMaterialInfo EnsureFulcioCaRotationCandidate(
         string candidatePath) =>
         SigstoreStateBootstrapper.EnsureFulcioCaRotationCandidate(
@@ -5858,6 +5864,70 @@ internal sealed class SigstoreFileStateInspector : ISigstoreStateInspector
 
     public string ReadTrustMaterialFingerprint(string statePath) =>
         SigstoreStatusCommand.ReadTrustMaterialFingerprint(statePath);
+
+    public void EnsureActiveGenerationManifestReadOnly(
+        string statePath)
+    {
+        var active = new DirectoryInfo(
+            Path.Combine(statePath, "active-generation"));
+        active.Refresh();
+        var target = active.LinkTarget
+            ?? throw new InvalidDataException(
+                "The active generation reference is missing.");
+        var generationId = Path.GetFileName(target);
+        var expected = Path.Combine("generations", generationId);
+        if (Path.IsPathFullyQualified(target)
+            || !string.Equals(
+                Path.TrimEndingDirectorySeparator(target),
+                expected,
+                OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                $"The active generation reference '{target}' is unsafe.");
+        }
+
+        var manifestPath = Path.Combine(
+            statePath,
+            expected,
+            "manifest.json");
+        var manifest = new FileInfo(manifestPath);
+        manifest.Refresh();
+        if (!manifest.Exists || manifest.LinkTarget is not null)
+        {
+            throw new InvalidDataException(
+                "The active generation manifest is missing or linked.");
+        }
+        if (OperatingSystem.IsWindows())
+        {
+            File.SetAttributes(
+                manifestPath,
+                File.GetAttributes(manifestPath)
+                    | FileAttributes.ReadOnly);
+            return;
+        }
+
+        var mode = File.GetUnixFileMode(manifestPath);
+        var readOnly = mode
+            & ~(UnixFileMode.UserWrite
+                | UnixFileMode.GroupWrite
+                | UnixFileMode.OtherWrite);
+        if (mode != readOnly)
+        {
+            File.SetUnixFileMode(manifestPath, readOnly);
+        }
+        if ((File.GetUnixFileMode(manifestPath)
+                & (UnixFileMode.UserWrite
+                    | UnixFileMode.GroupWrite
+                    | UnixFileMode.OtherWrite))
+            != 0)
+        {
+            throw new IOException(
+                $"Active generation manifest '{manifestPath}' could not be " +
+                "made read-only by the AppHost.");
+        }
+    }
 }
 
 internal sealed record SigstoreResourceInstanceSnapshot(

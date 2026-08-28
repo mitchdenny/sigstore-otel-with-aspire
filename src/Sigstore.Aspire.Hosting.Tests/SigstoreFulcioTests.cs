@@ -155,6 +155,54 @@ public sealed class SigstoreFulcioTests
                 key));
     }
 
+    [Fact]
+    public void AppHostSealsContainerWrittenGenerationManifest()
+    {
+        using var state = new TemporaryDirectory();
+        var initialized = SigstoreStateBootstrapper.EnsureInitialized(
+            state.Path);
+        var manifestPath = System.IO.Path.Combine(
+            state.Path,
+            "generations",
+            initialized.Generation.GenerationId,
+            "manifest.json");
+        if (OperatingSystem.IsWindows())
+        {
+            File.SetAttributes(
+                manifestPath,
+                File.GetAttributes(manifestPath)
+                    & ~FileAttributes.ReadOnly);
+        }
+        else
+        {
+            File.SetUnixFileMode(
+                manifestPath,
+                UnixFileMode.UserRead
+                | UnixFileMode.UserWrite
+                | UnixFileMode.GroupRead
+                | UnixFileMode.OtherRead);
+        }
+
+        new SigstoreFileStateInspector()
+            .EnsureActiveGenerationManifestReadOnly(state.Path);
+
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.True(
+                File.GetAttributes(manifestPath)
+                    .HasFlag(FileAttributes.ReadOnly));
+        }
+        else
+        {
+            Assert.Equal(
+                UnixFileMode.None,
+                File.GetUnixFileMode(manifestPath)
+                & (UnixFileMode.UserWrite
+                    | UnixFileMode.GroupWrite
+                    | UnixFileMode.OtherWrite));
+        }
+    }
+
     private static X509Certificate2 ReadRoot(string statePath) =>
         X509Certificate2.CreateFromPem(
             File.ReadAllText(
