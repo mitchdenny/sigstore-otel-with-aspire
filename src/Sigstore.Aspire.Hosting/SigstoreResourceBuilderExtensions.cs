@@ -22,15 +22,25 @@ public static class SigstoreResourceBuilderExtensions
             appHostDirectory,
             options.SourcePath,
             nameof(options.SourcePath));
-        var activeGenerationPath = Path.Combine(
+        var initialRekorSignerPath = Path.Combine(
             statePath,
-            "active-generation");
-        var activePrivatePath = Path.Combine(
-            activeGenerationPath,
-            "private");
-        var activePublicPath = Path.Combine(
-            activeGenerationPath,
-            "public");
+            "generations",
+            "generation-00000001",
+            "private",
+            "rekor");
+        var secondaryRekorRuntimePath = Path.Combine(
+            statePath,
+            "runtime",
+            "rekor-secondary");
+        var primaryRekorDataPath = Path.Combine(
+            statePath,
+            "data",
+            "rekor");
+        var secondaryRekorDataPath = Path.Combine(
+            statePath,
+            "data",
+            "rekor-shards",
+            "secondary");
         var fulcioRuntimePath = Path.Combine(
             statePath,
             "runtime",
@@ -139,6 +149,16 @@ public static class SigstoreResourceBuilderExtensions
                         context),
                 commandOptions:
                     SigstoreFulcioRotationCommand.CreateOptions(
+                        parent.Resource))
+             .WithCommand(
+                name: SigstoreOperationCommand.RotateRekorShardCommand,
+                displayName: "Rotate Rekor Shard",
+                executeCommand: context =>
+                    SigstoreRekorShardRotationCommand.ExecuteAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreRekorShardRotationCommand.CreateOptions(
                         parent.Resource))
             .OnInitializeResource(
                (resource, context, cancellationToken) =>
@@ -371,11 +391,11 @@ public static class SigstoreResourceBuilderExtensions
                 "v2.3.0@sha256:a5ceeff41b2468f965f7259685a9553c6dbba6870108ffebfa6584df5ae22504")
             .WithContainerRuntimeArgs("--user", "root")
             .WithBindMount(
-                activePrivatePath,
-                "/var/lib/sigstore/private",
+                initialRekorSignerPath,
+                "/var/lib/sigstore/rekor",
                 isReadOnly: true)
             .WithBindMount(
-                Path.Combine(statePath, "data"),
+                primaryRekorDataPath,
                 "/var/lib/sigstore/data")
             .WithArgs(
                 "rekor-server",
@@ -385,8 +405,8 @@ public static class SigstoreResourceBuilderExtensions
                 "--grpc-address=0.0.0.0",
                 "--grpc-port=3001",
                 "--hostname=rekor-sigstore.dev.localhost",
-                "--storage-dir=/var/lib/sigstore/data/rekor",
-                "--signer-filepath=/var/lib/sigstore/private/rekor/signer.key",
+                "--storage-dir=/var/lib/sigstore/data",
+                "--signer-filepath=/var/lib/sigstore/rekor/signer.key",
                 "--checkpoint-interval=2s",
                 "--persistent-antispam",
                 "--log-level=info")
@@ -404,14 +424,58 @@ public static class SigstoreResourceBuilderExtensions
             .WaitForCompletion(stateReady)
             .WithParentRelationship(parent.Resource);
 
+        var rekorServerSecondary = builder
+            .AddContainer(
+               "rekor-server-secondary",
+               "ghcr.io/sigstore/rekor-tiles/posix",
+               "v2.3.0@sha256:a5ceeff41b2468f965f7259685a9553c6dbba6870108ffebfa6584df5ae22504")
+            .WithContainerRuntimeArgs("--user", "root")
+            .WithBindMount(
+               secondaryRekorRuntimePath,
+               "/var/lib/sigstore/rekor",
+               isReadOnly: true)
+            .WithBindMount(
+               secondaryRekorDataPath,
+               "/var/lib/sigstore/data")
+            .WithArgs(
+               "rekor-server",
+               "serve",
+               "--http-address=0.0.0.0",
+               "--http-port=3000",
+               "--grpc-address=0.0.0.0",
+               "--grpc-port=3001",
+               "--hostname=rekor-secondary-sigstore.dev.localhost",
+               "--storage-dir=/var/lib/sigstore/data",
+               "--signer-filepath=/var/lib/sigstore/rekor/signer.key",
+               "--checkpoint-interval=2s",
+               "--persistent-antispam",
+               "--log-level=info")
+            .WithEnvironment("GOMEMLIMIT", "512MiB")
+            .WithHttpEndpoint(
+               targetPort: 3000,
+               name: "http")
+            .WithEndpoint(
+               name: "grpc",
+               scheme: "http",
+               targetPort: 3001)
+            .WithHttpHealthCheck(
+               "/healthz",
+               endpointName: "http")
+            .WithExplicitStart()
+            .WithParentRelationship(parent.Resource);
+
         var rekor = builder
             .AddContainer(
                 "rekor",
                 "nginx",
                 "1.31.1@sha256:5aca99593157f4ae539a5dec1092a0ad8762f8e2eb1789085a13a0f5622369f6")
             .WithBindMount(
-                Path.Combine(statePath, "data"),
-                "/var/lib/sigstore/data",
+                primaryRekorDataPath,
+                "/var/lib/sigstore/data/primary",
+                isReadOnly: true)
+            .WithBindMount(
+                secondaryRekorDataPath,
+                "/var/lib/sigstore/data/secondary",
                 isReadOnly: true)
             .WithBindMount(
                 Path.Combine(
@@ -511,6 +575,7 @@ public static class SigstoreResourceBuilderExtensions
                 fulcio,
                 timestamp,
                 rekorServer,
+                rekorServerSecondary,
                 rekor,
                 tufBootstrap,
                 tufStateReady,

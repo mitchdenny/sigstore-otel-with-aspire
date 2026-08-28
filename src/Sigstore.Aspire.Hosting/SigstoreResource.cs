@@ -8,6 +8,7 @@ public sealed class SigstoreResource(
 {
     private readonly Lock _sync = new();
     private readonly List<IResource> _requiredResources = [];
+    private readonly List<IResource> _conditionalResources = [];
     private readonly List<SigstoreClientRegistration> _clients = [];
     private SigstoreComponents? _components;
     private EndpointReference? _tufEndpoint;
@@ -16,6 +17,8 @@ public sealed class SigstoreResource(
         SigstoreRuntimeHealthSnapshot.Starting([]);
     private SigstoreOperationState? _operation;
     private SigstoreOperationRecoveryState? _recovery;
+    private readonly HashSet<string> _activeConditionalResources =
+        new(StringComparer.Ordinal);
 
     public string StatePath { get; } = statePath;
 
@@ -57,6 +60,7 @@ public sealed class SigstoreResource(
         RegisterRequiredResource(components.Fulcio.Resource);
         RegisterRequiredResource(components.Timestamp.Resource);
         RegisterRequiredResource(components.RekorServer.Resource);
+        RegisterConditionalResource(components.RekorServerSecondary.Resource);
         RegisterRequiredResource(components.Rekor.Resource);
         RegisterRequiredResource(components.Tuf.Resource);
     }
@@ -78,6 +82,77 @@ public sealed class SigstoreResource(
             }
 
             _requiredResources.Add(resource);
+        }
+    }
+
+    internal void RegisterConditionalResource(IResource resource)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+
+        lock (_sync)
+        {
+            if (_conditionalResources.Any(
+                    existing => ReferenceEquals(existing, resource)
+                        || string.Equals(
+                            existing.Name,
+                            resource.Name,
+                            StringComparison.Ordinal)))
+            {
+                return;
+            }
+
+            _conditionalResources.Add(resource);
+        }
+    }
+
+    internal void ActivateConditionalResource(IResource resource)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        lock (_sync)
+        {
+            if (!_conditionalResources.Any(
+                    existing => ReferenceEquals(existing, resource)))
+            {
+                throw new InvalidOperationException(
+                    $"Resource '{resource.Name}' is not conditionally registered.");
+            }
+            _activeConditionalResources.Add(resource.Name);
+        }
+    }
+
+    internal void MarkResourceHistorical(IResource resource)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        lock (_sync)
+        {
+            var required = _requiredResources.SingleOrDefault(
+                existing => ReferenceEquals(existing, resource));
+            if (required is null)
+            {
+                if (_conditionalResources.Any(
+                        existing => ReferenceEquals(existing, resource)))
+                {
+                    return;
+                }
+                throw new InvalidOperationException(
+                    $"Resource '{resource.Name}' is not registered.");
+            }
+
+            _requiredResources.Remove(required);
+            if (!_conditionalResources.Any(
+                    existing => ReferenceEquals(existing, resource)))
+            {
+                _conditionalResources.Add(resource);
+            }
+            _activeConditionalResources.Remove(resource.Name);
+        }
+    }
+
+    internal bool IsConditionalResourceActive(string name)
+    {
+        lock (_sync)
+        {
+            return _activeConditionalResources.Contains(name);
         }
     }
 
@@ -132,6 +207,7 @@ public sealed class SigstoreResource(
         {
             return new SigstoreResourceRegistrationSnapshot(
                 [.. _requiredResources],
+                [.. _conditionalResources],
                 [.. _clients]);
         }
     }
@@ -317,6 +393,7 @@ internal sealed record SigstoreClientRegistration(
 
 internal sealed record SigstoreResourceRegistrationSnapshot(
     IReadOnlyList<IResource> RequiredResources,
+    IReadOnlyList<IResource> ConditionalResources,
     IReadOnlyList<SigstoreClientRegistration> Clients);
 
 internal sealed record SigstoreOperationState(

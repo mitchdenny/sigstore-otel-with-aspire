@@ -123,6 +123,9 @@ func ensureTUFRepositoryWithHooks(
 	if err != nil {
 		return "", err
 	}
+	if _, err := ensureRekorShardCatalogLocked(statePath, bootstrap); err != nil {
+		return "", fmt.Errorf("ensure Rekor shard catalog: %w", err)
+	}
 	sourceFingerprint, err := fingerprintSource(bootstrap)
 	if err != nil {
 		return "", err

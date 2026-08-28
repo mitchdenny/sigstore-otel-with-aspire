@@ -1021,8 +1021,18 @@ func newTestState(t *testing.T) string {
 		filepath.Join(generationPath, "private", "ctlog", "privkey.pem"),
 		testECPrivateKeyPEM(t, ctKey),
 	)
-	rekorPEM := testPublicKeyPEM(t, newTestKey(t))
+	rekorKey := newTestKey(t)
+	rekorPEM := testPublicKeyPEM(t, rekorKey)
 	writeTestFile(t, filepath.Join(generationPath, "public", "rekor", "signer.pub"), rekorPEM)
+	writeTestFile(
+		t,
+		filepath.Join(generationPath, "private", "rekor", "signer.key"),
+		testECPrivateKeyPEM(t, rekorKey),
+	)
+	rekorDER, err := x509.MarshalPKIXPublicKey(&rekorKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tsaRootKey := newTestKey(t)
 	tsaRootTemplate := &x509.Certificate{
@@ -1135,7 +1145,7 @@ func newTestState(t *testing.T) string {
 		CreatedAtUTC:         createdAt,
 		FulcioRootSHA256:     testHash(fulcioDER),
 		CtLogPublicKeySHA256: testHash(ctPEM),
-		RekorPublicKeySHA256: testHash(rekorPEM),
+		RekorPublicKeySHA256: testHash(rekorDER),
 		TsaRootSHA256:        testHash(tsaRootDER),
 		TsaLeafSHA256:        testHash(tsaLeafDER),
 		OIDCKeyID:            oidcKid,

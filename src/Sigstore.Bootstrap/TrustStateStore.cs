@@ -31,10 +31,12 @@ internal static partial class SigstoreStateBootstrapper
     private const string OidcRotationOperation = "oidc-rotation";
     private const string TsaRotationOperation = "tsa-rotation";
     private const string FulcioRotationOperation = "fulcio-rotation";
+    private const string RekorRotationOperation = "rekor-shard-rotation";
     private const string GenerationAdvanceOperation = "generation-advance";
     private const string OidcRotationDirectoryName = "oidc-rotation";
     private const string TsaRotationDirectoryName = "tsa-rotation";
     private const string FulcioRotationDirectoryName = "fulcio-rotation";
+    private const string RekorRotationDirectoryName = "rekor-shard-rotation";
     private const string OidcRotationCompletionFileName =
         "rotate-oidc-signing-key.completed";
     private const string TsaRotationCompletionFileName =
@@ -45,10 +47,16 @@ internal static partial class SigstoreStateBootstrapper
         "rotate-fulcio-ca.completed";
     private const string FulcioRotationRequestFileName =
         "rotate-fulcio-ca.request";
+    private const string RekorRotationCompletionFileName =
+        "rotate-rekor-shard.completed";
+    private const string RekorRotationRequestFileName =
+        "rotate-rekor-shard.request";
     private const string RuntimeDirectoryName = "runtime";
     private const string RuntimeFulcioComponentName = "fulcio";
     private const string RuntimeFulcioStagedComponentName = "fulcio.next";
     private const string RuntimeTesseractComponentName = "tesseract";
+    private const string RuntimeRekorSecondaryComponentName =
+        "rekor-secondary";
     private const string RuntimeFulcioRootCertificateFileName = "root.pem";
     private const string RuntimeFulcioRootKeyFileName = "root.key";
     private const string RuntimeFulcioPasswordFileName = "password";
@@ -99,7 +107,8 @@ internal static partial class SigstoreStateBootstrapper
         string Runtime,
         string RuntimeFulcio,
         string RuntimeFulcioStaged,
-        string RuntimeTesseract);
+        string RuntimeTesseract,
+        string RuntimeRekorSecondary);
 
     private static BootstrapResult EnsureTrustStateLocked(
         string rootPath,
@@ -681,6 +690,7 @@ internal static partial class SigstoreStateBootstrapper
             or OidcRotationOperation
             or TsaRotationOperation
             or FulcioRotationOperation
+            or RekorRotationOperation
             or GenerationAdvanceOperation))
         {
             throw new InvalidDataException(
@@ -705,6 +715,7 @@ internal static partial class SigstoreStateBootstrapper
         if (journal.Operation is OidcRotationOperation
             or TsaRotationOperation
             or FulcioRotationOperation
+            or RekorRotationOperation
             or GenerationAdvanceOperation)
         {
             if (journal.PriorGeneration is null)
@@ -1101,6 +1112,14 @@ internal static partial class SigstoreStateBootstrapper
             0,
             null,
             null,
+            null,
+            0,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
             files);
 
     private static void ValidateTrustDomain(
@@ -1200,6 +1219,7 @@ internal static partial class SigstoreStateBootstrapper
         ValidateOidcRotationMetadata(generation);
         ValidateTsaRotationMetadata(generation);
         ValidateFulcioRotationMetadata(generation);
+        ValidateRekorRotationMetadata(generation);
     }
 
     private static void ValidateGenerationCryptography(
@@ -1225,6 +1245,20 @@ internal static partial class SigstoreStateBootstrapper
                 generationPath,
                 RekorPrivateKeyPath,
                 RekorPublicKeyPath));
+        if (generation.RekorRotationOperationId is not null)
+        {
+            var priorGenerationPath = Path.Combine(
+                stateRootPath,
+                GenerationsDirectoryName,
+                generation.RekorPriorGenerationId!);
+            EnsureEqual(
+                "prior Rekor public key",
+                generation.RekorPriorPublicKeySha256!,
+                ValidateEcdsaKeyPair(
+                    priorGenerationPath,
+                    RekorPrivateKeyPath,
+                    RekorPublicKeyPath));
+        }
         var tsa = ValidateTimestampAuthority(generationPath);
         if (tsa.HasRootPrivateKey
             == (generation.TsaRotationOperationId is not null))
@@ -1547,6 +1581,59 @@ internal static partial class SigstoreStateBootstrapper
         }
     }
 
+    private static void ValidateRekorRotationMetadata(
+        GenerationManifest generation)
+    {
+        if (generation.RekorRotationOperationId is null)
+        {
+            if (generation.RekorPriorGeneration != 0
+                || generation.RekorPriorGenerationId is not null
+                || generation.RekorPriorPublicKeySha256 is not null
+                || generation.RekorPriorShardId is not null
+                || generation.RekorPriorBaseUrl is not null
+                || generation.RekorShardId is not null
+                || generation.RekorBaseUrl is not null)
+            {
+                throw new InvalidDataException(
+                    "Generation contains partial Rekor shard rotation metadata.");
+            }
+            return;
+        }
+
+        if (!Guid.TryParseExact(
+                generation.RekorRotationOperationId,
+                "N",
+                out _)
+            || generation.RekorRotationOperationId.Any(char.IsUpper)
+            || generation.RekorPriorGeneration < InitialGeneration
+            || generation.RekorPriorGeneration >= generation.Generation
+            || generation.RekorPriorGenerationId
+                != GenerationId(generation.RekorPriorGeneration))
+        {
+            throw new InvalidDataException(
+                "Generation contains invalid Rekor shard rotation identity " +
+                "metadata.");
+        }
+        ValidateSha256(
+            generation.RekorPriorPublicKeySha256,
+            "prior Rekor public key");
+        if (generation.RekorPriorShardId
+                != $"sha256-{generation.RekorPriorPublicKeySha256}"
+            || generation.RekorPriorBaseUrl
+                != "http://rekor-sigstore.dev.localhost:3000"
+            || generation.RekorPriorPublicKeySha256
+                == generation.RekorPublicKeySha256
+            || generation.RekorShardId
+                != $"sha256-{generation.RekorPublicKeySha256}"
+            || generation.RekorBaseUrl
+                != "http://rekor-secondary-sigstore.dev.localhost:3000")
+        {
+            throw new InvalidDataException(
+                "Rekor shard rotation did not bind distinct old and new log " +
+                "identities.");
+        }
+    }
+
     private static void ValidateOidcRotationMetadata(
             GenerationManifest generation)
         {
@@ -1772,6 +1859,21 @@ internal static partial class SigstoreStateBootstrapper
                 Path.Combine(layout.Root, FulcioRotationRequestFileName)))
         {
             allowed.Add(FulcioRotationRequestFileName);
+        }
+        if (Directory.Exists(
+                Path.Combine(layout.Root, RekorRotationDirectoryName)))
+        {
+            allowed.Add(RekorRotationDirectoryName);
+        }
+        if (File.Exists(
+                Path.Combine(layout.Root, RekorRotationCompletionFileName)))
+        {
+            allowed.Add(RekorRotationCompletionFileName);
+        }
+        if (File.Exists(
+                Path.Combine(layout.Root, RekorRotationRequestFileName)))
+        {
+            allowed.Add(RekorRotationRequestFileName);
         }
         EnsureOnlyEntries(
             layout.Root,
@@ -2275,6 +2377,28 @@ internal static partial class SigstoreStateBootstrapper
             RuntimeFulcioComponentName,
             RuntimeTesseractComponentName
         };
+        var secondaryRekorRuntimeExists = PathExists(
+            layout.RuntimeRekorSecondary);
+        if (secondaryRekorRuntimeExists)
+        {
+            allowedRuntimeEntries.Add(RuntimeRekorSecondaryComponentName);
+            var runtimeRekor = ValidateRekorRuntimeSigner(
+                layout.RuntimeRekorSecondary);
+            if (generation.RekorRotationOperationId is not null
+                && runtimeRekor.PublicKeySha256
+                    != generation.RekorPublicKeySha256)
+            {
+                throw new InvalidDataException(
+                    "The secondary Rekor runtime signer does not match the " +
+                    "active rotated generation.");
+            }
+        }
+        else if (generation.RekorRotationOperationId is not null)
+        {
+            throw new InvalidDataException(
+                "The active rotated generation is missing the secondary Rekor " +
+                "runtime signer.");
+        }
         var stagedExists = PathExists(layout.RuntimeFulcioStaged);
         if (stagedExists)
         {
@@ -2602,7 +2726,8 @@ internal static partial class SigstoreStateBootstrapper
             runtime,
             Path.Combine(runtime, RuntimeFulcioComponentName),
             Path.Combine(runtime, RuntimeFulcioStagedComponentName),
-            Path.Combine(runtime, RuntimeTesseractComponentName));
+            Path.Combine(runtime, RuntimeTesseractComponentName),
+            Path.Combine(runtime, RuntimeRekorSecondaryComponentName));
     }
 
     private static string ReadActiveGeneration(
@@ -2819,6 +2944,29 @@ internal static partial class SigstoreStateBootstrapper
             && OrdinalEquals(
                 expected.FulcioPriorRootSha256,
                 actual.FulcioPriorRootSha256)
+            && OrdinalEquals(
+                expected.RekorRotationOperationId,
+                actual.RekorRotationOperationId)
+            && expected.RekorPriorGeneration
+                == actual.RekorPriorGeneration
+            && OrdinalEquals(
+                expected.RekorPriorGenerationId,
+                actual.RekorPriorGenerationId)
+            && OrdinalEquals(
+                expected.RekorPriorPublicKeySha256,
+                actual.RekorPriorPublicKeySha256)
+            && OrdinalEquals(
+                expected.RekorPriorShardId,
+                actual.RekorPriorShardId)
+            && OrdinalEquals(
+                expected.RekorPriorBaseUrl,
+                actual.RekorPriorBaseUrl)
+            && OrdinalEquals(
+                expected.RekorShardId,
+                actual.RekorShardId)
+            && OrdinalEquals(
+                expected.RekorBaseUrl,
+                actual.RekorBaseUrl)
             && FileMapsEqual(expected.Files, actual.Files);
 
     private static bool OrdinalEquals(string? expected, string? actual)

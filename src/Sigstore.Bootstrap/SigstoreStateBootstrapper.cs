@@ -33,6 +33,8 @@ internal static partial class SigstoreStateBootstrapper
         "data/ctlog/bootstrap-state";
     private const string RekorStateMarkerPath =
         "data/rekor/bootstrap-state";
+    private const string RekorSecondaryDataPath =
+        "data/rekor-shards/secondary";
 
     private static readonly string[] LegacyRequiredStateFiles =
     [
@@ -73,6 +75,12 @@ internal static partial class SigstoreStateBootstrapper
         FulcioRootCertificatePath
     ];
 
+    private static readonly string[] RekorRotationCandidateFiles =
+    [
+        RekorPrivateKeyPath,
+        RekorPublicKeyPath
+    ];
+
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
         {
@@ -111,9 +119,12 @@ internal static partial class SigstoreStateBootstrapper
             rootPath,
             options.LockTimeout,
             "bootstrap-or-trust-transition");
-        return EnsureTrustStateLocked(
+        var result = EnsureTrustStateLocked(
             rootPath,
             options);
+        Directory.CreateDirectory(
+            Resolve(rootPath, RekorSecondaryDataPath));
+        return result;
     }
 
     internal static BootstrapManifest CreateSchema4StateForMigrationTests(
@@ -494,6 +505,7 @@ internal static partial class SigstoreStateBootstrapper
             ValidateFulcioRotationCandidateFileSet(candidatePath);
             return ValidateFulcioCertificateAuthority(candidatePath);
         }
+
         if (File.Exists(candidatePath))
         {
             throw new InvalidDataException(
@@ -532,6 +544,132 @@ internal static partial class SigstoreStateBootstrapper
 
         ValidateFulcioRotationCandidateFileSet(candidatePath);
         return ValidateFulcioCertificateAuthority(candidatePath);
+    }
+
+    internal static RekorShardMaterialInfo
+        EnsureRekorShardRotationCandidate(string candidatePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidatePath);
+        candidatePath = Path.GetFullPath(candidatePath);
+        var parentPath = Directory.GetParent(candidatePath)?.FullName
+            ?? throw new InvalidOperationException(
+                $"Cannot determine the parent directory for '{candidatePath}'.");
+        Directory.CreateDirectory(parentPath);
+
+        if (Directory.Exists(candidatePath))
+        {
+            ValidateRekorRotationCandidateFileSet(candidatePath);
+            return ValidateRekorShardMaterial(candidatePath);
+        }
+        if (File.Exists(candidatePath))
+        {
+            throw new InvalidDataException(
+                $"Rekor rotation candidate '{candidatePath}' is not a directory.");
+        }
+
+        var stagingPath = candidatePath + ".staging";
+        if (Directory.Exists(stagingPath))
+        {
+            Directory.Delete(stagingPath, recursive: true);
+        }
+        else if (File.Exists(stagingPath))
+        {
+            throw new InvalidDataException(
+                $"Rekor rotation staging path '{stagingPath}' is not a directory.");
+        }
+
+        try
+        {
+            Directory.CreateDirectory(stagingPath);
+            GenerateEcdsaKeyPair(
+                stagingPath,
+                RekorPrivateKeyPath,
+                RekorPublicKeyPath);
+            ValidateRekorRotationCandidateFileSet(stagingPath);
+            _ = ValidateRekorShardMaterial(stagingPath);
+            Directory.Move(stagingPath, candidatePath);
+        }
+        catch
+        {
+            if (Directory.Exists(stagingPath))
+            {
+                Directory.Delete(stagingPath, recursive: true);
+            }
+            throw;
+        }
+
+        ValidateRekorRotationCandidateFileSet(candidatePath);
+        return ValidateRekorShardMaterial(candidatePath);
+    }
+
+    internal static RekorShardMaterialInfo StageRekorShardRuntime(
+        string statePath,
+        string candidatePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidatePath);
+        candidatePath = Path.GetFullPath(candidatePath);
+        var expected = ValidateRekorShardMaterial(candidatePath);
+        var runtimePath = Path.Combine(
+            Path.GetFullPath(statePath),
+            "runtime",
+            "rekor-secondary");
+        if (Directory.Exists(runtimePath))
+        {
+            var actual = ValidateRekorRuntimeSigner(runtimePath);
+            if (actual != expected)
+            {
+                throw new InvalidDataException(
+                    "The staged Rekor secondary signer does not match the " +
+                    "immutable rotation candidate.");
+            }
+            return actual;
+        }
+        if (File.Exists(runtimePath))
+        {
+            throw new InvalidDataException(
+                $"Rekor runtime path '{runtimePath}' is not a directory.");
+        }
+
+        var stagingPath = runtimePath + ".staging";
+        if (Directory.Exists(stagingPath))
+        {
+            Directory.Delete(stagingPath, recursive: true);
+        }
+        else if (File.Exists(stagingPath))
+        {
+            throw new InvalidDataException(
+                $"Rekor runtime staging path '{stagingPath}' is not a directory.");
+        }
+
+        try
+        {
+            Directory.CreateDirectory(stagingPath);
+            WriteFile(
+                Path.Combine(stagingPath, "signer.key"),
+                File.ReadAllText(
+                    Resolve(
+                        candidatePath,
+                        RekorPrivateKeyPath)),
+                isPrivate: true);
+            var actual = ValidateRekorRuntimeSigner(stagingPath);
+            if (actual != expected)
+            {
+                throw new InvalidDataException(
+                    "The staged Rekor runtime signer changed during copy.");
+            }
+            Directory.Move(stagingPath, runtimePath);
+        }
+        catch
+        {
+            if (Directory.Exists(stagingPath))
+            {
+                Directory.Delete(stagingPath, recursive: true);
+            }
+            throw;
+        }
+
+        return ValidateRekorRuntimeSigner(runtimePath);
     }
 
     /// <summary>
@@ -679,6 +817,58 @@ internal static partial class SigstoreStateBootstrapper
             throw new InvalidDataException(
                 "The Fulcio rotation candidate has an unexpected file set.");
         }
+    }
+
+    private static void ValidateRekorRotationCandidateFileSet(
+        string rootPath)
+    {
+        var actual = Directory.EnumerateFiles(
+                rootPath,
+                "*",
+                SearchOption.AllDirectories)
+            .Select(path => Path.GetRelativePath(rootPath, path)
+                .Replace(Path.DirectorySeparatorChar, '/'))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (!actual.SequenceEqual(
+                RekorRotationCandidateFiles.Order(StringComparer.Ordinal),
+                StringComparer.Ordinal))
+        {
+            throw new InvalidDataException(
+                "The Rekor rotation candidate has an unexpected file set.");
+        }
+    }
+
+    internal static RekorShardMaterialInfo ValidateRekorShardMaterial(
+        string rootPath)
+    {
+        var publicKeySha256 = ValidateEcdsaKeyPair(
+            rootPath,
+            RekorPrivateKeyPath,
+            RekorPublicKeyPath);
+        return new(
+            publicKeySha256,
+            publicKeySha256,
+            $"sha256-{publicKeySha256}");
+    }
+
+    internal static RekorShardMaterialInfo ValidateRekorRuntimeSigner(
+        string runtimePath)
+    {
+        EnsureOnlyEntries(runtimePath, ["signer.key"]);
+        using var privateKey = LoadEcdsaKey(
+            Path.Combine(runtimePath, "signer.key"));
+        if (privateKey.KeySize != 256)
+        {
+            throw new InvalidDataException(
+                "The Rekor shard signer must use ECDSA P-256.");
+        }
+        var publicKeySha256 = Fingerprint(
+            privateKey.ExportSubjectPublicKeyInfo());
+        return new(
+            publicKeySha256,
+            publicKeySha256,
+            $"sha256-{publicKeySha256}");
     }
 
     private static BootstrapManifest ValidateLegacyState(string rootPath)

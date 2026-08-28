@@ -27,10 +27,15 @@ do not need to be installed locally.
   `http://fulcio-sigstore.dev.localhost:5555`.
 - `timestamp` issues RFC 3161 signed timestamps using a run-scoped local file
   signer at `http://timestamp-sigstore.dev.localhost:3004`.
-- `rekor-server` sequences artifact-signature entries into a run-scoped Rekor
-  v2 tile log under `.sigstore/data/rekor`.
-- `rekor` is the single Rekor v2 gateway for entry uploads and static tile
-  reads at `http://rekor-sigstore.dev.localhost:3000`.
+- `rekor-server` sequences artifact-signature entries into the initial
+  run-scoped Rekor v2 shard under `.sigstore/data/rekor`. Its immutable public
+  URL remains `http://rekor-sigstore.dev.localhost:3000`.
+- `rekor-server-secondary` is an explicit-start writer for the one bounded
+  Step 12 rotation shard. It has its own signer and storage and is started and
+  health-proven before routing changes.
+- `rekor` is the stable multi-shard Rekor v2 gateway. It preserves the initial
+  root URL and serves the secondary shard at
+  `http://rekor-secondary-sigstore.dev.localhost:3000`.
 - `tuf-bootstrap` builds the signed TUF repository, Sigstore `TrustedRoot`,
   `SigningConfig`, and combined client trust configuration.
 - `tuf` serves the signed repository and public client configuration at
@@ -139,12 +144,23 @@ The trust-domain identity is separate from its active key generation:
 |       |-- command.json
 |       `-- candidate/public/fulcio/root.pem
 |-- rotate-fulcio-ca.completed
+|-- rekor-shard-rotation/
+|   `-- <operation-id>/
+|       |-- candidate/
+|       |-- hosting-state.json
+|       `-- command.json
+|-- rotate-rekor-shard.completed
 |-- runtime/
 |   |-- fulcio/                         # active CA + CT public key only
-|   `-- tesseract/                      # CT private key + accepted roots only
+|   |-- tesseract/                      # CT private key + accepted roots only
+|   `-- rekor-secondary/                # secondary Rekor signer only
 |-- migration/
 |   `-- bootstrap-manifest.schema-4.json  # migrated state only
 |-- data/
+|   |-- rekor/                          # immutable primary shard identity/data
+|   `-- rekor-shards/
+|       |-- state.json                  # schema-1 shard catalog
+|       `-- secondary/                  # independent secondary tile log
 `-- tuf/
 ```
 
@@ -353,16 +369,22 @@ by Fulcio's read-only API, the unchanged CT key/log ID, and a signed CT
 checkpoint. The parent is not Healthy while disk, served TUF, clients,
 Tesseract roots, or the live Fulcio issuer disagree.
 
-The parent state is event-driven and aggregates all 14 long-running resources:
-the seven Sigstore services, `shady-blob-store`, and six clients. It shows
-**Healthy** only when all 14 are running and healthy, **Starting** while initial
-readiness is pending, and **Degraded** with the first definitive reason when a
-required resource stops or becomes unhealthy. Starting a stopped child restores
-the parent to **Healthy** without changing trust state.
+The parent state is event-driven and initially aggregates 14 required
+long-running resources: the seven active Sigstore services,
+`shady-blob-store`, and six clients. The explicit-start secondary Rekor writer
+is conditional: it does not degrade initial health while no rotation has
+activated it, then becomes required after cutover. At that same boundary the
+primary writer becomes historical and no longer participates in parent health;
+this bounded implementation leaves it running, but immutable primary checkpoint
+and tile reads through nginx are the retention contract if it is stopped. The
+parent shows **Healthy** only when
+every active required resource is running and healthy, **Starting** while
+initial readiness is pending, and **Degraded** with the first definitive
+reason when an active required resource stops or becomes unhealthy.
 
 ## Dashboard operations
 
-The parent also exposes seven confirmed, progress-reporting operations in the
+The parent also exposes eight confirmed, progress-reporting operations in the
 dashboard and through the Aspire CLI:
 
 ```bash
@@ -373,6 +395,7 @@ aspire resource sigstore publish-trusted-root | jq
 aspire resource sigstore rotate-oidc-signing-key | jq
 aspire resource sigstore rotate-timestamp-authority | jq
 aspire resource sigstore rotate-fulcio-ca | jq
+aspire resource sigstore rotate-rekor-shard | jq
 ```
 
 `refresh-tuf` starts a new instance of the existing `tuf-bootstrap` one-shot
@@ -618,3 +641,54 @@ advanced, and old artifact 14 plus new artifact 70 passed all six targeted
 native verifiers. Dynamic fingerprints and container IDs are run-scoped and
 are reported with the validation commit rather than treated as static
 configuration.
+
+## Rekor Shard Rotation (Step 12)
+
+`rotate-rekor-shard` creates a new logical append-only log instead of replacing
+the signer of the initial log:
+
+```bash
+aspire resource sigstore rotate-rekor-shard
+```
+
+The initial shard keeps its generation-1 signer, log ID, storage, signed
+checkpoint, immutable tiles, writer, and canonical root URL. The command
+creates a distinct ECDSA P-256 signer in immutable generation N+1 and stages
+only that private signer in `runtime/rekor-secondary`. The secondary writer
+can see only its signer and `.sigstore/data/rekor-shards/secondary`; the
+primary writer remains bound to generation 1 and `.sigstore/data/rekor`.
+Nginx sees only the two public shard data trees and its routing configuration.
+
+Cutover is ordered to avoid an unavailable route. The command durably creates
+and validates the candidate and shard catalog, starts the explicit secondary
+writer, proves its Aspire health and gateway route, and only then dispatches
+the TUF worker. The worker creates generation N+1 by replacing only Rekor
+signer material, appends the secondary `TransparencyLogInstance` to
+`TrustedRoot`, changes the single active Rekor v2 `SigningConfig` URL to the
+stable secondary hostname, and transactionally advances targets, snapshot, and
+timestamp.
+The TUF bootstrap root, root role, Fulcio, CT, TSA, OIDC, standby and
+historical trust, and unrelated routes remain unchanged.
+
+After the TUF commit, recovery proceeds only forward. All six clients restart
+in deterministic resource-name order, fetch additive trust plus the exclusive
+secondary route, and must agree on the new generation before success. New
+artifacts must carry the secondary log ID, while a retained old artifact must
+still verify in every language and the primary checkpoint/tile hashes must not
+change except for legitimate entries accepted before cutover. Index zero is a
+valid first secondary entry and is never skipped or rewritten.
+
+The schema-1 hosting journal records candidate creation, secondary start and
+container identity, gateway availability, TUF preparation/commit and
+generation switch, each client convergence, first secondary entry, old/new
+artifact proofs, checkpoint/data continuity, and final completion. Before the
+TUF routing commit, failure leaves clients on the primary route. After commit,
+replay validates every stored identity/hash and resumes forward. A second
+independent rotation in the same AppHost run is explicitly rejected without
+mutation; the same incomplete operation is idempotently resumed. The AppHost
+reset boundary still discards the complete run-scoped trust and shard state.
+
+The known Python omitted-index-zero bundle parser issue remains out of scope.
+The operation does not seed an entry, hide artifact zero, or change bundle
+serialization; when encountered, it is reported and selected old/new bundles
+are proven through the existing generation-pinned targeted verifier.

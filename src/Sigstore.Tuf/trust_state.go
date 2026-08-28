@@ -62,6 +62,14 @@ type generationManifest struct {
 	FulcioPriorGeneration       int               `json:"fulcioPriorGeneration,omitempty"`
 	FulcioPriorGenerationID     string            `json:"fulcioPriorGenerationId,omitempty"`
 	FulcioPriorRootSHA256       string            `json:"fulcioPriorRootSha256,omitempty"`
+	RekorRotationOperationID    string            `json:"rekorRotationOperationId,omitempty"`
+	RekorPriorGeneration        int               `json:"rekorPriorGeneration,omitempty"`
+	RekorPriorGenerationID      string            `json:"rekorPriorGenerationId,omitempty"`
+	RekorPriorPublicKeySHA256   string            `json:"rekorPriorPublicKeySha256,omitempty"`
+	RekorPriorShardID           string            `json:"rekorPriorShardId,omitempty"`
+	RekorPriorBaseURL           string            `json:"rekorPriorBaseUrl,omitempty"`
+	RekorShardID                string            `json:"rekorShardId,omitempty"`
+	RekorBaseURL                string            `json:"rekorBaseUrl,omitempty"`
 	Files                       map[string]string `json:"files"`
 }
 
@@ -349,6 +357,9 @@ func validateGenerationState(
 	}
 	if err := validateFulcioGenerationMaterial(generationPath, generation); err != nil {
 		return fmt.Errorf("validate Fulcio generation material: %w", err)
+	}
+	if err := validateRekorGenerationMaterial(generationPath, generation); err != nil {
+		return fmt.Errorf("validate Rekor generation material: %w", err)
 	}
 	ctState, err := os.ReadFile(filepath.Join(statePath, "data", "ctlog", "bootstrap-state"))
 	if err != nil {

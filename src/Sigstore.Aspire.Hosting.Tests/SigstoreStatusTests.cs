@@ -90,6 +90,51 @@ public sealed class SigstoreStatusTests
     }
 
     [Fact]
+    public void HistoricalRekorWriterDoesNotDegradeActiveShardHealth()
+    {
+        var parent = new SigstoreResource(
+            "sigstore",
+            "/tmp/sigstore",
+            "/tmp/source");
+        var primary = new ContainerResource("rekor-server");
+        var secondary = new ContainerResource("rekor-server-secondary");
+        parent.RegisterRequiredResource(primary);
+        parent.RegisterConditionalResource(secondary);
+        parent.ActivateConditionalResource(secondary);
+        parent.MarkResourceHistorical(primary);
+
+        var registrations = parent.GetRegistrations();
+        var requiredNames = registrations.RequiredResources
+            .Select(resource => resource.Name)
+            .Concat(
+                registrations.ConditionalResources
+                    .Where(
+                        resource => parent.IsConditionalResourceActive(
+                            resource.Name))
+                    .Select(resource => resource.Name))
+            .ToHashSet(StringComparer.Ordinal);
+        var observed = new Dictionary<string, SigstoreObservedResource>(
+            StringComparer.Ordinal)
+        {
+            [primary.Name] = new(
+                KnownResourceStates.Exited,
+                null),
+            [secondary.Name] = new(
+                KnownResourceStates.Running,
+                HealthStatus.Healthy)
+        };
+
+        var status = SigstoreParentHealthMonitor.Evaluate(
+            requiredNames,
+            observed,
+            wasHealthy: true);
+
+        Assert.Equal("Healthy", status.State);
+        Assert.Equal([secondary.Name], requiredNames);
+        Assert.False(parent.IsConditionalResourceActive(primary.Name));
+    }
+
+    [Fact]
     public void ClientStatusParserRejectsIdentityAndHashErrors()
     {
         var resource = new ContainerResource("go-client");

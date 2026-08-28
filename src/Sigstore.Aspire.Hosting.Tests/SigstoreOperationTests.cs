@@ -38,7 +38,8 @@ public sealed class SigstoreOperationTests
                 SigstoreOperationCommand.PublishTrustedRootCommand,
                 SigstoreOperationCommand.RotateOidcSigningKeyCommand,
                 SigstoreOperationCommand.RotateTimestampAuthorityCommand,
-                SigstoreOperationCommand.RotateFulcioCaCommand
+                SigstoreOperationCommand.RotateFulcioCaCommand,
+                SigstoreOperationCommand.RotateRekorShardCommand
             ],
             annotations.Keys);
 
@@ -50,7 +51,8 @@ public sealed class SigstoreOperationTests
             SigstoreOperationCommand.PublishTrustedRootCommand,
             SigstoreOperationCommand.RotateOidcSigningKeyCommand,
             SigstoreOperationCommand.RotateTimestampAuthorityCommand,
-            SigstoreOperationCommand.RotateFulcioCaCommand
+            SigstoreOperationCommand.RotateFulcioCaCommand,
+            SigstoreOperationCommand.RotateRekorShardCommand
         })
         {
             var annotation = annotations[name];

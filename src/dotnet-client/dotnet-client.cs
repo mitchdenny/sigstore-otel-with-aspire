@@ -700,9 +700,11 @@ internal sealed class SigstoreRuntime : IDisposable
     private readonly HttpClient timestampHttpClient = CreateHttpClient();
     private readonly HttpClient oidcHttpClient = CreateHttpClient();
     private readonly FulcioHttpClient fulcio;
-    private readonly RekorHttpClient rekor;
+    private readonly HttpOidcTokenProvider tokenProvider;
     private readonly HttpTimestampAuthority timestampAuthority;
     private readonly TufTrustRootProvider trustRootProvider;
+    private RekorHttpClient? rekor;
+    private SigstoreSigner? signer;
 
     public SigstoreRuntime(DemoOptions options)
     {
@@ -720,16 +722,12 @@ internal sealed class SigstoreRuntime : IDisposable
         fulcio = new FulcioHttpClient(
             fulcioHttpClient,
             options.FulcioUrl);
-        rekor = new RekorHttpClient(
-            rekorHttpClient,
-            options.RekorUrl,
-            majorApiVersion: 2);
         timestampAuthority = new HttpTimestampAuthority(
             timestampHttpClient,
             new Uri(
                 NormalizeBaseUrl(options.TimestampUrl),
                 "api/v1/timestamp"));
-        var tokenProvider = new HttpOidcTokenProvider(
+        tokenProvider = new HttpOidcTokenProvider(
             oidcHttpClient,
             new Uri(
                 NormalizeBaseUrl(options.OidcUrl),
@@ -737,12 +735,6 @@ internal sealed class SigstoreRuntime : IDisposable
             options.ExpectedIdentity,
             options.ExpectedIssuer);
 
-        Signer = new SigstoreSigner(
-            fulcio,
-            rekor,
-            timestampAuthority,
-            tokenProvider,
-            trustRootProvider);
         Verifier = new SigstoreVerifier(
             trustRootProvider);
         VerificationPolicy = new VerificationPolicy
@@ -758,7 +750,10 @@ internal sealed class SigstoreRuntime : IDisposable
         };
     }
 
-    public SigstoreSigner Signer { get; }
+    public SigstoreSigner Signer =>
+        signer
+        ?? throw new InvalidOperationException(
+            "Sigstore trust has not been initialized.");
 
     public SigstoreVerifier Verifier { get; }
 
@@ -810,7 +805,18 @@ internal sealed class SigstoreRuntime : IDisposable
                 cancellationToken);
             _ = TrustedRoot.Deserialize(
                 Encoding.UTF8.GetString(trustedRoot.Content.Span));
-            ValidateSigningConfig(signingConfig.Content.Span);
+            var rekorUrl = ValidateSigningConfig(
+                signingConfig.Content.Span);
+            rekor = new RekorHttpClient(
+                rekorHttpClient,
+                rekorUrl,
+                majorApiVersion: 2);
+            signer = new SigstoreSigner(
+                fulcio,
+                rekor,
+                timestampAuthority,
+                tokenProvider,
+                trustRootProvider);
             var rootVersion = ReadMetadataVersion(
                 statusCache.LoadMetadata("root"),
                 "root");
@@ -848,7 +854,7 @@ internal sealed class SigstoreRuntime : IDisposable
     {
         trustRootProvider.Dispose();
         timestampAuthority.Dispose();
-        rekor.Dispose();
+        rekor?.Dispose();
         fulcio.Dispose();
         oidcHttpClient.Dispose();
         timestampHttpClient.Dispose();
@@ -916,7 +922,7 @@ internal sealed class SigstoreRuntime : IDisposable
             initializedAtUtc);
     }
 
-    private static void ValidateSigningConfig(
+    internal static Uri ValidateSigningConfig(
         ReadOnlySpan<byte> signingConfigBytes)
     {
         using var document = JsonDocument.Parse(
@@ -930,6 +936,29 @@ internal sealed class SigstoreRuntime : IDisposable
             throw new InvalidDataException(
                 $"Unsupported signing configuration media type '{mediaType}'.");
         }
+
+        var urls = document.RootElement
+            .GetProperty("rekorTlogUrls")
+            .EnumerateArray()
+            .Where(
+                service => service
+                    .GetProperty("majorApiVersion")
+                    .GetInt32() == 2)
+            .Select(service => service.GetProperty("url").GetString())
+            .ToArray();
+        if (urls is not [var selected]
+            || !Uri.TryCreate(
+                selected,
+                UriKind.Absolute,
+                out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp
+                && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            throw new InvalidDataException(
+                "Verified signing configuration must select exactly one " +
+                "absolute HTTP(S) Rekor v2 URL.");
+        }
+        return uri;
     }
 
     private static int ReadMetadataVersion(
