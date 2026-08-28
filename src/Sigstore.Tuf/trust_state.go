@@ -120,7 +120,7 @@ func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
 			"trust-domain manifest does not match the transition journal",
 		)
 	}
-	if !reflect.DeepEqual(journal.TrustDomain, domain) {
+	if !trustDomainEqual(journal.TrustDomain, domain) {
 		return bootstrapManifest{}, errors.New(
 			"journaled trust-domain identity does not match the immutable manifest",
 		)
@@ -350,4 +350,16 @@ func hashBytes(data []byte) string {
 
 func sha256Bytes(data []byte) [32]byte {
 	return sha256.Sum256(data)
+}
+
+// trustDomainEqual compares two trustDomainManifest values semantically.
+// Unlike reflect.DeepEqual, it uses time.Equal() for CreatedAtUTC so that
+// equivalent timestamps with different timezone representations (e.g., "Z"
+// vs "+00:00") are treated as equal.
+func trustDomainEqual(a, b trustDomainManifest) bool {
+	return a.SchemaVersion == b.SchemaVersion &&
+		a.TrustDomainID == b.TrustDomainID &&
+		a.CreatedAtUTC.Equal(b.CreatedAtUTC) &&
+		a.CtLogStateID == b.CtLogStateID &&
+		a.RekorStateID == b.RekorStateID
 }
