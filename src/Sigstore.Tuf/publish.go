@@ -18,6 +18,7 @@ import (
 	commonv1 "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
 	trustrootv1 "github.com/sigstore/protobuf-specs/gen/pb-go/trustroot/v1"
 	tuf "github.com/theupdateframework/go-tuf"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -121,6 +122,47 @@ func writeCompletion(statePath string, comp publishCompletion) error {
 	return writeAtomicJSON(filepath.Join(statePath, publishCompletionFile), data)
 }
 
+// validateCompletionAgainstState ensures a completion record matches the
+// current live state (trust domain, generation, publication). A stale or
+// tampered completion must not be accepted as replay success.
+func validateCompletionAgainstState(statePath string, comp *publishCompletion) error {
+	domain, err := loadTrustDomain(statePath)
+	if err != nil {
+		return fmt.Errorf("load trust domain: %w", err)
+	}
+	if comp.TrustDomainID != domain.TrustDomainID {
+		return fmt.Errorf("completion trust domain %q does not match active %q", comp.TrustDomainID, domain.TrustDomainID)
+	}
+	if comp.Generation < 1 {
+		return fmt.Errorf("completion generation %d invalid", comp.Generation)
+	}
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		return fmt.Errorf("load active generation: %w", err)
+	}
+	if comp.Generation != bootstrap.Generation {
+		return fmt.Errorf("completion generation %d does not match active %d", comp.Generation, bootstrap.Generation)
+	}
+	if comp.GenerationID != bootstrap.GenerationID {
+		return fmt.Errorf("completion generationId %q does not match active %q", comp.GenerationID, bootstrap.GenerationID)
+	}
+	layout := newTUFLayout(statePath)
+	state, err := loadPublicationState(layout)
+	if err != nil {
+		return fmt.Errorf("load publication state: %w", err)
+	}
+	if state.Active == nil {
+		return fmt.Errorf("no active publication for completion validation")
+	}
+	if comp.PublicationID != state.Active.ID {
+		return fmt.Errorf("completion publicationId %q does not match active %q", comp.PublicationID, state.Active.ID)
+	}
+	if comp.ManifestSHA256 != state.Active.ManifestSHA256 {
+		return fmt.Errorf("completion manifestSha256 %q does not match active %q", comp.ManifestSHA256, state.Active.ManifestSHA256)
+	}
+	return nil
+}
+
 // dispatchPublishRequest handles the full lifecycle of a publish-trusted-root
 // request including recovery, replay detection, and deterministic consumption.
 // This is the production entry point called from main. Holds the shared state
@@ -158,6 +200,15 @@ func dispatchPublishRequestWithHooks(statePath string, hooks publicationHooks) (
 	}
 	defer stateLock.release()
 
+	// (B) Validate request trust domain against immutable state under lock.
+	domain, err := loadTrustDomain(statePath)
+	if err != nil {
+		return "", fmt.Errorf("load trust domain for request validation: %w", err)
+	}
+	if domain.TrustDomainID != req.TrustDomainID {
+		return "", fmt.Errorf("request trust domain %q does not match immutable domain %q", req.TrustDomainID, domain.TrustDomainID)
+	}
+
 	// Check if this operation was already completed (crash after completion
 	// write but before request file removal).
 	comp, err := loadAndValidateCompletion(statePath)
@@ -166,8 +217,13 @@ func dispatchPublishRequestWithHooks(statePath string, hooks publicationHooks) (
 		return "", fmt.Errorf("ambiguous completion state: %w", err)
 	}
 	if comp != nil && comp.OperationID == req.OperationID {
-		// Same operation already completed. Remove request and return success.
-		_ = os.Remove(requestPath)
+		// (A) Validate completion matches live state before accepting replay.
+		if err := validateCompletionAgainstState(statePath, comp); err != nil {
+			return "", fmt.Errorf("completion replay validation failed: %w", err)
+		}
+		if err := os.Remove(requestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("remove request after replay: %w", err)
+		}
 		return repositoryActionPublished, nil
 	}
 
@@ -212,7 +268,9 @@ func dispatchPublishRequestWithHooks(statePath string, hooks publicationHooks) (
 			if err := writeCompletion(statePath, newComp); err != nil {
 				return "", err
 			}
-			_ = os.Remove(requestPath)
+			if err := os.Remove(requestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return "", fmt.Errorf("remove request after forward-recovery: %w", err)
+			}
 			return repositoryActionPublished, nil
 
 		case recoveryNoop, recoveryRolledBack:
@@ -608,7 +666,8 @@ func publishNewTargets(
 	}
 
 	// Build new targets with additive verification material.
-	targets, err := buildAdditiveTargets(generationPath, bootstrap)
+	activeTUFTargetsPath := filepath.Join(activePath, "targets")
+	targets, err := buildAdditiveTargets(generationPath, bootstrap, activeTUFTargetsPath)
 	if err != nil {
 		_ = os.RemoveAll(layout.candidate)
 		return err
@@ -802,30 +861,24 @@ func finalizePublishPublication(
 	return nil
 }
 
-// buildAdditiveTargets produces TUF targets that include both the original
-// verification material and the new standby Rekor key. SigningConfig is
-// unchanged — the standby key is present for future verification only.
-func buildAdditiveTargets(generationPath string, bootstrap bootstrapManifest) ([]tufTarget, error) {
+// buildAdditiveTargets produces TUF targets that preserve all existing
+// verification material exactly and append only the new standby Rekor key.
+// SigningConfig is preserved byte-for-byte — no routing changes.
+// activeTUFTargetsPath points to the current committed TUF targets directory.
+func buildAdditiveTargets(generationPath string, bootstrap bootstrapManifest, activeTUFTargetsPath string) ([]tufTarget, error) {
+	// Load raw PEM target files from the generation directory (byte-identical
+	// copies of prior generation material used as individual TUF targets).
 	fulcioPEM, err := os.ReadFile(filepath.Join(generationPath, "public", "fulcio", "root.pem"))
 	if err != nil {
 		return nil, fmt.Errorf("read Fulcio root: %w", err)
 	}
-	fulcioBlock, _ := pem.Decode(fulcioPEM)
-	if fulcioBlock == nil || fulcioBlock.Type != "CERTIFICATE" {
-		return nil, fmt.Errorf("Fulcio root is not a PEM certificate")
-	}
-	fulcioCert, err := x509.ParseCertificate(fulcioBlock.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse Fulcio root: %w", err)
-	}
-
-	ctPEM, ctDER, err := loadP256PublicKey(
+	ctPEM, _, err := loadP256PublicKey(
 		filepath.Join(generationPath, "public", "ctlog", "pubkey.pem"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load CT log key: %w", err)
 	}
-	rekorPEM, rekorDER, err := loadP256PublicKey(
+	rekorPEM, _, err := loadP256PublicKey(
 		filepath.Join(generationPath, "public", "rekor", "signer.pub"),
 	)
 	if err != nil {
@@ -845,74 +898,51 @@ func buildAdditiveTargets(generationPath string, bootstrap bootstrapManifest) ([
 		return nil, fmt.Errorf("load standby Rekor key: %w", err)
 	}
 
-	// Build TrustedRoot with BOTH original and standby Rekor entries.
-	// The standby entry has a future ValidFor.Start to indicate it is not yet active.
-	standbyStart := time.Now().UTC().Add(365 * 24 * time.Hour) // Future: not active for signing
-
-	trustedRoot := &trustrootv1.TrustedRoot{
-		MediaType: trustedRootMediaType,
-		Tlogs: []*trustrootv1.TransparencyLogInstance{
-			newTransparencyLog(rekorURL, rekorDER, bootstrap.CreatedAtUTC),
-			newStandbyTransparencyLog(rekorDER, standbyDER, standbyStart),
-		},
-		CertificateAuthorities: []*trustrootv1.CertificateAuthority{
-			newCertificateAuthority(fulcioURL, fulcioCert),
-		},
-		Ctlogs: []*trustrootv1.TransparencyLogInstance{
-			newTransparencyLog(ctLogURL, ctDER, bootstrap.CreatedAtUTC),
-		},
-		TimestampAuthorities: []*trustrootv1.CertificateAuthority{
-			newTimestampAuthority(tsaURL, tsaCertificates),
-		},
+	// Load and parse the EXISTING committed TrustedRoot to preserve all entries exactly.
+	existingTRBytes, err := os.ReadFile(filepath.Join(activeTUFTargetsPath, "trusted_root.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read committed trusted_root.json: %w", err)
+	}
+	existingTR := &trustrootv1.TrustedRoot{}
+	if err := protojson.Unmarshal(existingTRBytes, existingTR); err != nil {
+		return nil, fmt.Errorf("parse committed TrustedRoot: %w", err)
 	}
 
-	// SigningConfig is UNCHANGED — same service URLs, same routing.
-	// The standby key is verification-only, not referenced in SigningConfig.
-	signingConfig := &trustrootv1.SigningConfig{
-		MediaType: signingConfigMediaType,
-		CaUrls: []*trustrootv1.Service{
-			newService(fulcioURL, 1, bootstrap.CreatedAtUTC),
-		},
-		OidcUrls: []*trustrootv1.Service{
-			newService(oidcURL, 1, bootstrap.CreatedAtUTC),
-		},
-		RekorTlogUrls: []*trustrootv1.Service{
-			newService(rekorURL, 2, bootstrap.CreatedAtUTC),
-		},
-		RekorTlogConfig: &trustrootv1.ServiceConfiguration{
-			Selector: trustrootv1.ServiceSelector_ANY,
-		},
-		TsaUrls: []*trustrootv1.Service{
-			newService(tsaURL, 1, bootstrap.CreatedAtUTC),
-		},
-		TsaConfig: &trustrootv1.ServiceConfiguration{
-			Selector: trustrootv1.ServiceSelector_ANY,
-		},
+	// Append the standby entry to TrustedRoot.Tlogs. All existing entries
+	// (including their time ranges, log IDs, URLs, keys) are preserved exactly.
+	standbyStart := time.Now().UTC().Add(365 * 24 * time.Hour)
+	existingTR.Tlogs = append(existingTR.Tlogs, newStandbyTransparencyLog(standbyDER, standbyStart))
+
+	// Load committed SigningConfig bytes UNCHANGED — no routing to standby.
+	signingConfigBytes, err := os.ReadFile(filepath.Join(activeTUFTargetsPath, "signing_config.v0.2.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read committed signing_config.v0.2.json: %w", err)
 	}
+	// Parse for ClientTrustConfig embedding only.
+	existingSC := &trustrootv1.SigningConfig{}
+	if err := protojson.Unmarshal(signingConfigBytes, existingSC); err != nil {
+		return nil, fmt.Errorf("parse committed SigningConfig: %w", err)
+	}
+
+	// Build ClientTrustConfig from the modified TrustedRoot + unchanged SigningConfig.
 	clientConfig := &trustrootv1.ClientTrustConfig{
 		MediaType:    clientTrustConfigMediaType,
-		TrustedRoot:  trustedRoot,
-		SigningConfig: signingConfig,
+		TrustedRoot:  existingTR,
+		SigningConfig: existingSC,
 	}
 
-	trustedRootJSON, err := protoJSON.Marshal(trustedRoot)
+	trustedRootJSON, err := protoJSON.Marshal(existingTR)
 	if err != nil {
 		return nil, fmt.Errorf("marshal TrustedRoot: %w", err)
-	}
-	signingConfigJSON, err := protoJSON.Marshal(signingConfig)
-	if err != nil {
-		return nil, fmt.Errorf("marshal SigningConfig: %w", err)
 	}
 	clientConfigJSON, err := protoJSON.Marshal(clientConfig)
 	if err != nil {
 		return nil, fmt.Errorf("marshal ClientTrustConfig: %w", err)
 	}
 	trustedRootBytes := append(append([]byte(nil), trustedRootJSON...), '\n')
-	signingConfigBytes := append(append([]byte(nil), signingConfigJSON...), '\n')
 	clientConfigBytes := append(append([]byte(nil), clientConfigJSON...), '\n')
 
-	// Read current TUF targets version from the active repository to compute
-	// the new targets version.
+	// Build trust status target.
 	statusJSON, err := json.MarshalIndent(
 		trustStatusTarget{
 			SchemaVersion:            trustStatusSchemaVersion,
@@ -1054,9 +1084,9 @@ func replaceTargetsInRepository(tufPath string, targets []tufTarget, bootstrap b
 }
 
 // newStandbyTransparencyLog creates a transparency log entry for a standby key
-// with a future validity start time. The baseURL is left empty to clearly
+// with a future validity start time. The baseURL uses /standby to clearly
 // indicate this entry is not yet routable.
-func newStandbyTransparencyLog(activeDER, standbyDER []byte, standbyStart time.Time) *trustrootv1.TransparencyLogInstance {
+func newStandbyTransparencyLog(standbyDER []byte, standbyStart time.Time) *trustrootv1.TransparencyLogInstance {
 	logID := sha256.Sum256(standbyDER)
 	return &trustrootv1.TransparencyLogInstance{
 		BaseUrl:       rekorURL + "/standby",

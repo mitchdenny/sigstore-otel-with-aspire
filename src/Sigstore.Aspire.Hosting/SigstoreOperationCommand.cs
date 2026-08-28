@@ -483,9 +483,27 @@ internal sealed class SigstoreOperationExecutor(
                 resource.StatePath,
                 "publish-trusted-root.request");
 
-            // Reject if a surviving request file exists from a prior failed worker
-            // — never overwrite replay correlation.
-            if (File.Exists(signalPath))
+            // Use FileMode.CreateNew to atomically reject if a surviving request
+            // file exists — never overwrite replay correlation.
+            var requestContent = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                schemaVersion = 1,
+                operationId = operationId,
+                trustDomainId = before.Tuf.Trust.TrustDomainId
+            });
+            try
+            {
+                await using var fs = new FileStream(
+                    signalPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None);
+                var bytes = System.Text.Encoding.UTF8.GetBytes(requestContent);
+                await fs.WriteAsync(bytes, requestCancellationToken);
+                await fs.FlushAsync(requestCancellationToken);
+            }
+            catch (IOException ex) when (ex.HResult == unchecked((int)0x80070050) /* ERROR_FILE_EXISTS */
+                || File.Exists(signalPath))
             {
                 execution.AddError(
                     execution.Phase,
@@ -497,17 +515,6 @@ internal sealed class SigstoreOperationExecutor(
                 return execution.Failure(
                     "Cannot issue publish-trusted-root: surviving request file exists");
             }
-
-            var requestContent = System.Text.Json.JsonSerializer.Serialize(new
-            {
-                schemaVersion = 1,
-                operationId = operationId,
-                trustDomainId = before.Tuf.Trust.TrustDomainId
-            });
-            await File.WriteAllTextAsync(
-                signalPath,
-                requestContent,
-                requestCancellationToken);
 
             await execution.ReportAsync(
                 "start-worker",

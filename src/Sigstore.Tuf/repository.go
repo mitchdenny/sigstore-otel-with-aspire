@@ -288,12 +288,15 @@ func recoverTUFStateLocked(statePath string, hooks publicationHooks) (recoveryOu
 	// Validate previous with prior generation's fingerprint if available.
 	if state.Previous != nil {
 		priorFingerprint, priorErr := loadPriorGenerationFingerprint(statePath)
-		if priorErr == nil && priorFingerprint != "" {
+		if priorErr != nil {
+			return recoveryNoop, fmt.Errorf("derive prior generation fingerprint: %w", priorErr)
+		}
+		if priorFingerprint != "" {
 			if err := validateReference(layout.previous, *state.Previous, priorFingerprint); err != nil {
 				return recoveryNoop, fmt.Errorf("previous publication corrupted: %w", err)
 			}
 		}
-		// If prior fingerprint unavailable (gen1 initial), skip previous validation.
+		// priorFingerprint == "" only when journal.PriorGeneration is nil (initial gen1).
 	}
 	// Clean orphaned generation dirs but do NOT refresh.
 	if cleanErr := cleanupOrphanedGeneration(statePath, bootstrap); cleanErr != nil {
@@ -320,19 +323,19 @@ func loadPriorGenerationFingerprint(statePath string) (string, error) {
 	// Load the prior generation manifest to compute its fingerprint.
 	priorGenPath := filepath.Join(statePath, "generations", journal.PriorGeneration.GenerationID)
 	if !pathExists(priorGenPath) {
-		return "", nil // Prior generation dir removed — can't validate.
+		return "", fmt.Errorf("prior generation dir %q missing but referenced in journal", journal.PriorGeneration.GenerationID)
 	}
 	priorManifestPath := filepath.Join(priorGenPath, "manifest.json")
 	priorManifestBytes, err := os.ReadFile(priorManifestPath)
 	if err != nil {
-		return "", nil // Can't load — skip validation.
+		return "", fmt.Errorf("read prior generation manifest: %w", err)
 	}
 	if hashBytes(priorManifestBytes) != journal.PriorGeneration.ManifestSHA256 {
 		return "", fmt.Errorf("prior generation manifest hash mismatch")
 	}
 	priorBootstrap, err := loadBootstrapFromGeneration(statePath, priorGenPath, journal.PriorGeneration.GenerationID)
 	if err != nil {
-		return "", nil
+		return "", fmt.Errorf("load prior generation bootstrap: %w", err)
 	}
 	return fingerprintSource(priorBootstrap)
 }

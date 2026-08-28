@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -249,49 +250,15 @@ func TestPublishPreservesSigningConfigRouting(t *testing.T) {
 		filepath.Join(committedPath(layout, stateAfter.Active.ID), "targets", "signing_config.v0.2.json"),
 	)
 
-	// SigningConfig service URLs must remain the same (no standby routing).
-	// Note: the exact bytes may differ slightly due to marshaling of timestamps
-	// in service ValidFor, but the service URLs must match.
-	var beforeConfig, afterConfig map[string]interface{}
-	if err := json.Unmarshal(beforeSigningConfig, &beforeConfig); err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(afterSigningConfig, &afterConfig); err != nil {
-		t.Fatal(err)
+	// SigningConfig must be byte-for-byte identical (no time range mutation).
+	if !bytes.Equal(beforeSigningConfig, afterSigningConfig) {
+		t.Fatalf("SigningConfig bytes changed after additive publication:\nbefore hash=%s\nafter  hash=%s",
+			hashBytes(beforeSigningConfig), hashBytes(afterSigningConfig))
 	}
 
-	// Check that rekorTlogUrls still points to the same URL.
-	checkServiceURLs := func(config map[string]interface{}, field string) []string {
-		urls, ok := config[field]
-		if !ok {
-			return nil
-		}
-		arr, ok := urls.([]interface{})
-		if !ok {
-			return nil
-		}
-		var result []string
-		for _, item := range arr {
-			m, ok := item.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if u, ok := m["url"].(string); ok {
-				result = append(result, u)
-			}
-		}
-		return result
-	}
-
-	beforeRekorURLs := checkServiceURLs(beforeConfig, "rekorTlogUrls")
-	afterRekorURLs := checkServiceURLs(afterConfig, "rekorTlogUrls")
-	if len(beforeRekorURLs) != len(afterRekorURLs) {
-		t.Fatalf("rekorTlogUrls count changed: before=%d, after=%d", len(beforeRekorURLs), len(afterRekorURLs))
-	}
-	for i := range beforeRekorURLs {
-		if beforeRekorURLs[i] != afterRekorURLs[i] {
-			t.Fatalf("rekorTlogUrls[%d] changed: %q -> %q", i, beforeRekorURLs[i], afterRekorURLs[i])
-		}
+	// Verify no /standby service route in SigningConfig.
+	if strings.Contains(string(afterSigningConfig), "/standby") {
+		t.Fatal("SigningConfig must not contain /standby route")
 	}
 }
 
@@ -681,7 +648,12 @@ func writeTestPublishRequest(t *testing.T, statePath, opID string) {
 	if err != nil {
 		t.Fatalf("load trust domain for request: %v", err)
 	}
-	req := publishRequest{SchemaVersion: 1, OperationID: opID, TrustDomainID: domain.TrustDomainID}
+	writeTestPublishRequestWithDomain(t, statePath, opID, domain.TrustDomainID)
+}
+
+func writeTestPublishRequestWithDomain(t *testing.T, statePath, opID, trustDomainID string) {
+	t.Helper()
+	req := publishRequest{SchemaVersion: 1, OperationID: opID, TrustDomainID: trustDomainID}
 	data, _ := json.Marshal(req)
 	if err := os.WriteFile(filepath.Join(statePath, publishRequestFile), data, 0o644); err != nil {
 		t.Fatal(err)
@@ -778,8 +750,9 @@ func TestDispatchRecoversCrashAfterTUFCommitBeforeGenSwitch(t *testing.T) {
 
 	// State: TUF has committed gen2 fingerprint, but generation symlink still gen1.
 	// Request file should still exist (dispatch failed before completion).
-	// Write fresh request with SAME operation ID to simulate worker restart.
-	writeTestPublishRequest(t, statePath, "op-crash-tuf-commit")
+	if !pathExists(filepath.Join(statePath, publishRequestFile)) {
+		t.Fatal("request file should survive failed dispatch")
+	}
 
 	// Dispatch again — should recover via forward-complete to gen2.
 	action, err := dispatchPublishRequest(statePath)
@@ -934,5 +907,182 @@ func TestDispatchSecondRequestAfterCompletedPublishIsRejected(t *testing.T) {
 	// No gen 3 created.
 	if pathExists(filepath.Join(statePath, "generations", "generation-00000003")) {
 		t.Fatal("gen 3 directory should not exist")
+	}
+}
+
+func TestTrustedRootPreservesExistingEntriesExactly(t *testing.T) {
+	statePath := newTestState(t)
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	layout := newTUFLayout(statePath)
+	stateBefore := readTestPublicationState(t, layout)
+	beforeTR := readTestFile(t,
+		filepath.Join(committedPath(layout, stateBefore.Active.ID), "targets", "trusted_root.json"))
+
+	_, err = publishTrustedRootUpdate(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stateAfter := readTestPublicationState(t, layout)
+	afterTR := readTestFile(t,
+		filepath.Join(committedPath(layout, stateAfter.Active.ID), "targets", "trusted_root.json"))
+
+	// Parse both TrustedRoots.
+	var beforeObj, afterObj map[string]interface{}
+	if err := json.Unmarshal(beforeTR, &beforeObj); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(afterTR, &afterObj); err != nil {
+		t.Fatal(err)
+	}
+
+	// After must have exactly one MORE tlog entry than before.
+	beforeTlogs := beforeObj["tlogs"].([]interface{})
+	afterTlogs := afterObj["tlogs"].([]interface{})
+	if len(afterTlogs) != len(beforeTlogs)+1 {
+		t.Fatalf("expected %d tlogs after, got %d", len(beforeTlogs)+1, len(afterTlogs))
+	}
+
+	// All original tlog entries must be byte-for-byte identical.
+	for i, before := range beforeTlogs {
+		beforeJSON, _ := json.Marshal(before)
+		afterJSON, _ := json.Marshal(afterTlogs[i])
+		if !bytes.Equal(beforeJSON, afterJSON) {
+			t.Fatalf("tlog[%d] changed after publication", i)
+		}
+	}
+
+	// CA, ctlogs, timestampAuthorities unchanged.
+	for _, field := range []string{"certificateAuthorities", "ctlogs", "timestampAuthorities"} {
+		beforeJSON, _ := json.Marshal(beforeObj[field])
+		afterJSON, _ := json.Marshal(afterObj[field])
+		if !bytes.Equal(beforeJSON, afterJSON) {
+			t.Fatalf("%s changed after publication", field)
+		}
+	}
+}
+
+func TestDispatchRejectsWrongTrustDomainRequest(t *testing.T) {
+	statePath := newTestState(t)
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write request with wrong trust domain ID.
+	writeTestPublishRequestWithDomain(t, statePath, "op-wrong-domain", "wrong-domain-id")
+
+	_, err = dispatchPublishRequestWithHooks(statePath, publicationHooks{})
+	if err == nil {
+		t.Fatal("expected error for wrong domain request")
+	}
+	if !strings.Contains(err.Error(), "does not match immutable domain") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDispatchRejectsMalformedCompletion(t *testing.T) {
+	statePath := newTestState(t)
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a malformed completion file.
+	completionPath := filepath.Join(statePath, publishCompletionFile)
+	os.WriteFile(completionPath, []byte("{invalid json"), 0o644)
+
+	bootstrap, _ := loadActiveTrustGeneration(statePath)
+	writeTestPublishRequestWithDomain(t, statePath, "op-1", bootstrap.TrustDomainID)
+
+	_, err = dispatchPublishRequestWithHooks(statePath, publicationHooks{})
+	if err == nil {
+		t.Fatal("expected error for malformed completion")
+	}
+	if !strings.Contains(err.Error(), "ambiguous completion state") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDispatchRejectsStaleCompletionMismatch(t *testing.T) {
+	statePath := newTestState(t)
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bootstrap, _ := loadActiveTrustGeneration(statePath)
+
+	// Write a completion with matching operationId but wrong state.
+	staleComp := publishCompletion{
+		SchemaVersion:  publishCompletionSchema,
+		OperationID:    "op-stale",
+		TrustDomainID:  bootstrap.TrustDomainID,
+		Generation:     99, // Wrong generation.
+		GenerationID:   "generation-00000099",
+		PublicationID:  "fake-pub-id",
+		ManifestSHA256: "fake-manifest",
+	}
+	writeCompletion(statePath, staleComp)
+
+	// Write request with same operation ID.
+	writeTestPublishRequestWithDomain(t, statePath, "op-stale", bootstrap.TrustDomainID)
+
+	_, err = dispatchPublishRequestWithHooks(statePath, publicationHooks{})
+	if err == nil {
+		t.Fatal("expected error for stale completion")
+	}
+	if !strings.Contains(err.Error(), "completion replay validation failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDispatchPreservesRequestFileOnRetry(t *testing.T) {
+	statePath := newTestState(t)
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bootstrap, _ := loadActiveTrustGeneration(statePath)
+	writeTestPublishRequestWithDomain(t, statePath, "op-crash", bootstrap.TrustDomainID)
+
+	// Read original request bytes.
+	requestPath := filepath.Join(statePath, publishRequestFile)
+	originalBytes, _ := os.ReadFile(requestPath)
+
+	// First dispatch fails mid-publication.
+	failOnce := true
+	hooks := publicationHooks{
+		checkpoint: func(cp publicationCheckpoint) error {
+			if failOnce && cp == checkpointActiveLinkPrepared {
+				failOnce = false
+				return &testError{msg: "injected prepare failure"}
+			}
+			return nil
+		},
+	}
+	_, err = dispatchPublishRequestWithHooks(statePath, hooks)
+	if err == nil {
+		t.Fatal("first dispatch should fail")
+	}
+
+	// Verify request file was NOT removed or modified.
+	afterBytes, readErr := os.ReadFile(requestPath)
+	if readErr != nil {
+		t.Fatalf("request file should still exist: %v", readErr)
+	}
+	if !bytes.Equal(originalBytes, afterBytes) {
+		t.Fatal("request file bytes changed after failed dispatch")
+	}
+
+	// Retry should succeed using original request.
+	_, err = dispatchPublishRequestWithHooks(statePath, publicationHooks{})
+	if err != nil {
+		t.Fatalf("retry should succeed: %v", err)
 	}
 }
