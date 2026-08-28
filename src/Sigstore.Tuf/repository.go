@@ -202,6 +202,85 @@ func ensureTUFRepositoryWithHooks(
 	return repositoryActionRefreshed, nil
 }
 
+// recoverTUFState reconciles any interrupted TUF/generation state without
+// performing a metadata refresh or creating new publications. It handles:
+// - preparing status: rollback or cross-generation forward-complete
+// - committed with stale generation: forward-complete generation switch
+// - orphaned generation directories: validated cleanup
+// If state is already coherent and committed, it returns (true, nil) with no mutation.
+// Returns (false, nil) if no TUF layout exists yet (pre-bootstrap).
+func recoverTUFState(statePath string) (bool, error) {
+	return recoverTUFStateWithHooks(statePath, publicationHooks{})
+}
+
+func recoverTUFStateWithHooks(statePath string, hooks publicationHooks) (bool, error) {
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		return false, err
+	}
+	sourceFingerprint, err := fingerprintSource(bootstrap)
+	if err != nil {
+		return false, err
+	}
+
+	layout := newTUFLayout(statePath)
+	if err := ensureTUFLayout(layout); err != nil {
+		return false, err
+	}
+	state, err := loadPublicationState(layout)
+	if errors.Is(err, os.ErrNotExist) {
+		// No TUF repository exists yet — nothing to recover.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	if state.Status == publicationStatusPreparing {
+		if err := recoverPreparingPublication(layout, state, sourceFingerprint, hooks, statePath, bootstrap); err != nil {
+			return false, err
+		}
+		if cleanErr := cleanupOrphanedGeneration(statePath, bootstrap); cleanErr != nil {
+			return false, fmt.Errorf("orphaned generation cleanup after recovery: %w", cleanErr)
+		}
+		return true, nil
+	}
+	if state.Status != publicationStatusCommitted {
+		return false, fmt.Errorf("TUF publication status %q is unsupported", state.Status)
+	}
+
+	// Committed state: clean temps and validate active only.
+	// Note: We cannot use validateCommittedPublication here because after a
+	// cross-generation publish, the previous publication has the prior gen's
+	// fingerprint which won't match the current generation's fingerprint.
+	if err := cleanupPublicationTemps(layout); err != nil {
+		return false, err
+	}
+	if err := cleanupUnjournaledCandidate(layout); err != nil {
+		return false, err
+	}
+	if state.Active == nil {
+		return false, fmt.Errorf("committed TUF publication has no active repository")
+	}
+	if err := validateReference(
+		committedPath(layout, state.Active.ID),
+		*state.Active,
+		sourceFingerprint,
+	); err != nil {
+		// Check cross-generation forward-complete scenario.
+		recovered, fwdErr := tryForwardCompleteGeneration(statePath, layout, state, bootstrap)
+		if fwdErr != nil || !recovered {
+			return false, err
+		}
+		return true, nil
+	}
+	// Clean orphaned generation dirs but do NOT refresh.
+	if cleanErr := cleanupOrphanedGeneration(statePath, bootstrap); cleanErr != nil {
+		return false, fmt.Errorf("orphaned generation cleanup: %w", cleanErr)
+	}
+	return true, nil
+}
+
 // rotateTUFRootKey generates a new root key and publishes root N+1 within the
 // existing transactional publication framework. The rotation must only be
 // invoked against a committed, validated publication.

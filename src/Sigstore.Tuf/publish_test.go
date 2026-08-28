@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -669,5 +670,264 @@ func TestCrossGenRejectsTamperedDomainInPreparingForward(t *testing.T) {
 	activeGenID, _ := readActiveGeneration(filepath.Join(statePath, "active-generation"))
 	if activeGenID != "generation-00000001" {
 		t.Fatalf("expected gen 1 preserved, got %s", activeGenID)
+	}
+}
+
+// writeTestPublishRequest creates a schema-versioned request file with unique ID.
+func writeTestPublishRequest(t *testing.T, statePath, opID string) {
+	t.Helper()
+	req := publishRequest{SchemaVersion: 1, OperationID: opID}
+	data, _ := json.Marshal(req)
+	if err := os.WriteFile(filepath.Join(statePath, publishRequestFile), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDispatchFreshRequestPerformsExactlyOnePublish proves that a fresh request
+// in coherent gen1 state performs exactly one gen1→gen2 publish with no
+// pre-refresh mutation.
+func TestDispatchFreshRequestPerformsExactlyOnePublish(t *testing.T) {
+	statePath := newTestState(t)
+
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture pre-dispatch TUF state.
+	layout := newTUFLayout(statePath)
+	stateBefore := readTestPublicationState(t, layout)
+
+	// Write a fresh request.
+	writeTestPublishRequest(t, statePath, "op-fresh-001")
+
+	// Dispatch.
+	action, err := dispatchPublishRequest(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != repositoryActionPublished {
+		t.Fatalf("action = %q, want %q", action, repositoryActionPublished)
+	}
+
+	// Verify exactly gen 2.
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrap.Generation != 2 {
+		t.Fatalf("generation = %d, want 2", bootstrap.Generation)
+	}
+
+	// Verify active publication changed exactly once.
+	stateAfter := readTestPublicationState(t, layout)
+	if stateAfter.Active.ID == stateBefore.Active.ID {
+		t.Fatal("active publication did not change")
+	}
+
+	// Verify request file consumed and completion file written.
+	if pathExists(filepath.Join(statePath, publishRequestFile)) {
+		t.Fatal("request file should have been consumed")
+	}
+	compData, err := os.ReadFile(filepath.Join(statePath, publishCompletionFile))
+	if err != nil {
+		t.Fatal("completion file missing")
+	}
+	var comp publishCompletion
+	if err := json.Unmarshal(compData, &comp); err != nil {
+		t.Fatal(err)
+	}
+	if comp.OperationID != "op-fresh-001" {
+		t.Fatalf("completion operationId = %q, want op-fresh-001", comp.OperationID)
+	}
+	if comp.Generation != 2 {
+		t.Fatalf("completion generation = %d, want 2", comp.Generation)
+	}
+}
+
+// TestDispatchRecoversCrashAfterTUFCommitBeforeGenSwitch proves recovery
+// converges to exactly gen2 when TUF committed N+1 but generation symlink
+// still points to gen1.
+func TestDispatchRecoversCrashAfterTUFCommitBeforeGenSwitch(t *testing.T) {
+	statePath := newTestState(t)
+
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate crash after TUF commit but before generation switch by
+	// injecting a checkpoint failure at the generation switch step.
+	crashAtGenSwitch := publicationHooks{
+		checkpoint: func(cp publicationCheckpoint) error {
+			if cp == checkpointActiveSwitched {
+				return &testError{msg: "simulated crash after TUF active switch"}
+			}
+			return nil
+		},
+	}
+
+	writeTestPublishRequest(t, statePath, "op-crash-tuf-commit")
+	// This will fail partway through the inner publish.
+	_, _ = dispatchPublishRequestWithHooks(statePath, crashAtGenSwitch)
+
+	// State: TUF has committed gen2 fingerprint, but generation symlink still gen1.
+	// Request file should still exist (dispatch failed before completion).
+	// Write fresh request with SAME operation ID to simulate worker restart.
+	writeTestPublishRequest(t, statePath, "op-crash-tuf-commit")
+
+	// Dispatch again — should recover via forward-complete to gen2.
+	action, err := dispatchPublishRequest(statePath)
+	if err != nil {
+		t.Fatalf("recovery dispatch failed: %v", err)
+	}
+	if action != repositoryActionPublished {
+		t.Fatalf("action = %q, want %q", action, repositoryActionPublished)
+	}
+
+	// Verify exactly gen 2, not gen 3.
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrap.Generation != 2 {
+		t.Fatalf("generation = %d, want exactly 2", bootstrap.Generation)
+	}
+
+	// Request consumed, completion written.
+	if pathExists(filepath.Join(statePath, publishRequestFile)) {
+		t.Fatal("request file should have been consumed")
+	}
+}
+
+// TestDispatchCrashAfterGenSwitchBeforeRequestCleanup proves retry remains
+// exactly gen2, never gen3.
+func TestDispatchCrashAfterGenSwitchBeforeRequestCleanup(t *testing.T) {
+	statePath := newTestState(t)
+
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Full successful publish but we simulate crash by keeping request file.
+	writeTestPublishRequest(t, statePath, "op-crash-cleanup")
+	action, err := dispatchPublishRequest(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != repositoryActionPublished {
+		t.Fatalf("action = %q, want %q", action, repositoryActionPublished)
+	}
+
+	// Simulate crash after completion write but before request file removal
+	// by writing back the same request file.
+	writeTestPublishRequest(t, statePath, "op-crash-cleanup")
+
+	// Dispatch again — should detect completion record and skip.
+	action2, err := dispatchPublishRequest(statePath)
+	if err != nil {
+		t.Fatalf("retry after completion: %v", err)
+	}
+	if action2 != repositoryActionPublished {
+		t.Fatalf("retry action = %q, want %q", action2, repositoryActionPublished)
+	}
+
+	// Still gen 2, never gen 3.
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrap.Generation != 2 {
+		t.Fatalf("generation = %d, want exactly 2", bootstrap.Generation)
+	}
+}
+
+// TestDispatchOrphanedGenPlusRequestRecoversDeterministically proves that
+// a pre-TUF orphan + request results in cleanup then exactly one gen2 publish.
+func TestDispatchOrphanedGenPlusRequestRecoversDeterministically(t *testing.T) {
+	statePath := newTestState(t)
+
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate orphaned gen2 directory (created by advanceTrustGeneration before
+	// TUF publication started, then crashed).
+	bootstrap, _ := loadActiveTrustGeneration(statePath)
+	_, genPath, err := advanceTrustGeneration(statePath, bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pathExists(genPath) {
+		t.Fatal("orphaned gen dir should exist")
+	}
+
+	// Write request and dispatch.
+	writeTestPublishRequest(t, statePath, "op-orphan-recover")
+	action, err := dispatchPublishRequest(statePath)
+	if err != nil {
+		t.Fatalf("dispatch with orphan: %v", err)
+	}
+	if action != repositoryActionPublished {
+		t.Fatalf("action = %q, want %q", action, repositoryActionPublished)
+	}
+
+	// Verify exactly gen 2.
+	bootstrap, err = loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrap.Generation != 2 {
+		t.Fatalf("generation = %d, want 2", bootstrap.Generation)
+	}
+}
+
+// TestDispatchSecondRequestAfterCompletedPublishIsRejected proves that a new
+// request (different operation ID) after a completed publish is rejected
+// without mutation. The one-shot contract is preserved.
+func TestDispatchSecondRequestAfterCompletedPublishIsRejected(t *testing.T) {
+	statePath := newTestState(t)
+
+	_, err := ensureTUFRepository(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Complete first publish via dispatch.
+	writeTestPublishRequest(t, statePath, "op-first")
+	_, err = dispatchPublishRequest(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture state.
+	layout := newTUFLayout(statePath)
+	stateAfterFirst := readTestPublicationState(t, layout)
+
+	// Write a DIFFERENT operation ID — this is a genuine second request.
+	writeTestPublishRequest(t, statePath, "op-second-forbidden")
+	_, err = dispatchPublishRequest(statePath)
+	if err == nil {
+		t.Fatal("expected second request with different op ID to be rejected")
+	}
+	if !strings.Contains(err.Error(), "already completed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify no mutation.
+	stateAfterSecond := readTestPublicationState(t, layout)
+	if stateAfterSecond.Active.ID != stateAfterFirst.Active.ID {
+		t.Fatal("active publication changed after rejected second request")
+	}
+	bootstrap, _ := loadActiveTrustGeneration(statePath)
+	if bootstrap.Generation != 2 {
+		t.Fatalf("generation = %d, want 2", bootstrap.Generation)
+	}
+
+	// No gen 3 created.
+	if pathExists(filepath.Join(statePath, "generations", "generation-00000003")) {
+		t.Fatal("gen 3 directory should not exist")
 	}
 }

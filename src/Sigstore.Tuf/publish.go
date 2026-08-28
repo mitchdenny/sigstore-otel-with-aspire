@@ -22,8 +22,129 @@ import (
 )
 
 const (
-	standbyRekorKeyFile = "rekor-standby.pub"
+	standbyRekorKeyFile       = "rekor-standby.pub"
+	publishRequestFile        = "publish-trusted-root.request"
+	publishCompletionFile     = "publish-trusted-root.completed"
 )
+
+// publishRequest is the schema-versioned content of the request file.
+type publishRequest struct {
+	SchemaVersion int    `json:"schemaVersion"`
+	OperationID   string `json:"operationId"`
+}
+
+// publishCompletion records that a specific operation ID was completed.
+type publishCompletion struct {
+	SchemaVersion int       `json:"schemaVersion"`
+	OperationID   string    `json:"operationId"`
+	CompletedAt   time.Time `json:"completedAtUtc"`
+	Generation    int       `json:"generation"`
+}
+
+// dispatchPublishRequest handles the full lifecycle of a publish-trusted-root
+// request including recovery, replay detection, and deterministic consumption.
+// This is the production entry point called from main.
+func dispatchPublishRequest(statePath string) (repositoryAction, error) {
+	return dispatchPublishRequestWithHooks(statePath, publicationHooks{})
+}
+
+func dispatchPublishRequestWithHooks(statePath string, hooks publicationHooks) (repositoryAction, error) {
+	requestPath := filepath.Join(statePath, publishRequestFile)
+	completionPath := filepath.Join(statePath, publishCompletionFile)
+
+	// Read and parse the request to get its operation ID.
+	requestData, err := os.ReadFile(requestPath)
+	if err != nil {
+		return "", fmt.Errorf("read publish request: %w", err)
+	}
+	var req publishRequest
+	if err := json.Unmarshal(requestData, &req); err != nil {
+		return "", fmt.Errorf("parse publish request (must contain operationId): %w", err)
+	}
+	if req.OperationID == "" {
+		return "", fmt.Errorf("publish request missing operationId")
+	}
+
+	// Check if this operation was already completed (crash after completion
+	// journal write but before request file removal).
+	if completionData, err := os.ReadFile(completionPath); err == nil {
+		var comp publishCompletion
+		if json.Unmarshal(completionData, &comp) == nil && comp.OperationID == req.OperationID {
+			// Same operation already completed. Remove request and return success.
+			_ = os.Remove(requestPath)
+			return repositoryActionPublished, nil
+		}
+		// Different operation ID in completion than request — this would be a
+		// new request after a prior completion. The one-shot guard in
+		// publishTrustedRootUpdate will reject it, but first recover state.
+	}
+
+	// Recover any interrupted TUF/generation state WITHOUT refreshing.
+	if _, err := recoverTUFStateWithHooks(statePath, hooks); err != nil {
+		return "", fmt.Errorf("recover TUF state before publish dispatch: %w", err)
+	}
+
+	// After recovery, check if this operation was already completed by the
+	// recovery itself (forward-complete scenario where gen is now > 1).
+	bootstrap, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		return "", fmt.Errorf("load generation after recovery: %w", err)
+	}
+	if bootstrap.Generation > 1 {
+		// Recovery forward-completed the generation. Check if this is the
+		// same operation that was interrupted (not a new second request).
+		if completionData, err := os.ReadFile(completionPath); err == nil {
+			var comp publishCompletion
+			if json.Unmarshal(completionData, &comp) == nil && comp.OperationID == req.OperationID {
+				_ = os.Remove(requestPath)
+				return repositoryActionPublished, nil
+			}
+			// A completion exists with a DIFFERENT operation ID. This means a
+			// prior operation completed and this is a genuinely new second
+			// request which must be rejected by the one-shot guard.
+		} else {
+			// No completion record but gen > 1 means recovery completed an
+			// interrupted publish for this same request. Write completion now.
+			comp := publishCompletion{
+				SchemaVersion: 1,
+				OperationID:   req.OperationID,
+				CompletedAt:   time.Now().UTC(),
+				Generation:    bootstrap.Generation,
+			}
+			compData, _ := json.MarshalIndent(comp, "", "  ")
+			if err := os.WriteFile(completionPath, compData, 0o644); err != nil {
+				return "", fmt.Errorf("write completion after recovery: %w", err)
+			}
+			_ = os.Remove(requestPath)
+			return repositoryActionPublished, nil
+		}
+	}
+
+	// Perform the actual publication.
+	action, err := publishTrustedRootUpdateWithHooks(statePath, hooks)
+	if err != nil {
+		return "", err
+	}
+
+	// Record completion before removing request.
+	bootstrap, _ = loadActiveTrustGeneration(statePath)
+	comp := publishCompletion{
+		SchemaVersion: 1,
+		OperationID:   req.OperationID,
+		CompletedAt:   time.Now().UTC(),
+		Generation:    bootstrap.Generation,
+	}
+	compData, _ := json.MarshalIndent(comp, "", "  ")
+	if err := os.WriteFile(completionPath, compData, 0o644); err != nil {
+		return "", fmt.Errorf("write completion journal: %w", err)
+	}
+
+	// Remove request file last — if we crash here, next restart sees
+	// completion record with matching ID and skips.
+	_ = os.Remove(requestPath)
+
+	return action, nil
+}
 
 // publishTrustedRootUpdate advances the trust generation by adding inactive
 // standby verification material, then publishes new TUF targets that contain
@@ -49,6 +170,20 @@ func publishTrustedRootUpdateWithHooks(
 	if err != nil {
 		return "", err
 	}
+
+	// Reject repeated invocation: this command is one-shot per trust domain.
+	// A second invocation would overwrite the prior standby key, violating
+	// "retain historical verification material by default." Accumulating
+	// arbitrary standby material is deferred to Steps 9-13 which introduce
+	// real rotating keys with stable unique identities.
+	if bootstrap.Generation > 1 {
+		return "", fmt.Errorf(
+			"publish-trusted-root already completed (generation %d); "+
+				"repeated publication is not supported because it would remove prior standby verification material",
+			bootstrap.Generation,
+		)
+	}
+
 	sourceFingerprint, err := fingerprintSource(bootstrap)
 	if err != nil {
 		return "", err
@@ -108,6 +243,8 @@ func publishTrustedRootUpdateWithHooks(
 // advanceTrustGeneration creates a new generation N+1 that contains all
 // material from generation N plus a standby Rekor verification key. The
 // standby key is genuine but inactive — it does not affect live signing.
+// If a validated generation N+1 directory already exists (from a prior
+// interrupted attempt), it is reused rather than overwritten.
 func advanceTrustGeneration(statePath string, current bootstrapManifest) (bootstrapManifest, string, error) {
 	if current.Generation < 1 {
 		return bootstrapManifest{}, "", fmt.Errorf("invalid current generation %d", current.Generation)
@@ -117,6 +254,19 @@ func advanceTrustGeneration(statePath string, current bootstrapManifest) (bootst
 	currentGenerationID := current.GenerationID
 	currentGenerationPath := filepath.Join(statePath, "generations", currentGenerationID)
 	newGenerationPath := filepath.Join(statePath, "generations", newGenerationID)
+
+	// If the generation N+1 directory already exists (from an interrupted
+	// prior attempt), validate and reuse it to ensure deterministic replay.
+	if pathExists(newGenerationPath) {
+		_, nextBootstrap, _, err := validateNextGenerationForRecovery(statePath, current)
+		if err != nil {
+			return bootstrapManifest{}, "", fmt.Errorf(
+				"pre-existing generation %s failed validation; cannot resume or overwrite: %w",
+				newGenerationID, err,
+			)
+		}
+		return nextBootstrap, newGenerationPath, nil
+	}
 
 	// Generate standby Rekor key (ECDSA P-256).
 	standbyKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

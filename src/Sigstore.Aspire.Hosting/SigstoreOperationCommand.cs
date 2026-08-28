@@ -478,12 +478,18 @@ internal sealed class SigstoreOperationExecutor(
                 1,
                 "Writing publish-trusted-root.request signal file for the TUF worker.");
 
+            var operationId = Guid.NewGuid().ToString("N");
             var signalPath = Path.Combine(
                 resource.StatePath,
                 "publish-trusted-root.request");
+            var requestContent = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                schemaVersion = 1,
+                operationId = operationId
+            });
             await File.WriteAllTextAsync(
                 signalPath,
-                "publish-trusted-root",
+                requestContent,
                 requestCancellationToken);
 
             await execution.ReportAsync(

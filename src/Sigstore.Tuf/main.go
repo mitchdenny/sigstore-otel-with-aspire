@@ -105,14 +105,11 @@ func main() {
 	}
 	statePath = filepath.Clean(statePath)
 
-	publishRequest := filepath.Join(statePath, "publish-trusted-root.request")
+	publishRequest := filepath.Join(statePath, publishRequestFile)
 	if pathExists(publishRequest) {
-		action, err := publishTrustedRootUpdate(statePath)
+		action, err := dispatchPublishRequest(statePath)
 		if err != nil {
 			fatalf("%v", err)
-		}
-		if err := os.Remove(publishRequest); err != nil {
-			fatalf("remove publish request: %v", err)
 		}
 		fmt.Printf("%s Sigstore TUF repository at %s.\n", action, filepath.Join(statePath, "tuf"))
 		return
