@@ -5,9 +5,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -1042,6 +1044,42 @@ func newTestState(t *testing.T) string {
 	)
 	writeTestFile(t, filepath.Join(generationPath, "public", "tsa", "cert-chain.pem"), tsaChain)
 	writeTestFile(t, filepath.Join(generationPath, "private", "test.key"), []byte("test private material\n"))
+	oidcKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oidcSPKI, err := x509.MarshalPKIXPublicKey(&oidcKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oidcKidHash := sha256.Sum256(oidcSPKI)
+	oidcKid := base64.RawURLEncoding.EncodeToString(oidcKidHash[:])
+	writeTestFile(
+		t,
+		filepath.Join(generationPath, "private", "oidc", "signer.key"),
+		pem.EncodeToMemory(&pem.Block{
+			Type:  "PRIVATE KEY",
+			Bytes: mustMarshalPKCS8(oidcKey),
+		}),
+	)
+	writeTestFile(
+		t,
+		filepath.Join(generationPath, "public", "oidc", "signer.pub"),
+		pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: oidcSPKI}),
+	)
+	oidcJWKS, err := json.MarshalIndent(
+		jwks{Keys: []jwk{rsaPublicKeyToJWK(&oidcKey.PublicKey, oidcKid)}},
+		"",
+		"  ",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(
+		t,
+		filepath.Join(generationPath, "public", "oidc", "jwks.json"),
+		append(oidcJWKS, '\n'),
+	)
 	writeTestFile(
 		t,
 		filepath.Join(statePath, "data", "ctlog", "bootstrap-state"),
@@ -1061,7 +1099,7 @@ func newTestState(t *testing.T) string {
 		RekorPublicKeySHA256: testHash(rekorPEM),
 		TsaRootSHA256:        testHash(tsaRootDER),
 		TsaLeafSHA256:        testHash(tsaLeafDER),
-		OIDCKeyID:            "test-oidc-key",
+		OIDCKeyID:            oidcKid,
 	}
 	if err := os.MkdirAll(
 		filepath.Join(statePath, "migration"),

@@ -1,4 +1,10 @@
+using System.ComponentModel;
 using System.Globalization;
+using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
@@ -13,6 +19,7 @@ internal static class SigstoreOperationCommand
     public const string RotateTufRootCommand = "rotate-tuf-root";
     public const string RestartClientsCommand = "restart-clients";
     public const string PublishTrustedRootCommand = "publish-trusted-root";
+    public const string RotateOidcSigningKeyCommand = "rotate-oidc-signing-key";
 
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
@@ -221,6 +228,18 @@ internal sealed class SigstoreOperationExecutor(
     ISigstoreStateInspector stateInspector,
     ILogger logger)
 {
+    private const int OpenReadOnly = 0;
+    private const string OidcRotationStatusRequested = "requested";
+    private const string OidcRotationStatusWorkerCommitted =
+        "worker-committed";
+    private const string OidcRotationStatusOidcRestarted =
+        "oidc-restarted";
+    private const string OidcRotationStatusCompleted = "completed";
+    private static readonly JsonSerializerOptions JsonOptions =
+        new(JsonSerializerDefaults.Web)
+        {
+            WriteIndented = true
+        };
     private static readonly TimeSpan WorkerTimeout =
         TimeSpan.FromMinutes(5);
     private static readonly TimeSpan ClientTimeout =
@@ -410,6 +429,1031 @@ internal sealed class SigstoreOperationExecutor(
             lease!.Dispose();
             await runtime.PublishParentStateAsync(resource);
         }
+    }
+
+    public async Task<ExecuteCommandResult> ExecuteRotateOidcSigningKeyAsync(
+        CancellationToken requestCancellationToken)
+    {
+        requestCancellationToken.ThrowIfCancellationRequested();
+        if (!resource.TryBeginOperation(
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+                "Rotating OIDC signing key",
+                out var lease,
+                out var active))
+        {
+            return CreateContentionResult(
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+                active!);
+        }
+
+        var execution = new OperationExecution(
+            resource,
+            runtime,
+            logger,
+            lease!,
+            total: 14);
+        try
+        {
+            return await ExecuteRotateOidcSigningKeyCoreAsync(
+                execution,
+                requestCancellationToken);
+        }
+        catch (Exception exception)
+            when (IsExpectedOperationFailure(exception))
+        {
+            execution.AddError(
+                execution.Phase,
+                resource.Name,
+                null,
+                exception.Message);
+            return execution.Failure(
+                $"{SigstoreOperationCommand.RotateOidcSigningKeyCommand} failed " +
+                $"during {execution.Phase}.");
+        }
+        finally
+        {
+            lease!.Dispose();
+            await runtime.PublishParentStateAsync(resource);
+        }
+    }
+
+    private async Task<ExecuteCommandResult> ExecuteRotateOidcSigningKeyCoreAsync(
+        OperationExecution execution,
+        CancellationToken requestCancellationToken)
+    {
+        await execution.ReportAsync(
+            "preflight", 0,
+            "Validating current trust, OIDC, and Fulcio state for OIDC key rotation.");
+        await execution.ReportAsync(
+            "capture-old-token", 1,
+            "Loading a resumable operation or capturing the pre-switch JWT.");
+        SigstoreOperationSnapshot before;
+        SigstoreOperationSnapshot after;
+        SigstoreResourceInstanceSnapshot workerBefore;
+        SigstoreResourceInstanceSnapshot oidcBefore;
+        SigstoreResourceInstanceSnapshot fulcioBefore;
+        OidcRotationCommandJournal operation;
+        var workerStarted = false;
+        ExecuteCommandResult? workerStart = null;
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-rotate-oidc-preflight"))
+        {
+            requestCancellationToken.ThrowIfCancellationRequested();
+            var current = await CaptureAsync(requestCancellationToken);
+            workerBefore = runtime.GetRequiredSnapshot(
+                resource.Components.TufBootstrap.Resource);
+            oidcBefore = runtime.GetRequiredSnapshot(
+                resource.Components.Oidc.Resource);
+            fulcioBefore = runtime.GetRequiredSnapshot(
+                resource.Components.Fulcio.Resource);
+            if (!ValidateCapture(execution, "preflight", current)
+                || !execution.Check("worker-ready",
+                    IsSuccessfulTerminal(workerBefore),
+                    "completed one-shot with exit code 0",
+                    Describe(workerBefore), "preflight", workerBefore.Resource)
+                || !execution.Check("oidc-running",
+                    IsRunningHealthy(oidcBefore) && HasContainerIdentity(oidcBefore),
+                    "Running/Healthy with container identity",
+                    Describe(oidcBefore), "preflight", oidcBefore.Resource)
+                || !execution.Check("fulcio-running",
+                    IsRunningHealthy(fulcioBefore) && HasContainerIdentity(fulcioBefore),
+                    "Running/Healthy with container identity",
+                    Describe(fulcioBefore), "preflight", fulcioBefore.Resource))
+            {
+                return execution.Failure("OIDC rotation preconditions are not satisfied.");
+            }
+
+            operation = LoadIncompleteOidcRotation(resource.StatePath)
+                ?? await CreateOidcRotationOperationAsync(
+                    current,
+                    oidcBefore,
+                    fulcioBefore,
+                    requestCancellationToken);
+            before = operation.StartingSnapshot;
+            execution.Before = before;
+            execution.OidcRotation = CreateOidcRotationResult(
+                operation,
+                recovered: operation.Status != OidcRotationStatusRequested);
+
+            if (operation.TrustDomainId != current.Tuf.Trust.TrustDomainId
+                || operation.StartingGenerationId
+                    != $"generation-{operation.StartingGeneration:D8}"
+                || operation.StartingOidcKeyId != operation.OldToken.Kid
+                || operation.OldToken.ExpiresAtUtc <= DateTimeOffset.UtcNow
+                || operation.FulcioContainerId != fulcioBefore.ContainerId
+                || operation.FulcioStartTimeUtc != fulcioBefore.StartTimeUtc)
+            {
+                execution.AddError(
+                    "preflight", resource.Name, null,
+                    "Durable OIDC operation state does not match the live trust domain, " +
+                    "old token, or unchanged Fulcio instance.");
+                return execution.Failure("OIDC rotation recovery validation failed.");
+            }
+
+            var completion = ReadOidcWorkerCompletion(resource.StatePath);
+            if (current.Tuf.Trust.Generation == operation.StartingGeneration)
+            {
+                if (completion?.OperationId == operation.OperationId)
+                {
+                    execution.AddError(
+                        "preflight", resource.Name, null,
+                        "Worker completion exists but the active generation did not advance.");
+                    return execution.Failure("OIDC worker completion is inconsistent.");
+                }
+                await execution.ReportAsync(
+                    "write-signal", 2,
+                    "Writing the operation-bound OIDC rotation request.");
+                WriteOidcRotationRequest(resource.StatePath, operation);
+                workerStarted = true;
+            }
+            else if (current.Tuf.Trust.Generation
+                    != operation.StartingGeneration + 1
+                || completion?.OperationId != operation.OperationId)
+            {
+                execution.AddError(
+                    "preflight", resource.Name, null,
+                    "Live generation or worker completion is not bound to the " +
+                    "incomplete OIDC operation.");
+                return execution.Failure("OIDC rotation cannot be resumed safely.");
+            }
+        }
+
+        if (workerStarted)
+        {
+            await execution.ReportAsync(
+                "start-worker", 3,
+                "Starting the dedicated worker for one generation advance.");
+            using (var workerCritical =
+                new CancellationTokenSource(WorkerTimeout))
+            {
+                workerStart = await runtime.ExecuteCommandAsync(
+                    resource.Components.TufBootstrap.Resource,
+                    KnownResourceCommands.StartCommand,
+                    workerCritical.Token);
+            }
+            if (workerStart is not { Success: true })
+            {
+                execution.AddError(
+                    "start-worker",
+                    resource.Components.TufBootstrap.Resource.Name,
+                    null,
+                    workerStart?.Message ?? "Aspire rejected TUF worker start.");
+                return execution.Failure("OIDC rotation worker could not be started.");
+            }
+            await execution.ReportAsync(
+                "wait-worker", 4,
+                "Waiting for the OIDC rotation worker to commit generation N+1.");
+            SigstoreResourceInstanceSnapshot workerAfter;
+            using (var workerWait = new CancellationTokenSource(WorkerTimeout))
+            {
+                workerAfter = await runtime.WaitForSnapshotAsync(
+                    resource.Components.TufBootstrap.Resource,
+                    snapshot => IsNewInstance(workerBefore, snapshot)
+                        && IsTerminal(snapshot),
+                    WorkerTimeout,
+                    workerWait.Token);
+            }
+            execution.Resources.Add(CreateLifecycleResult(
+                workerAfter.Resource,
+                KnownResourceCommands.StartCommand,
+                workerBefore,
+                workerAfter,
+                null));
+            if (!IsSuccessfulTerminal(workerAfter))
+            {
+                execution.AddError(
+                    "wait-worker", workerAfter.Resource, null,
+                    $"Worker completed as {Describe(workerAfter)}.");
+                return execution.Failure("OIDC rotation worker failed.");
+            }
+        }
+
+        await execution.ReportAsync(
+            "postconditions", 5,
+            "Validating the committed generation, TUF publication, and key overlap.");
+        using (stateInspector.AcquireLock(resource.StatePath,
+            "dashboard-rotate-oidc-postconditions"))
+        {
+            using var postToken = new CancellationTokenSource(WorkerTimeout);
+            after = await CaptureAsync(postToken.Token);
+            execution.After = after;
+            operation = operation with
+            {
+                Status = OidcRotationStatusWorkerCommitted,
+                NewGeneration = after.Tuf.Trust.Generation,
+                NewGenerationId = after.Tuf.Trust.GenerationId,
+                NewOidcKeyId = ReadOidcKeyIdFromManifest(resource.StatePath),
+                WorkerCompletion = ReadOidcWorkerCompletion(resource.StatePath)
+            };
+            WriteOidcRotationJournal(resource.StatePath, operation);
+        }
+        var completionResult = operation.WorkerCompletion;
+        execution.Check("generation-advanced",
+            after.Tuf.Trust.Generation == before.Tuf.Trust.Generation + 1
+                && after.Tuf.Trust.GenerationId != before.Tuf.Trust.GenerationId,
+            $"generation {before.Tuf.Trust.Generation + 1}",
+            $"generation {after.Tuf.Trust.Generation}",
+            "postconditions", "tuf-bootstrap");
+        execution.Check("oidc-key-changed",
+            operation.NewOidcKeyId != operation.StartingOidcKeyId
+                && !string.IsNullOrEmpty(operation.NewOidcKeyId),
+            $"new kid != {operation.StartingOidcKeyId}",
+            operation.NewOidcKeyId ?? "null",
+            "postconditions", "tuf-bootstrap");
+        execution.Check("worker-completion-bound",
+            completionResult?.OperationId == operation.OperationId
+                && completionResult.TrustDomainId == operation.TrustDomainId
+                && completionResult.PriorGeneration
+                    == operation.StartingGeneration
+                && completionResult.PriorGenerationId
+                    == operation.StartingGenerationId
+                && completionResult.PriorOidcKeyId
+                    == operation.StartingOidcKeyId
+                && completionResult.NewGeneration == operation.NewGeneration
+                && completionResult.NewGenerationId == operation.NewGenerationId
+                && completionResult.NewOidcKeyId == operation.NewOidcKeyId
+                && completionResult.PublicationId
+                    == after.Tuf.Trust.PublicationId
+                && completionResult.ManifestSha256
+                    == after.Tuf.Trust.GenerationManifestSha256
+                && completionResult.JwksKeyIds.Contains(
+                    operation.StartingOidcKeyId,
+                    StringComparer.Ordinal)
+                && completionResult.JwksKeyIds.Contains(
+                    operation.NewOidcKeyId!,
+                    StringComparer.Ordinal),
+            operation.OperationId,
+            completionResult?.OperationId ?? "missing",
+            "postconditions", "tuf-bootstrap");
+        CheckEqual(execution, "trust-domain-unchanged",
+            before.Tuf.Trust.TrustDomainId, after.Tuf.Trust.TrustDomainId);
+        CheckEqual(execution, "trusted-root-unchanged",
+            before.Tuf.Trust.TrustedRootSha256, after.Tuf.Trust.TrustedRootSha256);
+        CheckEqual(execution, "signing-config-unchanged",
+            before.Tuf.Trust.SigningConfigSha256, after.Tuf.Trust.SigningConfigSha256);
+        if (execution.HasFailures)
+            return execution.Failure("OIDC rotation postconditions failed.");
+
+        await execution.ReportAsync("restart-oidc", 6,
+            "Ensuring exactly one OIDC restart activates the committed signer.");
+        var oidcCurrent = runtime.GetRequiredSnapshot(
+            resource.Components.Oidc.Resource);
+        var (probeJwt, probeKid) = await runtime.CaptureOidcTokenAsync(
+            requestCancellationToken);
+        SigstoreResourceInstanceSnapshot oidcAfter;
+        if (probeKid == operation.StartingOidcKeyId)
+        {
+            if (oidcCurrent.ContainerId != operation.OidcContainerId
+                || oidcCurrent.StartTimeUtc != operation.OidcStartTimeUtc)
+            {
+                execution.AddError(
+                    "restart-oidc", oidcCurrent.Resource, null,
+                    "OIDC instance changed but still signs with the prior key.");
+                return execution.Failure("OIDC restart recovery is ambiguous.");
+            }
+            var restart = await runtime.ExecuteCommandAsync(
+                resource.Components.Oidc.Resource,
+                KnownResourceCommands.RestartCommand,
+                requestCancellationToken);
+            if (!restart.Success)
+            {
+                execution.AddError("restart-oidc",
+                    oidcCurrent.Resource, null,
+                    restart.Message ?? "OIDC restart rejected.");
+                return execution.Failure("Could not restart the OIDC issuer.");
+            }
+            using var oidcWait = new CancellationTokenSource(ClientTimeout);
+            oidcAfter = await runtime.WaitForSnapshotAsync(
+                resource.Components.Oidc.Resource,
+                snapshot => IsNewInstance(oidcCurrent, snapshot)
+                    && IsRunningHealthy(snapshot),
+                ClientTimeout,
+                oidcWait.Token);
+            execution.Resources.Add(CreateLifecycleResult(
+                oidcAfter.Resource,
+                KnownResourceCommands.RestartCommand,
+                oidcCurrent,
+                oidcAfter,
+                null));
+        }
+        else if (probeKid == operation.NewOidcKeyId
+            && oidcCurrent.ContainerId != operation.OidcContainerId
+            && oidcCurrent.StartTimeUtc != operation.OidcStartTimeUtc
+            && IsRunningHealthy(oidcCurrent))
+        {
+            oidcAfter = oidcCurrent;
+        }
+        else
+        {
+            execution.AddError(
+                "restart-oidc", oidcCurrent.Resource, null,
+                $"OIDC probe kid '{probeKid ?? "missing"}' is not safely resumable.");
+            return execution.Failure("OIDC signer activation could not be established.");
+        }
+        operation = operation with
+        {
+            Status = OidcRotationStatusOidcRestarted,
+            OidcAfterContainerId = oidcAfter.ContainerId,
+            OidcAfterStartTimeUtc = oidcAfter.StartTimeUtc
+        };
+        WriteOidcRotationJournal(resource.StatePath, operation);
+
+        await execution.ReportAsync("verify-new-token", 7,
+            "Validating the post-switch JWT claims and rotated kid.");
+        var (newTokenJwt, newTokenKid) = await runtime.CaptureOidcTokenAsync(
+            requestCancellationToken);
+        var newToken = ParseAndValidateOidcToken(
+            newTokenJwt ?? throw new InvalidDataException(
+                "OIDC returned an empty post-switch token."),
+            operation.NewOidcKeyId!);
+        execution.Check("new-token-uses-new-kid",
+            newTokenKid == operation.NewOidcKeyId,
+            operation.NewOidcKeyId!, newTokenKid ?? "missing",
+            "verify-new-token", resource.Components.Oidc.Resource.Name);
+
+        await execution.ReportAsync("verify-fulcio-stable", 8,
+            "Confirming Fulcio was not restarted.");
+        var fulcioAfterRotation = runtime.GetRequiredSnapshot(
+            resource.Components.Fulcio.Resource);
+        execution.Check("fulcio-not-restarted",
+            fulcioAfterRotation.ContainerId == operation.FulcioContainerId
+                && fulcioAfterRotation.StartTimeUtc == operation.FulcioStartTimeUtc
+                && IsRunningHealthy(fulcioAfterRotation),
+            $"same identity {operation.FulcioContainerId}",
+            fulcioAfterRotation.ContainerId ?? "different",
+            "verify-fulcio-stable", resource.Components.Fulcio.Resource.Name);
+
+        await execution.ReportAsync("prove-fulcio-issuance", 9,
+            "Issuing and validating Fulcio certificates for the exact old and new JWTs.");
+        var oldCertificate = await runtime.ProveFulcioCertIssuanceAsync(
+            operation.OldJwt!, operation.OldToken.Subject,
+            requestCancellationToken);
+        var newCertificate = await runtime.ProveFulcioCertIssuanceAsync(
+            newTokenJwt!, newToken.Subject, requestCancellationToken);
+        execution.Check("fulcio-accepts-old-token", oldCertificate is not null,
+            "validated certificate",
+            oldCertificate?.CertificateSha256 ?? "missing",
+            "prove-fulcio-issuance", resource.Components.Fulcio.Resource.Name);
+        execution.Check("fulcio-accepts-new-token", newCertificate is not null,
+            "validated certificate",
+            newCertificate?.CertificateSha256 ?? "missing",
+            "prove-fulcio-issuance", resource.Components.Fulcio.Resource.Name);
+
+        await execution.ReportAsync("restart-clients", 10,
+            "Restarting all six clients for trust generation convergence.");
+        var clients = resource.GetRegistrations().Clients
+            .OrderBy(c => c.Resource.Name, StringComparer.Ordinal).ToArray();
+        if (!execution.Check("six-clients-registered",
+                clients.Length == 6, "6",
+                clients.Length.ToString(CultureInfo.InvariantCulture),
+                "restart-clients", resource.Name))
+            return execution.Failure("Not exactly six clients.");
+
+        using var clientCritical = new CancellationTokenSource(
+            TimeSpan.FromMinutes(20));
+        foreach (var client in clients)
+        {
+            var clientBefore = runtime.GetRequiredSnapshot(client.Resource);
+            if (!execution.Check($"{client.Resource.Name}-ready",
+                    IsRunningHealthy(clientBefore) && HasContainerIdentity(clientBefore),
+                    "Running/Healthy", Describe(clientBefore),
+                    "restart-client", client.Resource.Name))
+                return execution.Failure($"{client.Resource.Name} not ready.");
+
+            var restart = await runtime.ExecuteCommandAsync(
+                client.Resource, KnownResourceCommands.RestartCommand,
+                clientCritical.Token);
+            if (!restart.Success)
+            {
+                execution.AddError("restart-client", client.Resource.Name, null,
+                    restart.Message ?? "Restart rejected.");
+                return execution.Failure($"{client.Resource.Name} restart failed.");
+            }
+
+            SigstoreResourceInstanceSnapshot clientAfter;
+            try
+            {
+                clientAfter = await runtime.WaitForSnapshotAsync(
+                    client.Resource,
+                    snapshot => IsNewInstance(clientBefore, snapshot)
+                        && IsRunningHealthy(snapshot),
+                    ClientTimeout, clientCritical.Token);
+            }
+            catch (OperationCanceledException ex)
+            {
+                execution.AddError("wait-client", client.Resource.Name, null,
+                    ex.Message);
+                return execution.Failure($"{client.Resource.Name} not healthy.");
+            }
+
+            var trustStatus = await runtime.ReadClientStatusAsync(
+                client, clientCritical.Token);
+            if (!execution.Check($"{client.Resource.Name}-trust-status",
+                    MatchesDisk(after.Tuf.Trust, trustStatus),
+                    DescribeTrust(after.Tuf.Trust), DescribeTrust(trustStatus),
+                    "wait-client", client.Resource.Name))
+                return execution.Failure($"{client.Resource.Name} stale trust.");
+
+            execution.Resources.Add(CreateLifecycleResult(
+                client.Resource.Name, KnownResourceCommands.RestartCommand,
+                clientBefore, clientAfter, trustStatus));
+        }
+
+        await execution.ReportAsync("aggregate-status", 11,
+            "Waiting for aggregate health.");
+        await runtime.WaitForAggregateHealthyAsync(
+            AggregateTimeout, clientCritical.Token);
+        var aggregate = await runtime.CollectStatusAsync(clientCritical.Token);
+        execution.Check("aggregate-ready",
+            aggregate.Ready
+                && aggregate.Clients.Count == clients.Length
+                && aggregate.Clients.All(client =>
+                    MatchesDisk(after.Tuf.Trust, client)),
+            $"ready, {clients.Length} clients",
+            aggregate.Reason ?? $"ready={aggregate.Ready}",
+            "aggregate-status", resource.Name);
+
+        await execution.ReportAsync("final-verification", 12,
+            "Final Fulcio identity verification.");
+        var fulcioFinal = runtime.GetRequiredSnapshot(
+            resource.Components.Fulcio.Resource);
+        execution.Check("fulcio-final-identity",
+            fulcioFinal.ContainerId == operation.FulcioContainerId
+                && fulcioFinal.StartTimeUtc == operation.FulcioStartTimeUtc
+                && IsRunningHealthy(fulcioFinal),
+            $"same {operation.FulcioContainerId}",
+            fulcioFinal.ContainerId ?? "different",
+            "final-verification", resource.Components.Fulcio.Resource.Name);
+
+        if (execution.HasFailures)
+            return execution.Failure("OIDC rotation convergence checks failed.");
+
+        operation = operation with
+        {
+            Status = OidcRotationStatusCompleted,
+            OldJwt = null,
+            NewToken = newToken,
+            OldCertificate = oldCertificate,
+            NewCertificate = newCertificate,
+            CompletedAtUtc = DateTimeOffset.UtcNow
+        };
+        WriteOidcRotationJournal(resource.StatePath, operation);
+        execution.OidcRotation = CreateOidcRotationResult(
+            operation,
+            recovered: operation.StartedAtUtc < execution.Progress[0].ObservedAtUtc);
+        await execution.ReportAsync("complete", 13,
+            "OIDC signing key rotated successfully.");
+        return execution.Success(
+            $"OIDC signing key rotated: {operation.StartingOidcKeyId} → " +
+            $"{operation.NewOidcKeyId} (gen " +
+            $"{before.Tuf.Trust.Generation} → {after.Tuf.Trust.Generation}). " +
+            $"Fulcio identity unchanged ({operation.FulcioContainerId}).");
+    }
+
+    private async Task<OidcRotationCommandJournal> CreateOidcRotationOperationAsync(
+        SigstoreOperationSnapshot startingSnapshot,
+        SigstoreResourceInstanceSnapshot oidc,
+        SigstoreResourceInstanceSnapshot fulcio,
+        CancellationToken cancellationToken)
+    {
+        var kid = ReadOidcKeyIdFromManifest(resource.StatePath)
+            ?? throw new InvalidDataException(
+                "The active generation omits oidcKeyId.");
+        var (jwt, tokenKid) = await runtime.CaptureOidcTokenAsync(
+            cancellationToken);
+        if (jwt is null || tokenKid != kid)
+        {
+            throw new InvalidDataException(
+                "The pre-switch OIDC JWT does not use the active generation key.");
+        }
+        var evidence = ParseAndValidateOidcToken(jwt, kid);
+        var operation = new OidcRotationCommandJournal(
+            1,
+            Guid.NewGuid().ToString("N"),
+            OidcRotationStatusRequested,
+            DateTimeOffset.UtcNow,
+            null,
+            startingSnapshot.Tuf.Trust.TrustDomainId,
+            startingSnapshot.Tuf.Trust.Generation,
+            startingSnapshot.Tuf.Trust.GenerationId,
+            kid,
+            startingSnapshot,
+            oidc.ResourceId,
+            oidc.ContainerId!,
+            oidc.StartTimeUtc,
+            fulcio.ContainerId!,
+            fulcio.StartTimeUtc,
+            jwt,
+            evidence,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null);
+        WriteOidcRotationJournal(resource.StatePath, operation);
+        return operation;
+    }
+
+    private static OidcRotationCommandJournal? LoadIncompleteOidcRotation(
+        string statePath)
+    {
+        var root = Path.Combine(statePath, "oidc-rotation");
+        if (!Directory.Exists(root))
+        {
+            return null;
+        }
+        var journals = Directory
+            .EnumerateFiles(root, "command.json", SearchOption.AllDirectories)
+            .Select(path =>
+            {
+                var journal = JsonSerializer.Deserialize<OidcRotationCommandJournal>(
+                    File.ReadAllText(path),
+                    JsonOptions)
+                    ?? throw new InvalidDataException(
+                        $"OIDC command journal '{path}' is empty.");
+                if (journal.SchemaVersion != 1
+                    || !Guid.TryParseExact(journal.OperationId, "N", out _)
+                    || Path.GetFileName(Path.GetDirectoryName(path))
+                        != journal.OperationId)
+                {
+                    throw new InvalidDataException(
+                        $"OIDC command journal '{path}' has invalid identity.");
+                }
+                if (journal.Status is not (
+                        OidcRotationStatusRequested
+                        or OidcRotationStatusWorkerCommitted
+                        or OidcRotationStatusOidcRestarted
+                        or OidcRotationStatusCompleted)
+                    || journal.StartingGeneration < 1
+                    || journal.StartingGenerationId
+                        != $"generation-{journal.StartingGeneration:D8}"
+                    || journal.StartingSnapshot.Tuf.Trust.TrustDomainId
+                        != journal.TrustDomainId
+                    || journal.StartingSnapshot.Tuf.Trust.Generation
+                        != journal.StartingGeneration
+                    || journal.StartingSnapshot.Tuf.Trust.GenerationId
+                        != journal.StartingGenerationId
+                    || string.IsNullOrWhiteSpace(journal.OldJwt)
+                        && journal.Status != OidcRotationStatusCompleted)
+                {
+                    throw new InvalidDataException(
+                        $"OIDC command journal '{path}' has invalid state.");
+                }
+                if (journal.Status != OidcRotationStatusCompleted)
+                {
+                    var token = ParseAndValidateOidcToken(
+                        journal.OldJwt!,
+                        journal.StartingOidcKeyId);
+                    if (token != journal.OldToken)
+                    {
+                        throw new InvalidDataException(
+                            $"OIDC command journal '{path}' token evidence is invalid.");
+                    }
+                }
+                if (journal.Status is OidcRotationStatusWorkerCommitted
+                        or OidcRotationStatusOidcRestarted
+                    && (journal.WorkerCompletion is null
+                        || journal.NewGeneration
+                            != journal.StartingGeneration + 1
+                        || journal.NewGenerationId
+                            != $"generation-{journal.NewGeneration:D8}"
+                        || journal.NewOidcKeyId
+                            != journal.WorkerCompletion.NewOidcKeyId))
+                {
+                    throw new InvalidDataException(
+                        $"OIDC command journal '{path}' has invalid worker state.");
+                }
+                if (journal.Status == OidcRotationStatusOidcRestarted
+                    && (string.IsNullOrWhiteSpace(journal.OidcAfterContainerId)
+                        || journal.OidcAfterStartTimeUtc is null))
+                {
+                    throw new InvalidDataException(
+                        $"OIDC command journal '{path}' has invalid restart state.");
+                }
+                return journal;
+            })
+            .Where(journal => journal.Status != OidcRotationStatusCompleted)
+            .ToArray();
+        return journals.Length switch
+        {
+            0 => null,
+            1 => journals[0],
+            _ => throw new InvalidDataException(
+                "Multiple incomplete OIDC rotation operations exist.")
+        };
+    }
+
+    private static void WriteOidcRotationRequest(
+        string statePath,
+        OidcRotationCommandJournal operation)
+    {
+        var path = Path.Combine(
+            statePath,
+            "rotate-oidc-signing-key.request");
+        var request = new OidcRotationWorkerRequest(
+            2,
+            operation.OperationId,
+            operation.TrustDomainId,
+            operation.StartingGeneration,
+            operation.StartingGenerationId,
+            operation.StartingOidcKeyId);
+        if (File.Exists(path))
+        {
+            var existing = JsonSerializer.Deserialize<OidcRotationWorkerRequest>(
+                File.ReadAllText(path),
+                JsonOptions);
+            if (existing != request)
+            {
+                throw new InvalidDataException(
+                    "The surviving OIDC worker request belongs to another operation.");
+            }
+            return;
+        }
+        WriteCreateNewJson(path, request);
+    }
+
+    private static OidcRotationWorkerCompletion? ReadOidcWorkerCompletion(
+        string statePath)
+    {
+        var path = Path.Combine(
+            statePath,
+            "rotate-oidc-signing-key.completed");
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+        var completion =
+            JsonSerializer.Deserialize<OidcRotationWorkerCompletion>(
+                File.ReadAllText(path),
+                JsonOptions)
+            ?? throw new InvalidDataException(
+                "The OIDC worker completion is empty.");
+        if (completion.SchemaVersion != 2
+            || !Guid.TryParseExact(completion.OperationId, "N", out _)
+            || completion.NewGeneration != completion.PriorGeneration + 1
+            || completion.NewGenerationId
+                != $"generation-{completion.NewGeneration:D8}"
+            || completion.PriorGenerationId
+                != $"generation-{completion.PriorGeneration:D8}"
+            || completion.JwksKeyIds.Count < 2
+            || string.IsNullOrWhiteSpace(completion.JwksSha256)
+            || string.IsNullOrWhiteSpace(completion.PublicationId))
+        {
+            throw new InvalidDataException(
+                "The OIDC worker completion is invalid.");
+        }
+        return completion;
+    }
+
+    private static void WriteOidcRotationJournal(
+        string statePath,
+        OidcRotationCommandJournal operation)
+    {
+        var directory = Path.Combine(
+            statePath,
+            "oidc-rotation",
+            operation.OperationId);
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "command.json");
+        var temporary = Path.Combine(
+            directory,
+            $".command.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+        var data = JsonSerializer.Serialize(operation, JsonOptions) + "\n";
+        using (var stream = new FileStream(
+            temporary,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            4096,
+            FileOptions.WriteThrough))
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(
+                    temporary,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+            var bytes = Encoding.UTF8.GetBytes(data);
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+        }
+        File.Move(temporary, path, overwrite: true);
+        SyncParentDirectory(path);
+    }
+
+    private static void WriteCreateNewJson<T>(string path, T value)
+    {
+        using (var stream = new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            4096,
+            FileOptions.WriteThrough))
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(
+                    path,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+            var bytes = Encoding.UTF8.GetBytes(
+                JsonSerializer.Serialize(value, JsonOptions) + "\n");
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+        }
+        SyncParentDirectory(path);
+    }
+
+    private static void SyncParentDirectory(string path)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+        var directory = Path.GetDirectoryName(path)
+            ?? throw new InvalidDataException(
+                $"Path '{path}' has no parent directory.");
+        var descriptor = OpenUnix(directory, OpenReadOnly);
+        if (descriptor < 0)
+        {
+            throw new IOException(
+                $"Could not open '{directory}' for fsync.",
+                new Win32Exception(Marshal.GetLastPInvokeError()));
+        }
+        try
+        {
+            if (FsyncUnix(descriptor) != 0)
+            {
+                throw new IOException(
+                    $"Could not fsync '{directory}'.",
+                    new Win32Exception(Marshal.GetLastPInvokeError()));
+            }
+        }
+        finally
+        {
+            _ = CloseUnix(descriptor);
+        }
+    }
+
+    [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+    private static extern int OpenUnix(string path, int flags);
+
+    [DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
+    private static extern int FsyncUnix(int descriptor);
+
+    [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+    private static extern int CloseUnix(int descriptor);
+
+    private static OidcTokenEvidence ParseAndValidateOidcToken(
+        string jwt,
+        string expectedKid)
+    {
+        var parts = jwt.Trim().Split('.');
+        if (parts.Length != 3)
+        {
+            throw new InvalidDataException("OIDC token is not a compact JWT.");
+        }
+        using var header = JsonDocument.Parse(DecodeJwtSegment(parts[0]));
+        using var payload = JsonDocument.Parse(DecodeJwtSegment(parts[1]));
+        var kid = RequiredJsonString(header.RootElement, "kid");
+        var algorithm = RequiredJsonString(header.RootElement, "alg");
+        var issuer = RequiredJsonString(payload.RootElement, "iss");
+        var subject = RequiredJsonString(payload.RootElement, "sub");
+        var audience = RequiredJsonString(payload.RootElement, "aud");
+        var issuedAt = RequiredUnixTime(payload.RootElement, "iat");
+        var notBefore = RequiredUnixTime(payload.RootElement, "nbf");
+        var expires = RequiredUnixTime(payload.RootElement, "exp");
+        var now = DateTimeOffset.UtcNow;
+        if (kid != expectedKid
+            || algorithm != "RS256"
+            || issuer != SigstoreDefaults.ExpectedIssuer
+            || subject != SigstoreDefaults.ExpectedIdentity
+            || audience != "sigstore"
+            || issuedAt > now.AddSeconds(30)
+            || notBefore > now.AddSeconds(30)
+            || expires <= now
+            || expires <= issuedAt)
+        {
+            throw new InvalidDataException(
+                "OIDC token claims do not match the required issuer, identity, " +
+                "audience, lifetime, or signing key.");
+        }
+        return new OidcTokenEvidence(
+            kid,
+            issuer,
+            subject,
+            audience,
+            issuedAt,
+            notBefore,
+            expires);
+    }
+
+    private static byte[] DecodeJwtSegment(string segment)
+    {
+        var value = segment.Replace('-', '+').Replace('_', '/');
+        value += (value.Length % 4) switch
+        {
+            0 => string.Empty,
+            2 => "==",
+            3 => "=",
+            _ => throw new InvalidDataException("JWT contains invalid base64url.")
+        };
+        return Convert.FromBase64String(value);
+    }
+
+    private static string RequiredJsonString(
+        JsonElement element,
+        string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || property.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(property.GetString()))
+        {
+            throw new InvalidDataException(
+                $"JWT claim '{propertyName}' is missing.");
+        }
+        return property.GetString()!;
+    }
+
+    private static DateTimeOffset RequiredUnixTime(
+        JsonElement element,
+        string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || !property.TryGetInt64(out var seconds))
+        {
+            throw new InvalidDataException(
+                $"JWT claim '{propertyName}' is missing.");
+        }
+        return DateTimeOffset.FromUnixTimeSeconds(seconds);
+    }
+
+    private static OidcRotationEvidence CreateOidcRotationResult(
+        OidcRotationCommandJournal operation,
+        bool recovered) =>
+        new(
+            operation.OperationId,
+            operation.Status,
+            recovered,
+            operation.StartingGeneration,
+            operation.StartingGenerationId,
+            operation.NewGeneration,
+            operation.NewGenerationId,
+            operation.StartingOidcKeyId,
+            operation.NewOidcKeyId,
+            operation.WorkerCompletion?.PublicationId,
+            operation.WorkerCompletion?.ManifestSha256,
+            operation.WorkerCompletion?.JwksSha256,
+            operation.WorkerCompletion?.JwksKeyIds,
+            operation.WorkerCompletion?.RetainedKeyPaths,
+            operation.OldToken,
+            operation.NewToken,
+            operation.OldCertificate,
+            operation.NewCertificate,
+            operation.OidcContainerId,
+            operation.OidcAfterContainerId,
+            operation.FulcioContainerId,
+            operation.FulcioStartTimeUtc);
+
+    internal static async Task<(string? jwt, string? kid)> CaptureOidcTokenAsync(
+        CancellationToken cancellationToken)
+    {
+        using var handler = new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback =
+                HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+        };
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = TimeSpan.FromSeconds(30)
+        };
+        var jwt = await httpClient.GetStringAsync(
+            $"{SigstoreDefaults.ExpectedIssuer}/token", cancellationToken);
+        if (string.IsNullOrWhiteSpace(jwt))
+        {
+            throw new InvalidDataException("OIDC token response was empty.");
+        }
+        return (jwt, ExtractKidFromJwt(jwt));
+    }
+
+    internal static async Task<FulcioIssuanceEvidence?> ProveFulcioCertIssuanceAsync(
+        string oidcToken,
+        string subject,
+        CancellationToken cancellationToken)
+    {
+        using var httpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(30)
+        };
+        httpClient.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue(
+                "Bearer", oidcToken);
+        using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var body = new
+        {
+            publicKeyRequest = new
+            {
+                publicKey = new
+                {
+                    algorithm = "ECDSA",
+                    content = ecdsa.ExportSubjectPublicKeyInfoPem()
+                },
+                proofOfPossession = Convert.ToBase64String(
+                    ecdsa.SignData(
+                        Encoding.UTF8.GetBytes(subject),
+                        HashAlgorithmName.SHA256))
+            }
+        };
+        using var response = await httpClient.PostAsJsonAsync(
+            "http://fulcio-sigstore.dev.localhost:5555/api/v2/signingCert",
+            body,
+            cancellationToken);
+        var responseContent = await response.Content.ReadAsStringAsync(
+            cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidDataException(
+                $"Fulcio issuance returned {(int)response.StatusCode}: " +
+                responseContent);
+        }
+        using var responseJson = JsonDocument.Parse(responseContent);
+        var certificatePem = FindCertificatePem(responseJson.RootElement)
+            ?? throw new InvalidDataException(
+                "Fulcio response did not contain a PEM certificate.");
+        using var certificate = X509Certificate2.CreateFromPem(certificatePem);
+        using var certificateKey = certificate.GetECDsaPublicKey()
+            ?? throw new InvalidDataException(
+                "Fulcio certificate does not contain an ECDSA public key.");
+        if (!certificateKey.ExportSubjectPublicKeyInfo()
+                .SequenceEqual(ecdsa.ExportSubjectPublicKeyInfo())
+            || certificate.NotAfter.ToUniversalTime() <= DateTime.UtcNow
+            || !certificate.Extensions
+                .OfType<X509Extension>()
+                .Where(extension => extension.Oid?.Value == "2.5.29.17")
+                .Any(extension => extension.Format(false)
+                    .Contains(subject, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new InvalidDataException(
+                "Fulcio certificate key, lifetime, or identity is invalid.");
+        }
+        return new FulcioIssuanceEvidence(
+            Convert.ToHexString(SHA256.HashData(certificate.RawData))
+                .ToLowerInvariant(),
+            certificate.Subject,
+            certificate.Issuer,
+            subject,
+            certificate.NotBefore.ToUniversalTime(),
+            certificate.NotAfter.ToUniversalTime());
+    }
+
+    private static string? FindCertificatePem(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.String)
+        {
+            var value = element.GetString();
+            return value?.Contains(
+                "-----BEGIN CERTIFICATE-----",
+                StringComparison.Ordinal) == true
+                ? value
+                : null;
+        }
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in element.EnumerateObject())
+            {
+                var found = FindCertificatePem(property.Value);
+                if (found is not null)
+                {
+                    return found;
+                }
+            }
+        }
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                var found = FindCertificatePem(item);
+                if (found is not null)
+                {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static string? ExtractKidFromJwt(string jwt)
+    {
+        var parts = jwt.Trim().Split('.');
+        if (parts.Length != 3)
+        {
+            throw new InvalidDataException("OIDC token is not a compact JWT.");
+        }
+        using var document = JsonDocument.Parse(DecodeJwtSegment(parts[0]));
+        return RequiredJsonString(document.RootElement, "kid");
     }
 
     private async Task<ExecuteCommandResult> ExecutePublishTrustedRootCoreAsync(
@@ -1691,6 +2735,30 @@ internal sealed class SigstoreOperationExecutor(
             tufServer);
     }
 
+    internal static async Task<SigstoreOperationSnapshot> CaptureAsync(
+        SigstoreResource resource,
+        ISigstoreStateInspector stateInspector,
+        CancellationToken cancellationToken)
+    {
+        var tuf = stateInspector.ReadTufState(resource.StatePath);
+        var trustStateSha256 = stateInspector.ReadTrustStateFingerprint(
+            resource.StatePath);
+        var trustMaterialSha256 =
+            stateInspector.ReadTrustMaterialFingerprint(
+                resource.StatePath);
+        // Use a no-op served state when called from external commands
+        // that don't need served TUF validation.
+        var tufServer = new SigstoreResourceInstanceSnapshot(
+            resource.Components.Tuf.Resource.Name,
+            "none", "none", "none", null, null, null, null, null);
+        return new SigstoreOperationSnapshot(
+            tuf,
+            new SigstoreServedTufSnapshot(null!, null!),
+            trustStateSha256,
+            trustMaterialSha256,
+            tufServer);
+    }
+
     private static bool ValidateCapture(
         OperationExecution execution,
         string phase,
@@ -2086,6 +3154,18 @@ internal sealed class SigstoreOperationExecutor(
         return execution.Failure(message);
     }
 
+    private static string? ReadOidcKeyIdFromManifest(string statePath)
+    {
+        var manifestPath = Path.Combine(statePath, "active-generation", "manifest.json");
+        if (!File.Exists(manifestPath)) return null;
+        var json = File.ReadAllText(manifestPath);
+        var doc = System.Text.Json.JsonDocument.Parse(json);
+        if (doc.RootElement.TryGetProperty("OidcKeyId", out var kid)
+            || doc.RootElement.TryGetProperty("oidcKeyId", out kid))
+            return kid.GetString();
+        return null;
+    }
+
     private static void CheckEqual<T>(
         OperationExecution execution,
         string name,
@@ -2147,7 +3227,7 @@ internal sealed class SigstoreOperationExecutor(
         && disk.Trust.SigningConfigSha256
             == served.Trust.SigningConfigSha256;
 
-    private static bool MatchesDisk(
+    internal static bool MatchesDisk(
         SigstoreDiskTrustStatus disk,
         SigstoreClientTrustStatus client) =>
         disk.TrustDomainId == client.TrustDomainId
@@ -2160,11 +3240,11 @@ internal sealed class SigstoreOperationExecutor(
         && disk.TrustedRootSha256 == client.TrustedRootSha256
         && disk.SigningConfigSha256 == client.SigningConfigSha256;
 
-    private static bool HasContainerIdentity(
+    internal static bool HasContainerIdentity(
         SigstoreResourceInstanceSnapshot snapshot) =>
         !string.IsNullOrWhiteSpace(snapshot.ContainerId);
 
-    private static bool IsNewInstance(
+    internal static bool IsNewInstance(
         SigstoreResourceInstanceSnapshot before,
         SigstoreResourceInstanceSnapshot after) =>
         HasContainerIdentity(before)
@@ -2173,27 +3253,27 @@ internal sealed class SigstoreOperationExecutor(
         && (before.StartTimeUtc is null
             || after.StartTimeUtc > before.StartTimeUtc);
 
-    private static bool SameInstance(
+    internal static bool SameInstance(
         SigstoreResourceInstanceSnapshot first,
         SigstoreResourceInstanceSnapshot second) =>
         HasContainerIdentity(first)
         && first.ContainerId == second.ContainerId
         && first.StartTimeUtc == second.StartTimeUtc;
 
-    private static bool IsTerminal(
+    internal static bool IsTerminal(
         SigstoreResourceInstanceSnapshot snapshot) =>
         KnownResourceStates.TerminalStates.Contains(snapshot.State);
 
-    private static bool IsSuccessfulTerminal(
+    internal static bool IsSuccessfulTerminal(
         SigstoreResourceInstanceSnapshot snapshot) =>
         IsTerminal(snapshot) && snapshot.ExitCode == 0;
 
-    private static bool IsRunningHealthy(
+    internal static bool IsRunningHealthy(
         SigstoreResourceInstanceSnapshot snapshot) =>
         snapshot.State == KnownResourceStates.Running
         && snapshot.Health == nameof(HealthStatus.Healthy);
 
-    private static SigstoreResourceLifecycleResult CreateLifecycleResult(
+    internal static SigstoreResourceLifecycleResult CreateLifecycleResult(
         string resourceName,
         string command,
         SigstoreResourceInstanceSnapshot before,
@@ -2211,7 +3291,7 @@ internal sealed class SigstoreOperationExecutor(
             after.ExitCode,
             trustStatus);
 
-    private static ExecuteCommandResult CreateContentionResult(
+    internal static ExecuteCommandResult CreateContentionResult(
         string command,
         SigstoreOperationState active)
     {
@@ -2242,7 +3322,7 @@ internal sealed class SigstoreOperationExecutor(
                 ]));
     }
 
-    private static bool IsExpectedOperationFailure(Exception exception) =>
+    internal static bool IsExpectedOperationFailure(Exception exception) =>
         exception is SigstoreStatusException
             or IOException
             or UnauthorizedAccessException
@@ -2252,7 +3332,7 @@ internal sealed class SigstoreOperationExecutor(
             or UriFormatException
             or OperationCanceledException;
 
-    private static string Describe(
+    internal static string Describe(
         SigstoreResourceInstanceSnapshot snapshot) =>
         $"{snapshot.State}/{snapshot.Health}, container " +
         $"{snapshot.ContainerId ?? "missing"}, start " +
@@ -2294,13 +3374,13 @@ internal sealed class SigstoreOperationExecutor(
         $"{trust.TrustDomainId}/{trust.Generation}/{trust.GenerationId}/" +
         trust.GenerationManifestSha256;
 
-    private static string DescribeTrust(
+    internal static string DescribeTrust(
         SigstoreDiskTrustStatus trust) =>
         $"{DescribeGeneration(trust)}/{trust.TufRootVersion}/" +
         $"{trust.TufTargetsVersion}/{trust.TrustedRootSha256}/" +
         trust.SigningConfigSha256;
 
-    private static string DescribeTrust(
+    internal static string DescribeTrust(
         SigstoreClientTrustStatus trust) =>
         $"{trust.TrustDomainId}/{trust.Generation}/{trust.GenerationId}/" +
         $"{trust.GenerationManifestSha256}/{trust.TufRootVersion}/" +
@@ -2329,6 +3409,8 @@ internal sealed class SigstoreOperationExecutor(
         public SigstoreOperationSnapshot? After { get; set; }
 
         public bool? CommittedStatePreserved { get; set; }
+
+        public OidcRotationEvidence? OidcRotation { get; set; }
 
         public bool HasFailures => Errors.Count != 0;
 
@@ -2422,9 +3504,104 @@ internal sealed class SigstoreOperationExecutor(
                     Resources,
                     Checks,
                     CommittedStatePreserved,
-                    Errors));
+                    Errors,
+                    OidcRotation));
     }
 }
+
+internal sealed record OidcRotationWorkerRequest(
+    int SchemaVersion,
+    string OperationId,
+    string TrustDomainId,
+    int StartingGeneration,
+    string StartingGenerationId,
+    string StartingOidcKeyId);
+
+internal sealed record OidcRotationWorkerCompletion(
+    int SchemaVersion,
+    string OperationId,
+    string TrustDomainId,
+    int PriorGeneration,
+    string PriorGenerationId,
+    string PriorOidcKeyId,
+    int NewGeneration,
+    string NewGenerationId,
+    string NewOidcKeyId,
+    string PublicationId,
+    string ManifestSha256,
+    string JwksSha256,
+    IReadOnlyList<string> JwksKeyIds,
+    IReadOnlyList<string> RetainedKeyPaths,
+    string OverlapExpiresAtUtc);
+
+internal sealed record OidcTokenEvidence(
+    string Kid,
+    string Issuer,
+    string Subject,
+    string Audience,
+    DateTimeOffset IssuedAtUtc,
+    DateTimeOffset NotBeforeUtc,
+    DateTimeOffset ExpiresAtUtc);
+
+internal sealed record FulcioIssuanceEvidence(
+    string CertificateSha256,
+    string CertificateSubject,
+    string CertificateIssuer,
+    string Identity,
+    DateTimeOffset NotBeforeUtc,
+    DateTimeOffset NotAfterUtc);
+
+internal sealed record OidcRotationCommandJournal(
+    int SchemaVersion,
+    string OperationId,
+    string Status,
+    DateTimeOffset StartedAtUtc,
+    DateTimeOffset? CompletedAtUtc,
+    string TrustDomainId,
+    int StartingGeneration,
+    string StartingGenerationId,
+    string StartingOidcKeyId,
+    SigstoreOperationSnapshot StartingSnapshot,
+    string OidcResourceId,
+    string OidcContainerId,
+    DateTimeOffset? OidcStartTimeUtc,
+    string FulcioContainerId,
+    DateTimeOffset? FulcioStartTimeUtc,
+    string? OldJwt,
+    OidcTokenEvidence OldToken,
+    int? NewGeneration,
+    string? NewGenerationId,
+    string? NewOidcKeyId,
+    OidcRotationWorkerCompletion? WorkerCompletion,
+    string? OidcAfterContainerId,
+    DateTimeOffset? OidcAfterStartTimeUtc,
+    OidcTokenEvidence? NewToken = null,
+    FulcioIssuanceEvidence? OldCertificate = null,
+    FulcioIssuanceEvidence? NewCertificate = null);
+
+internal sealed record OidcRotationEvidence(
+    string OperationId,
+    string Status,
+    bool Recovered,
+    int StartingGeneration,
+    string StartingGenerationId,
+    int? NewGeneration,
+    string? NewGenerationId,
+    string OldKid,
+    string? NewKid,
+    string? TufPublicationId,
+    string? GenerationManifestSha256,
+    string? JwksSha256,
+    IReadOnlyList<string>? JwksKeyIds,
+    IReadOnlyList<string>? RetainedKeyPaths,
+    OidcTokenEvidence OldToken,
+    OidcTokenEvidence? NewToken,
+    FulcioIssuanceEvidence? OldCertificate,
+    FulcioIssuanceEvidence? NewCertificate,
+    string OidcBeforeContainerId,
+    string? OidcAfterContainerId,
+    string FulcioContainerId,
+    DateTimeOffset? FulcioStartTimeUtc);
 
 internal interface ISigstoreOperationRuntime
 {
@@ -2453,6 +3630,14 @@ internal interface ISigstoreOperationRuntime
 
     Task<SigstoreClientTrustStatus> ReadClientStatusAsync(
         SigstoreClientRegistration client,
+        CancellationToken cancellationToken);
+
+    Task<(string? jwt, string? kid)> CaptureOidcTokenAsync(
+        CancellationToken cancellationToken);
+
+    Task<FulcioIssuanceEvidence?> ProveFulcioCertIssuanceAsync(
+        string oidcToken,
+        string subject,
         CancellationToken cancellationToken);
 
     Task PublishParentStateAsync(SigstoreResource resource);
@@ -2497,6 +3682,19 @@ internal sealed class AspireSigstoreOperationRuntime
         _commands.ExecuteCommandAsync(
             resource,
             command,
+            cancellationToken);
+
+    public Task<(string? jwt, string? kid)> CaptureOidcTokenAsync(
+        CancellationToken cancellationToken) =>
+        SigstoreOperationExecutor.CaptureOidcTokenAsync(cancellationToken);
+
+    public Task<FulcioIssuanceEvidence?> ProveFulcioCertIssuanceAsync(
+        string oidcToken,
+        string subject,
+        CancellationToken cancellationToken) =>
+        SigstoreOperationExecutor.ProveFulcioCertIssuanceAsync(
+            oidcToken,
+            subject,
             cancellationToken);
 
     public async Task<SigstoreResourceInstanceSnapshot> WaitForSnapshotAsync(
@@ -2681,4 +3879,5 @@ internal sealed record SigstoreOperationResult(
     IReadOnlyList<SigstoreResourceLifecycleResult> Resources,
     IReadOnlyList<SigstoreOperationCheck> Postconditions,
     bool? CommittedStatePreserved,
-    IReadOnlyList<SigstoreOperationError> Errors);
+    IReadOnlyList<SigstoreOperationError> Errors,
+    OidcRotationEvidence? OidcRotation = null);

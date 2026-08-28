@@ -23,10 +23,10 @@ import (
 )
 
 const (
-	standbyRekorKeyFile       = "rekor-standby.pub"
-	publishRequestFile        = "publish-trusted-root.request"
-	publishCompletionFile     = "publish-trusted-root.completed"
-	publishCompletionSchema   = 2
+	standbyRekorKeyFile     = "rekor-standby.pub"
+	publishRequestFile      = "publish-trusted-root.request"
+	publishCompletionFile   = "publish-trusted-root.completed"
+	publishCompletionSchema = 2
 )
 
 // recoveryOutcome distinguishes no-op from actual state mutations.
@@ -83,6 +83,18 @@ func writeAtomicJSON(path string, data []byte) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("rename atomic: %w", err)
+	}
+	return syncDirectory(dir)
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open directory for fsync: %w", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("fsync directory: %w", err)
 	}
 	return nil
 }
@@ -521,6 +533,17 @@ func advanceTrustGeneration(statePath string, current bootstrapManifest) (bootst
 
 	// Write generation manifest.
 	now := time.Now().UTC()
+	currentGenerationManifest, err := readOIDCGenerationManifest(
+		statePath,
+		current.GenerationID,
+	)
+	if err != nil {
+		_ = os.RemoveAll(newGenerationPath)
+		return bootstrapManifest{}, "", fmt.Errorf(
+			"read current generation OIDC metadata: %w",
+			err,
+		)
+	}
 	genManifest := generationManifest{
 		SchemaVersion:        trustStateSchemaVersion,
 		Generation:           newGeneration,
@@ -535,6 +558,10 @@ func advanceTrustGeneration(statePath string, current bootstrapManifest) (bootst
 		TsaRootSHA256:        current.TsaRootSHA256,
 		TsaLeafSHA256:        current.TsaLeafSHA256,
 		OIDCKeyID:            current.OIDCKeyID,
+		OIDCRetainedPrivateKeyPaths: append(
+			[]string(nil),
+			currentGenerationManifest.OIDCRetainedPrivateKeyPaths...,
+		),
 		Files:                newFiles,
 	}
 	manifestBytes, err := json.MarshalIndent(genManifest, "", "  ")
@@ -607,13 +634,25 @@ func switchActiveGeneration(statePath string, current bootstrapManifest, newBoot
 		GenerationID:   current.GenerationID,
 		ManifestSHA256: current.GenerationManifestSHA256,
 	}
+	operation := "generation-advance"
+	transitionID := journal.TransitionID
+	if genManifest.OIDCRotationOperationID != "" {
+		operation = "oidc-rotation"
+		transitionID = genManifest.OIDCRotationOperationID
+	}
+	now := time.Now().UTC()
 	newJournal := trustTransitionJournal{
 		SchemaVersion:             trustTransitionSchemaVersion,
-		Status:                    "committed",
-		LastCheckpoint:            "transition-finalized",
+		TransitionID:              transitionID,
+		Operation:                 operation,
+		Status:                    "staged",
+		LastCheckpoint:            "active-link-prepared",
+		StartedAtUTC:              now,
+		UpdatedAtUTC:              now,
 		PriorGeneration:           priorRef,
 		Candidate:                 generationReference{Generation: newBootstrap.Generation, GenerationID: newBootstrap.GenerationID, ManifestSHA256: manifestHash},
 		TrustDomainManifestSHA256: domainHash,
+		LegacyManifestSHA256:      journal.LegacyManifestSHA256,
 		TrustDomain:               journal.TrustDomain,
 		CandidateManifest:         genManifest,
 	}
@@ -622,7 +661,7 @@ func switchActiveGeneration(statePath string, current bootstrapManifest, newBoot
 		return fmt.Errorf("marshal new journal: %w", err)
 	}
 	newJournalBytes = append(newJournalBytes, '\n')
-	if err := os.WriteFile(journalPath, newJournalBytes, 0o644); err != nil {
+	if err := writeAtomicJSON(journalPath, newJournalBytes); err != nil {
 		return fmt.Errorf("write transition journal: %w", err)
 	}
 
@@ -630,14 +669,29 @@ func switchActiveGeneration(statePath string, current bootstrapManifest, newBoot
 	activeLink := filepath.Join(statePath, "active-generation")
 	activeLinkNext := filepath.Join(statePath, "active-generation.next")
 	newTarget := filepath.Join("generations", newBootstrap.GenerationID)
-	if err := os.Symlink(newTarget, activeLinkNext); err != nil {
+	if pathExists(activeLinkNext) {
+		target, err := os.Readlink(activeLinkNext)
+		if err != nil || target != newTarget {
+			return fmt.Errorf("active-generation.next contains ambiguous state")
+		}
+	} else if err := os.Symlink(newTarget, activeLinkNext); err != nil {
 		return fmt.Errorf("create active-generation.next link: %w", err)
 	}
 	if err := os.Rename(activeLinkNext, activeLink); err != nil {
 		_ = os.Remove(activeLinkNext)
 		return fmt.Errorf("switch active-generation link: %w", err)
 	}
-	return nil
+	if err := syncDirectory(statePath); err != nil {
+		return err
+	}
+	newJournal.Status = "committed"
+	newJournal.LastCheckpoint = "transition-finalized"
+	newJournal.UpdatedAtUTC = time.Now().UTC()
+	newJournalBytes, err = json.MarshalIndent(newJournal, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal committed transition journal: %w", err)
+	}
+	return writeAtomicJSON(journalPath, append(newJournalBytes, '\n'))
 }
 
 // publishNewTargets builds TUF targets from the new generation (with additive
@@ -815,8 +869,18 @@ func finalizePublishPublication(
 		if preparing.Previous == nil {
 			return errors.New("retired TUF history exists without journal metadata")
 		}
-		// Retired history was also from the prior generation.
-		retired, err := repositoryReference(layout.retiredPrevious, priorSourceFingerprint)
+		retiredManifestData, err := os.ReadFile(filepath.Join(layout.retiredPrevious, "manifest.json"))
+		if err != nil {
+			return fmt.Errorf("read retired history manifest: %w", err)
+		}
+		var retiredManifest tufManifest
+		if err := json.Unmarshal(retiredManifestData, &retiredManifest); err != nil {
+			return fmt.Errorf("parse retired history manifest: %w", err)
+		}
+		retired, err := repositoryReference(
+			layout.retiredPrevious,
+			retiredManifest.SourceFingerprint,
+		)
 		if err != nil {
 			return fmt.Errorf("validate retired history: %w", err)
 		}
@@ -926,8 +990,8 @@ func buildAdditiveTargets(generationPath string, bootstrap bootstrapManifest, ac
 
 	// Build ClientTrustConfig from the modified TrustedRoot + unchanged SigningConfig.
 	clientConfig := &trustrootv1.ClientTrustConfig{
-		MediaType:    clientTrustConfigMediaType,
-		TrustedRoot:  existingTR,
+		MediaType:     clientTrustConfigMediaType,
+		TrustedRoot:   existingTR,
 		SigningConfig: existingSC,
 	}
 

@@ -936,6 +936,71 @@ and prevents the command from completing.
 - Fulcio does not require restart.
 - Signing and validation traffic resumes without trust regression.
 
+### Implementation (Step 9)
+
+Step 9 uses a **single-stage atomic switch**. It intentionally does not
+pre-publish a separate overlap-only generation. Fulcio refreshes discovery/JWKS
+when it encounters the new `kid`, so one generation advance and one OIDC
+replacement preserve continuity while the exact old token remains available
+for proof.
+
+The AppHost command owns orchestration and protected control files only. Under
+`state.lock`, it creates a schema-versioned operation journal and a CreateNew
+worker request bound to operation ID, trust domain, starting generation, and
+starting `kid`. The journal stores the exact pre-switch JWT with mode `0600`
+until proof succeeds. The Go worker owns all durable trust mutations under the
+same lock:
+
+1. Build generation N+1 in an operation-bound staging directory.
+2. Validate the exact manifest, every JWKS entry, active RSA
+   signer/public/JWK equality, every kid-bound retained private key, and
+   unchanged non-OIDC material.
+3. Atomically rename the complete generation into `generations/`.
+4. Transactionally publish TUF `trust_status` for N+1.
+5. Switch `active-generation` with the transition journal.
+6. Atomically write the operation-bound completion and consume the request.
+
+The command validates completion/publication/manifests, restarts OIDC exactly
+once, validates the new JWT claims, and proves real Fulcio certificate issuance
+using the exact old JWT and the new JWT with proof-of-possession. Fulcio's
+container ID and start timestamp must remain unchanged. All six clients are
+then restarted and every status contract must report N+1 before success. The
+completed journal retains token metadata and certificate hashes but removes the
+JWT.
+
+OIDC bind-mounts the stable state root read-only at `/var/lib/sigstore`; signer
+and JWKS paths use `/var/lib/sigstore/active-generation/...`. A replacement
+container therefore resolves the committed generation without mounting
+replaceable symlink descendants.
+
+Generation N+1 contains:
+
+- `private/oidc/signer.key` — new active private key.
+- `public/oidc/signer.pub` — matching new active public key.
+- `public/oidc/jwks.json` — new key plus every historical public key.
+- `private/oidc/retained/signer-<kid>.key` — one key for every historical
+  non-active JWK.
+- `manifest.json` — exact hashes and operation/prior-generation/overlap
+  metadata.
+
+Repeated rotations are append-only in Step 9: JWKS grows 1→2→3 and all
+historical private keys remain available. The recorded overlap expiration is
+the configured 30-minute token lifetime plus clock skew and is a minimum safety
+boundary, not an automatic retirement time. Key retirement is outside this
+command.
+
+Recovery always completes forward once generation/TUF commit has occurred. A
+replay validates the exact operation binding and live publication before
+reusing N+1; it never treats an arbitrary higher generation or broad completion
+match as success. If OIDC already restarted, the new signer probe suppresses a
+second restart. If proof was interrupted, the protected pre-switch JWT is
+reused and no new generation is created.
+
+TrustedRoot, SigningConfig, Fulcio/Rekor/CT/TSA identities, and prior generation
+bytes must remain unchanged. Any missing endpoint, token, certificate,
+container identity, completion binding, client convergence result, or aggregate
+health condition fails the parent command.
+
 ## Step 10: Implement timestamp-authority rotation
 
 ### Scope

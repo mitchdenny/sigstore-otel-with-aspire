@@ -130,7 +130,7 @@ internal sealed class OidcTokenIssuer : IDisposable
                 aud = Audience,
                 iat = now.ToUnixTimeSeconds(),
                 nbf = now.AddSeconds(-5).ToUnixTimeSeconds(),
-                exp = now.AddMinutes(5).ToUnixTimeSeconds(),
+                exp = now.AddMinutes(30).ToUnixTimeSeconds(),
                 email = identity,
                 email_verified = true
             },
@@ -192,42 +192,105 @@ internal sealed class OidcTokenIssuer : IDisposable
         string jwksJson)
     {
         using var document = JsonDocument.Parse(jwksJson);
-        var keys = document.RootElement
-            .GetProperty("keys")
-            .EnumerateArray()
-            .ToArray();
-
-        if (keys.Length != 1)
+        if (document.RootElement.ValueKind != JsonValueKind.Object
+            || !document.RootElement.TryGetProperty("keys", out var keysElement)
+            || keysElement.ValueKind != JsonValueKind.Array)
         {
             throw new InvalidDataException(
-                "The OIDC JWKS must contain exactly one key.");
+                "The OIDC JWKS must contain a keys array.");
         }
+        var keys = keysElement.EnumerateArray().ToArray();
 
-        var key = keys[0];
-        EnsureEqual("key type", "RSA", key.GetProperty("kty").GetString());
-        EnsureEqual("key use", "sig", key.GetProperty("use").GetString());
-        EnsureEqual("algorithm", "RS256", key.GetProperty("alg").GetString());
-
-        var parameters = signingKey.ExportParameters(
-            includePrivateParameters: false);
-        EnsureKeyBytesEqual(
-            "modulus",
-            parameters.Modulus!,
-            Base64UrlDecode(key.GetProperty("n").GetString()));
-        EnsureKeyBytesEqual(
-            "exponent",
-            parameters.Exponent!,
-            Base64UrlDecode(key.GetProperty("e").GetString()));
+        if (keys.Length < 1)
+        {
+            throw new InvalidDataException(
+                "The OIDC JWKS must contain at least one key.");
+        }
 
         var expectedKeyId = Base64UrlEncode(
             SHA256.HashData(
                 signingKey.ExportSubjectPublicKeyInfo()));
-        EnsureEqual(
-            "key ID",
-            expectedKeyId,
-            key.GetProperty("kid").GetString());
+        var seenKids = new HashSet<string>(StringComparer.Ordinal);
+        var activeMatches = 0;
+        foreach (var candidate in keys)
+        {
+            if (candidate.ValueKind != JsonValueKind.Object)
+            {
+                throw new InvalidDataException(
+                    "Every OIDC JWK must be an object.");
+            }
+            var kid = RequiredString(candidate, "kid");
+            if (kid.Length != 43
+                || kid.Any(character =>
+                    !char.IsAsciiLetterOrDigit(character)
+                    && character is not ('-' or '_'))
+                || !seenKids.Add(kid))
+            {
+                throw new InvalidDataException(
+                    "The OIDC JWKS contains an invalid or duplicate key ID.");
+            }
+            EnsureEqual("key type", "RSA", RequiredString(candidate, "kty"));
+            EnsureEqual("key use", "sig", RequiredString(candidate, "use"));
+            EnsureEqual("algorithm", "RS256", RequiredString(candidate, "alg"));
+
+            var parameters = new RSAParameters
+            {
+                Modulus = Base64UrlDecode(RequiredString(candidate, "n")),
+                Exponent = Base64UrlDecode(RequiredString(candidate, "e"))
+            };
+            using var candidateKey = RSA.Create();
+            try
+            {
+                candidateKey.ImportParameters(parameters);
+            }
+            catch (CryptographicException exception)
+            {
+                throw new InvalidDataException(
+                    $"The OIDC JWK '{kid}' is not a valid RSA public key.",
+                    exception);
+            }
+            if (candidateKey.KeySize < 2048)
+            {
+                throw new InvalidDataException(
+                    $"The OIDC JWK '{kid}' must use at least 2048 RSA bits.");
+            }
+            EnsureEqual(
+                "key ID",
+                kid,
+                Base64UrlEncode(
+                    SHA256.HashData(
+                        candidateKey.ExportSubjectPublicKeyInfo())));
+            if (kid == expectedKeyId)
+            {
+                EnsureKeyBytesEqual(
+                    "active public key",
+                    signingKey.ExportSubjectPublicKeyInfo(),
+                    candidateKey.ExportSubjectPublicKeyInfo());
+                activeMatches++;
+            }
+        }
+        if (activeMatches != 1)
+        {
+            throw new InvalidDataException(
+                "The OIDC JWKS must contain exactly one key matching " +
+                "the private signer.");
+        }
 
         return expectedKeyId;
+    }
+
+    private static string RequiredString(
+        JsonElement element,
+        string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || property.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(property.GetString()))
+        {
+            throw new InvalidDataException(
+                $"The OIDC JWK property '{propertyName}' is required.");
+        }
+        return property.GetString()!;
     }
 
     private static void EnsureKeyBytesEqual(

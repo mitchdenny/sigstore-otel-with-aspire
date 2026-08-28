@@ -102,6 +102,16 @@ public static class SigstoreResourceBuilderExtensions
                 commandOptions:
                     SigstoreOperationCommand.CreatePublishTrustedRootOptions(
                         parent.Resource))
+            .WithCommand(
+                name: SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+                displayName: "Rotate OIDC Signing Key",
+                executeCommand: context =>
+                    SigstoreOidcRotationCommand.ExecuteAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreOidcRotationCommand.CreateOptions(
+                        parent.Resource))
             .OnInitializeResource(
                (resource, context, cancellationToken) =>
                {
@@ -148,22 +158,18 @@ public static class SigstoreResourceBuilderExtensions
                 "oidc",
                 Path.Combine(sourcePath, "Sigstore.Oidc"))
             .WithBindMount(
-                activePrivatePath,
-                "/var/lib/sigstore/private",
-                isReadOnly: true)
-            .WithBindMount(
-                activePublicPath,
-                "/var/lib/sigstore/public",
+                statePath,
+                "/var/lib/sigstore",
                 isReadOnly: true)
             .WithEnvironment(
                 "SIGSTORE_OIDC_ISSUER",
                 SigstoreDefaults.ExpectedIssuer)
             .WithEnvironment(
                 "SIGSTORE_OIDC_PRIVATE_KEY_PATH",
-                "/var/lib/sigstore/private/oidc/signer.key")
+                "/var/lib/sigstore/active-generation/private/oidc/signer.key")
             .WithEnvironment(
                 "SIGSTORE_OIDC_JWKS_PATH",
-                "/var/lib/sigstore/public/oidc/jwks.json")
+                "/var/lib/sigstore/active-generation/public/oidc/jwks.json")
             .WithEnvironment(
                 "SIGSTORE_OIDC_DEFAULT_IDENTITY",
                 SigstoreDefaults.ExpectedIdentity)

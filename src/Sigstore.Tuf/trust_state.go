@@ -29,20 +29,26 @@ type trustDomainManifest struct {
 }
 
 type generationManifest struct {
-	SchemaVersion        int               `json:"schemaVersion"`
-	Generation           int               `json:"generation"`
-	GenerationID         string            `json:"generationId"`
-	TrustDomainID        string            `json:"trustDomainId"`
-	CreatedAtUTC         time.Time         `json:"createdAtUtc"`
-	SourceSchemaVersion  int               `json:"sourceSchemaVersion"`
-	SourceManifestSHA256 *string           `json:"sourceManifestSha256"`
-	FulcioRootSHA256     string            `json:"fulcioRootSha256"`
-	CtLogPublicKeySHA256 string            `json:"ctLogPublicKeySha256"`
-	RekorPublicKeySHA256 string            `json:"rekorPublicKeySha256"`
-	TsaRootSHA256        string            `json:"tsaRootSha256"`
-	TsaLeafSHA256        string            `json:"tsaLeafSha256"`
-	OIDCKeyID            string            `json:"oidcKeyId"`
-	Files                map[string]string `json:"files"`
+	SchemaVersion               int               `json:"schemaVersion"`
+	Generation                  int               `json:"generation"`
+	GenerationID                string            `json:"generationId"`
+	TrustDomainID               string            `json:"trustDomainId"`
+	CreatedAtUTC                time.Time         `json:"createdAtUtc"`
+	SourceSchemaVersion         int               `json:"sourceSchemaVersion"`
+	SourceManifestSHA256        *string           `json:"sourceManifestSha256"`
+	FulcioRootSHA256            string            `json:"fulcioRootSha256"`
+	CtLogPublicKeySHA256        string            `json:"ctLogPublicKeySha256"`
+	RekorPublicKeySHA256        string            `json:"rekorPublicKeySha256"`
+	TsaRootSHA256               string            `json:"tsaRootSha256"`
+	TsaLeafSHA256               string            `json:"tsaLeafSha256"`
+	OIDCKeyID                   string            `json:"oidcKeyId"`
+	OIDCRotationOperationID     string            `json:"oidcRotationOperationId,omitempty"`
+	OIDCPriorGeneration         int               `json:"oidcPriorGeneration,omitempty"`
+	OIDCPriorGenerationID       string            `json:"oidcPriorGenerationId,omitempty"`
+	OIDCPriorKeyID              string            `json:"oidcPriorKeyId,omitempty"`
+	OIDCOverlapExpiresAtUTC     *time.Time        `json:"oidcOverlapExpiresAtUtc,omitempty"`
+	OIDCRetainedPrivateKeyPaths []string          `json:"oidcRetainedPrivateKeyPaths,omitempty"`
+	Files                       map[string]string `json:"files"`
 }
 
 type generationReference struct {
@@ -53,13 +59,19 @@ type generationReference struct {
 
 type trustTransitionJournal struct {
 	SchemaVersion             int                  `json:"schemaVersion"`
+	TransitionID              string               `json:"transitionId,omitempty"`
+	Operation                 string               `json:"operation,omitempty"`
 	Status                    string               `json:"status"`
 	LastCheckpoint            string               `json:"lastCheckpoint"`
+	StartedAtUTC              time.Time            `json:"startedAtUtc,omitempty"`
+	UpdatedAtUTC              time.Time            `json:"updatedAtUtc,omitempty"`
 	PriorGeneration           *generationReference `json:"priorGeneration"`
 	Candidate                 generationReference  `json:"candidate"`
 	TrustDomainManifestSHA256 string               `json:"trustDomainManifestSha256"`
+	LegacyManifestSHA256      *string              `json:"legacyManifestSha256,omitempty"`
 	TrustDomain               trustDomainManifest  `json:"trustDomain"`
 	CandidateManifest         generationManifest   `json:"candidateManifest"`
+	Failure                   *string              `json:"failure,omitempty"`
 }
 
 func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
@@ -111,6 +123,14 @@ func loadActiveTrustGeneration(statePath string) (bootstrapManifest, error) {
 	if journal.PriorGeneration != nil && journal.Candidate.Generation <= journal.PriorGeneration.Generation {
 		return bootstrapManifest{}, fmt.Errorf(
 			"candidate generation %d must be greater than prior generation %d",
+			journal.Candidate.Generation,
+			journal.PriorGeneration.Generation,
+		)
+	}
+	if journal.PriorGeneration != nil &&
+		journal.Candidate.Generation != journal.PriorGeneration.Generation+1 {
+		return bootstrapManifest{}, fmt.Errorf(
+			"candidate generation %d must immediately follow prior generation %d",
 			journal.Candidate.Generation,
 			journal.PriorGeneration.Generation,
 		)
@@ -241,6 +261,14 @@ func validateGenerationState(
 			initialGeneration,
 		)
 	}
+	expectedGenerationID := fmt.Sprintf("generation-%08d", generation.Generation)
+	if generation.GenerationID != expectedGenerationID {
+		return fmt.Errorf(
+			"generation ID %q does not match generation %d",
+			generation.GenerationID,
+			generation.Generation,
+		)
+	}
 	if generation.TrustDomainID != domain.TrustDomainID {
 		return errors.New("generation trust-domain identity does not match")
 	}
@@ -269,6 +297,9 @@ func validateGenerationState(
 	}
 	if !reflect.DeepEqual(actualFiles, generation.Files) {
 		return errors.New("active generation file set or hashes do not match its manifest")
+	}
+	if err := validateOIDCGenerationMaterial(generationPath, generation); err != nil {
+		return fmt.Errorf("validate OIDC generation material: %w", err)
 	}
 	ctState, err := os.ReadFile(filepath.Join(statePath, "data", "ctlog", "bootstrap-state"))
 	if err != nil {

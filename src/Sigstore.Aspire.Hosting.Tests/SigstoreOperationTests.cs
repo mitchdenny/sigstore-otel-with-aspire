@@ -32,7 +32,8 @@ public sealed class SigstoreOperationTests
                 SigstoreOperationCommand.RefreshTufCommand,
                 SigstoreOperationCommand.RotateTufRootCommand,
                 SigstoreOperationCommand.RestartClientsCommand,
-                SigstoreOperationCommand.PublishTrustedRootCommand
+                SigstoreOperationCommand.PublishTrustedRootCommand,
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand
             ],
             annotations.Keys);
 
@@ -41,7 +42,8 @@ public sealed class SigstoreOperationTests
             SigstoreOperationCommand.RefreshTufCommand,
             SigstoreOperationCommand.RotateTufRootCommand,
             SigstoreOperationCommand.RestartClientsCommand,
-            SigstoreOperationCommand.PublishTrustedRootCommand
+            SigstoreOperationCommand.PublishTrustedRootCommand,
+            SigstoreOperationCommand.RotateOidcSigningKeyCommand
         })
         {
             var annotation = annotations[name];
@@ -104,6 +106,166 @@ public sealed class SigstoreOperationTests
         Assert.DoesNotContain(
             snapshot.Properties,
             property => property.Name == "Operation");
+    }
+
+    [Fact]
+    public async Task OidcRotationUsesOneWorkerOneIssuerRestartAndNoFulcioRestart()
+    {
+        using var model = new OperationModelFixture();
+        var oldKid = new string('a', 43);
+        var newKid = new string('b', 43);
+        var before = NewTufState();
+        var after = NewOidcRotationTufState(before);
+        var statePath = model.Parent.Resource.StatePath;
+        var activePath = System.IO.Path.Combine(
+            statePath,
+            "active-generation");
+        Directory.CreateDirectory(activePath);
+        File.WriteAllText(
+            System.IO.Path.Combine(activePath, "manifest.json"),
+            JsonSerializer.Serialize(new { oidcKeyId = oldKid }));
+
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events);
+        inspector.TufStates.Enqueue(before);
+        inspector.TufStates.Enqueue(after);
+        inspector.TrustFingerprints.Enqueue(Hash('1'));
+        inspector.TrustFingerprints.Enqueue(Hash('2'));
+        inspector.MaterialFingerprints.Enqueue(Hash('3'));
+        inspector.MaterialFingerprints.Enqueue(Hash('3'));
+
+        var runtime = NewRuntime(model, events, inspector);
+        runtime.ServedStates.Enqueue(NewServed(before));
+        runtime.ServedStates.Enqueue(NewServed(after));
+        runtime.Statuses.Enqueue(NewAggregate(model, after));
+        runtime.OidcTokens.Enqueue((CreateOidcJwt(oldKid), oldKid));
+        runtime.OidcTokens.Enqueue((CreateOidcJwt(oldKid), oldKid));
+        runtime.OidcTokens.Enqueue((CreateOidcJwt(newKid), newKid));
+        var now = DateTimeOffset.UtcNow;
+        runtime.FulcioCertificates.Enqueue(new FulcioIssuanceEvidence(
+            Hash('a'), "CN=leaf", "CN=fulcio", SigstoreDefaults.ExpectedIdentity,
+            now.AddMinutes(-1), now.AddMinutes(9)));
+        runtime.FulcioCertificates.Enqueue(new FulcioIssuanceEvidence(
+            Hash('b'), "CN=leaf", "CN=fulcio", SigstoreDefaults.ExpectedIdentity,
+            now.AddMinutes(-1), now.AddMinutes(9)));
+
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Tuf.Resource,
+            Running("tuf", "tuf-id"),
+            Running("tuf", "tuf-id"));
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.TufBootstrap.Resource,
+            Exited("tuf-bootstrap", "worker-before", 0));
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Oidc.Resource,
+            Running("oidc", "oidc-before"),
+            Running("oidc", "oidc-before"));
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Fulcio.Resource,
+            Running("fulcio", "fulcio-id"),
+            Running("fulcio", "fulcio-id"),
+            Running("fulcio", "fulcio-id"));
+        runtime.WaitResults["tuf-bootstrap"] =
+            Exited("tuf-bootstrap", "worker-after", 0, offsetSeconds: 10);
+        runtime.WaitResults["oidc"] =
+            Running("oidc", "oidc-after", offsetSeconds: 10);
+
+        foreach (var client in model.Parent.Resource.GetRegistrations().Clients)
+        {
+            runtime.SetSnapshotSequence(
+                client.Resource,
+                Running(client.Resource.Name, $"{client.Resource.Name}-before"));
+            runtime.WaitResults[client.Resource.Name] = Running(
+                client.Resource.Name,
+                $"{client.Resource.Name}-after",
+                offsetSeconds: 10);
+            runtime.ClientStatuses[client.Resource.Name] =
+                NewClientStatus(client, after.Trust);
+        }
+
+        runtime.OnExecuteCommand = (target, command) =>
+        {
+            if (target.Name != "tuf-bootstrap"
+                || command != KnownResourceCommands.StartCommand)
+            {
+                return;
+            }
+            var requestPath = System.IO.Path.Combine(
+                statePath,
+                "rotate-oidc-signing-key.request");
+            using var request = JsonDocument.Parse(
+                File.ReadAllText(requestPath));
+            var operationId = request.RootElement
+                .GetProperty("operationId")
+                .GetString()!;
+            File.WriteAllText(
+                System.IO.Path.Combine(activePath, "manifest.json"),
+                JsonSerializer.Serialize(new { oidcKeyId = newKid }));
+            File.WriteAllText(
+                System.IO.Path.Combine(
+                    statePath,
+                    "rotate-oidc-signing-key.completed"),
+                JsonSerializer.Serialize(new
+                {
+                    schemaVersion = 2,
+                    operationId,
+                    trustDomainId = before.Trust.TrustDomainId,
+                    priorGeneration = 1,
+                    priorGenerationId = "generation-00000001",
+                    priorOidcKeyId = oldKid,
+                    newGeneration = 2,
+                    newGenerationId = "generation-00000002",
+                    newOidcKeyId = newKid,
+                    publicationId = after.Trust.PublicationId,
+                    manifestSha256 = after.Trust.GenerationManifestSha256,
+                    jwksSha256 = Hash('4'),
+                    jwksKeyIds = new[] { newKid, oldKid },
+                    retainedKeyPaths = new[]
+                    {
+                        $"private/oidc/retained/signer-{oldKid}.key"
+                    },
+                    overlapExpiresAtUtc = now.AddMinutes(6).ToString("O")
+                }));
+            File.Delete(requestPath);
+        };
+
+        var result = await NewExecutor(model, runtime, inspector)
+            .ExecuteRotateOidcSigningKeyAsync(CancellationToken.None);
+        var output = ReadResult(result);
+
+        Assert.True(result.Success, output.Message);
+        Assert.NotNull(output.OidcRotation);
+        Assert.Equal(oldKid, output.OidcRotation.OldKid);
+        Assert.Equal(newKid, output.OidcRotation.NewKid);
+        Assert.Equal(2, output.OidcRotation.NewGeneration);
+        Assert.Equal(
+            1,
+            runtime.ExecutedCommands.Count(item =>
+                item.Resource == "tuf-bootstrap"
+                && item.Command == KnownResourceCommands.StartCommand));
+        Assert.Equal(
+            1,
+            runtime.ExecutedCommands.Count(item =>
+                item.Resource == "oidc"
+                && item.Command == KnownResourceCommands.RestartCommand));
+        Assert.DoesNotContain(
+            runtime.ExecutedCommands,
+            item => item.Resource == "fulcio");
+        Assert.Equal(
+            6,
+            runtime.ExecutedCommands.Count(item =>
+                item.Resource.EndsWith("-client", StringComparison.Ordinal)
+                && item.Command == KnownResourceCommands.RestartCommand));
+        Assert.False(runtime.WorkerStartedWhileLockHeld);
+        Assert.All(output.Postconditions, check =>
+            Assert.True(check.Passed, check.Name));
+        Assert.False(File.ReadAllText(
+            System.IO.Path.Combine(
+                statePath,
+                "oidc-rotation",
+                output.OidcRotation.OperationId,
+                "command.json"))
+            .Contains(CreateOidcJwt(oldKid), StringComparison.Ordinal));
     }
 
     [Fact]
@@ -907,6 +1069,66 @@ public sealed class SigstoreOperationTests
                 : null);
     }
 
+    private static SigstoreTufStateSnapshot NewOidcRotationTufState(
+        SigstoreTufStateSnapshot prior)
+    {
+        var trust = prior.Trust with
+        {
+            Generation = prior.Trust.Generation + 1,
+            GenerationId = "generation-00000002",
+            GenerationManifestSha256 = Hash('5'),
+            TufTargetsVersion = prior.Trust.TufTargetsVersion + 1,
+            PublicationId = "sha256-" + Hash('9'),
+            PublicationManifestSha256 = Hash('9')
+        };
+        var metadata = prior.Metadata with
+        {
+            Targets = prior.Metadata.Targets with
+            {
+                Version = prior.Metadata.Targets.Version + 1,
+                Sha256 = Hash('e')
+            },
+            Snapshot = prior.Metadata.Snapshot with
+            {
+                Version = prior.Metadata.Snapshot.Version + 1,
+                Sha256 = Hash('f')
+            },
+            Timestamp = prior.Metadata.Timestamp with
+            {
+                Version = prior.Metadata.Timestamp.Version + 1,
+                Sha256 = Hash('a')
+            }
+        };
+        return prior with
+        {
+            Trust = trust,
+            Metadata = metadata,
+            PreviousPublicationId = prior.Trust.PublicationId,
+            PreviousPublicationManifestSha256 =
+                prior.Trust.PublicationManifestSha256
+        };
+    }
+
+    private static string CreateOidcJwt(string kid)
+    {
+        static string Encode(object value) =>
+            Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(value))
+                .TrimEnd('=')
+                .Replace('+', '-')
+                .Replace('/', '_');
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        return $"{Encode(new { alg = "RS256", kid })}." +
+            $"{Encode(new
+            {
+                iss = SigstoreDefaults.ExpectedIssuer,
+                sub = SigstoreDefaults.ExpectedIdentity,
+                aud = "sigstore",
+                iat = now,
+                nbf = now - 1,
+                exp = now + 600
+            })}.c2ln";
+    }
+
     private static SigstoreServedTufSnapshot NewServed(
         SigstoreTufStateSnapshot state) =>
         new(
@@ -1191,6 +1413,10 @@ public sealed class SigstoreOperationTests
 
         public Queue<SigstoreServedTufSnapshot> ServedStates { get; } = [];
 
+        public Queue<(string? jwt, string? kid)> OidcTokens { get; } = [];
+
+        public Queue<FulcioIssuanceEvidence?> FulcioCertificates { get; } = [];
+
         public Dictionary<string, SigstoreResourceInstanceSnapshot>
             WaitResults { get; } = new(StringComparer.Ordinal);
 
@@ -1209,6 +1435,8 @@ public sealed class SigstoreOperationTests
 
         public ExecuteCommandResult CommandResult { get; set; } =
             CommandResults.Success();
+
+        public Action<IResource, string>? OnExecuteCommand { get; set; }
 
         public bool BlockWorkerStart { get; set; }
 
@@ -1250,6 +1478,7 @@ public sealed class SigstoreOperationTests
         {
             events.Enqueue($"execute:{target.Name}:{command}");
             ExecutedCommands.Add((target.Name, command));
+            OnExecuteCommand?.Invoke(target, command);
             if (target.Name == "tuf-bootstrap")
             {
                 WorkerStartedWhileLockHeld = isLockHeld();
@@ -1319,6 +1548,22 @@ public sealed class SigstoreOperationTests
             events.Enqueue($"client-status:{client.Resource.Name}");
             return Task.FromResult(
                 ClientStatuses[client.Resource.Name]);
+        }
+
+        public Task<(string? jwt, string? kid)> CaptureOidcTokenAsync(
+            CancellationToken cancellationToken)
+        {
+            events.Enqueue("oidc-token");
+            return Task.FromResult(OidcTokens.Dequeue());
+        }
+
+        public Task<FulcioIssuanceEvidence?> ProveFulcioCertIssuanceAsync(
+            string oidcToken,
+            string subject,
+            CancellationToken cancellationToken)
+        {
+            events.Enqueue($"fulcio-certificate:{subject}");
+            return Task.FromResult(FulcioCertificates.Dequeue());
         }
 
         public Task PublishParentStateAsync(SigstoreResource target)
