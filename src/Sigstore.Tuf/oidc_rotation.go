@@ -517,15 +517,15 @@ func validateAndReuseOidcGeneration(
 		if actualFiles[k] != v {
 			return bootstrapManifest{}, fmt.Errorf("pre-existing generation file %q hash mismatch", k)
 		}
-		if err := validateOIDCGenerationMaterial(newGenPath, genManifest); err != nil {
-			return bootstrapManifest{}, err
-		}
-		if err := validateUnchangedNonOIDCMaterial(
-			filepath.Join(statePath, "generations", current.GenerationID),
-			newGenPath,
-		); err != nil {
-			return bootstrapManifest{}, err
-		}
+	}
+	if err := validateOIDCGenerationMaterial(newGenPath, genManifest); err != nil {
+		return bootstrapManifest{}, err
+	}
+	if err := validateUnchangedNonOIDCMaterial(
+		filepath.Join(statePath, "generations", current.GenerationID),
+		newGenPath,
+	); err != nil {
+		return bootstrapManifest{}, err
 	}
 
 	manifestHash := hashBytes(manifestBytes)

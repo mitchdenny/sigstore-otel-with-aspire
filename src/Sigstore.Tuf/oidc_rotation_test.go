@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -175,6 +176,99 @@ func TestOIDCRotationRejectsRequestForAnotherTrustDomain(t *testing.T) {
 	if active.Generation != 1 {
 		t.Fatalf("invalid request advanced generation to %d", active.Generation)
 	}
+}
+
+func TestValidateAndReuseOIDCGenerationValidatesCompleteMaterial(t *testing.T) {
+	t.Run("valid generation", func(t *testing.T) {
+		statePath := newOIDCRotationTestState(t)
+		current, request, nextPath, nextID := createReusableOIDCGeneration(
+			t,
+			statePath,
+			"55555555555555555555555555555555",
+		)
+
+		reused, err := validateAndReuseOidcGeneration(
+			statePath,
+			current,
+			nextPath,
+			nextID,
+			current.Generation+1,
+			request,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reused.GenerationID != nextID {
+			t.Fatalf("reused generation ID = %q, want %q", reused.GenerationID, nextID)
+		}
+	})
+
+	t.Run("empty material", func(t *testing.T) {
+		statePath := newOIDCRotationTestState(t)
+		current, request, nextPath, nextID := createReusableOIDCGeneration(
+			t,
+			statePath,
+			"66666666666666666666666666666666",
+		)
+		manifest, err := readOIDCGenerationManifest(statePath, nextID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest.Files = map[string]string{}
+		for _, directory := range []string{"private", "public"} {
+			path := filepath.Join(nextPath, directory)
+			if err := os.RemoveAll(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := writeJSON(
+			filepath.Join(nextPath, "manifest.json"),
+			manifest,
+			0o644,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = validateAndReuseOidcGeneration(
+			statePath,
+			current,
+			nextPath,
+			nextID,
+			current.Generation+1,
+			request,
+		)
+		if err == nil {
+			t.Fatal("reused generation with empty material was accepted")
+		}
+		if !strings.Contains(err.Error(), "jwks.json") {
+			t.Fatalf("strict OIDC validation did not reject empty material: %v", err)
+		}
+	})
+}
+
+func createReusableOIDCGeneration(
+	t *testing.T,
+	statePath string,
+	operationID string,
+) (bootstrapManifest, oidcRotationRequest, string, string) {
+	t.Helper()
+	current, err := loadActiveTrustGeneration(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := writeOIDCRotationTestRequest(t, statePath, operationID)
+	next, err := rotateOidcGeneration(statePath, current, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return current, request, filepath.Join(
+		statePath,
+		"generations",
+		next.GenerationID,
+	), next.GenerationID
 }
 
 func newOIDCRotationTestState(t *testing.T) string {
