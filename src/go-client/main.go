@@ -110,6 +110,19 @@ type clientTrustStatus struct {
 	InitializedAtUTC         time.Time `json:"initializedAtUtc"`
 }
 
+type artifactVerificationEvidence struct {
+	SchemaVersion     int    `json:"schemaVersion"`
+	Resource          string `json:"resource"`
+	Language          string `json:"language"`
+	Verified          bool   `json:"verified"`
+	ArtifactID        uint64 `json:"artifactId"`
+	ArtifactSHA256    string `json:"artifactSha256"`
+	BundleSHA256      string `json:"bundleSha256"`
+	Generation        int    `json:"generation"`
+	GenerationID      string `json:"generationId"`
+	TrustedRootSHA256 string `json:"trustedRootSha256"`
+}
+
 type tufMetadataEnvelope struct {
 	Signed struct {
 		Version int `json:"version"`
@@ -211,6 +224,15 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", healthHandler(ctx))
 	mux.Handle("/trust/status", trustStatusHandler(ctx, trustStatus))
+	mux.Handle(
+		"/artifacts/",
+		artifactVerificationHandler(
+			store,
+			verifier,
+			cfg,
+			trustStatus,
+		),
+	)
 	server := &http.Server{
 		Addr:              ":" + cfg.port,
 		Handler:           otelhttp.NewHandler(mux, "client.status"),
@@ -712,27 +734,6 @@ func validateOnce(
 		return "pending", signatureResult.retryAfter, nil
 	}
 
-	protoBundle := &protobundle.Bundle{}
-	if err := protojson.Unmarshal(signatureResult.content, protoBundle); err != nil {
-		return "", 0, err
-	}
-	parsedBundle, err := bundle.NewBundle(protoBundle)
-	if err != nil {
-		return "", 0, err
-	}
-	certificateIdentity, err := verify.NewShortCertificateIdentity(
-		cfg.expectedIssuer,
-		"",
-		cfg.expectedIdentity,
-		"",
-	)
-	if err != nil {
-		return "", 0, err
-	}
-	policy := verify.NewPolicy(
-		verify.WithArtifact(bytes.NewReader(artifactResult.content)),
-		verify.WithCertificateIdentity(certificateIdentity),
-	)
 	ctx, span := tracer.Start(
 		ctx,
 		"artifact.validate",
@@ -744,12 +745,115 @@ func validateOnce(
 		),
 	)
 	defer span.End()
-	_, err = verifier.Verify(parsedBundle, policy)
-	if err != nil {
+	if err := verifyArtifactBytes(
+		artifactResult.content,
+		signatureResult.content,
+		verifier,
+		cfg,
+	); err != nil {
 		return "", 0, recordError(span, err)
 	}
 	log.Printf("Validated artifact %d (%d bytes).", id, len(artifactResult.content))
 	return "validated", 0, nil
+}
+
+func verifyArtifactBytes(
+	artifact []byte,
+	bundleJSON []byte,
+	verifier *verify.SignedEntityVerifier,
+	cfg config,
+) error {
+	protoBundle := &protobundle.Bundle{}
+	if err := protojson.Unmarshal(bundleJSON, protoBundle); err != nil {
+		return err
+	}
+	parsedBundle, err := bundle.NewBundle(protoBundle)
+	if err != nil {
+		return err
+	}
+	certificateIdentity, err := verify.NewShortCertificateIdentity(
+		cfg.expectedIssuer,
+		"",
+		cfg.expectedIdentity,
+		"",
+	)
+	if err != nil {
+		return err
+	}
+	policy := verify.NewPolicy(
+		verify.WithArtifact(bytes.NewReader(artifact)),
+		verify.WithCertificateIdentity(certificateIdentity),
+	)
+	_, err = verifier.Verify(parsedBundle, policy)
+	return err
+}
+
+func artifactVerificationHandler(
+	store *artifactStore,
+	verifier *verify.SignedEntityVerifier,
+	cfg config,
+	trust clientTrustStatus,
+) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		path := strings.TrimPrefix(request.URL.Path, "/artifacts/")
+		parts := strings.Split(path, "/")
+		if len(parts) != 2 || parts[1] != "verify" {
+			http.NotFound(response, request)
+			return
+		}
+		id, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || id == 0 {
+			http.Error(response, "invalid artifact ID", http.StatusBadRequest)
+			return
+		}
+		artifactResult, err := store.artifact(request.Context(), id)
+		if err != nil {
+			http.Error(response, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if artifactResult.state != fetchFound {
+			http.Error(response, "artifact is unavailable", http.StatusNotFound)
+			return
+		}
+		signatureResult, err := store.signature(request.Context(), id)
+		if err != nil {
+			http.Error(response, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if signatureResult.state != fetchFound {
+			http.Error(response, "artifact signature is unavailable", http.StatusNotFound)
+			return
+		}
+		if err := verifyArtifactBytes(
+			artifactResult.content,
+			signatureResult.content,
+			verifier,
+			cfg,
+		); err != nil {
+			http.Error(response, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		evidence := artifactVerificationEvidence{
+			SchemaVersion:     1,
+			Resource:          "go-client",
+			Language:          "go",
+			Verified:          true,
+			ArtifactID:        id,
+			ArtifactSHA256:    sha256Hex(artifactResult.content),
+			BundleSHA256:      sha256Hex(signatureResult.content),
+			Generation:        trust.Generation,
+			GenerationID:      trust.GenerationID,
+			TrustedRootSHA256: trust.TrustedRootSHA256,
+		}
+		response.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(response).Encode(evidence); err != nil {
+			log.Printf("artifact verification response failed: %v", err)
+		}
+	})
 }
 
 func skipArtifact(

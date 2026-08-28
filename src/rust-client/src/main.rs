@@ -155,6 +155,21 @@ struct ClientTrustStatus {
     initialized_at_utc: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactVerificationEvidence {
+    schema_version: u32,
+    resource: &'static str,
+    language: &'static str,
+    verified: bool,
+    artifact_id: u64,
+    artifact_sha256: String,
+    bundle_sha256: String,
+    generation: u64,
+    generation_id: String,
+    trusted_root_sha256: String,
+}
+
 impl Config {
     fn from_environment() -> Result<Self> {
         Ok(Self {
@@ -672,6 +687,9 @@ async fn health_server(
     port: u16,
     healthy: Arc<AtomicBool>,
     trust_status: Arc<ClientTrustStatus>,
+    artifact_store: ArtifactStore,
+    trusted_root: Arc<TrustedRoot>,
+    config: Config,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -686,36 +704,88 @@ async fn health_server(
                 let (mut stream, _) = accepted?;
                 let is_healthy = healthy.load(Ordering::Relaxed) && !*shutdown.borrow();
                 let trust_status = trust_status.clone();
+                let artifact_store = artifact_store.clone();
+                let trusted_root = trusted_root.clone();
+                let config = config.clone();
                 tokio::spawn(async move {
                     let mut buffer = [0_u8; 1024];
                     let read = stream.read(&mut buffer).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&buffer[..read]);
                     let path_is_health = request.starts_with("GET /healthz ");
                     let path_is_status = request.starts_with("GET /trust/status ");
-                    let (body, serialized) = if path_is_status {
+                    let verification_id = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.strip_prefix("GET /artifacts/"))
+                        .and_then(|path| path.strip_suffix("/verify HTTP/1.1"))
+                        .and_then(|id| id.parse::<u64>().ok())
+                        .filter(|id| *id > 0);
+                    let (body, serialized, verification_ok) =
+                        if let Some(artifact_id) = verification_id {
+                            let policy = VerificationPolicy::default()
+                                .require_identity(config.expected_identity.clone())
+                                .require_issuer(config.expected_issuer.clone());
+                            match verify_artifact_evidence(
+                                artifact_id,
+                                &artifact_store,
+                                &trusted_root,
+                                &policy,
+                                &trust_status,
+                            )
+                            .await
+                            {
+                                Ok(evidence) => (
+                                    serde_json::to_string(&evidence)
+                                        .unwrap_or_else(|error| {
+                                            serde_json::json!({
+                                                "error": format!(
+                                                    "verification response serialization failed: {error}"
+                                                )
+                                            })
+                                            .to_string()
+                                        }),
+                                    true,
+                                    true,
+                                ),
+                                Err(error) => (
+                                    serde_json::json!({"error": error.to_string()})
+                                        .to_string(),
+                                    true,
+                                    false,
+                                ),
+                            }
+                        } else if path_is_status {
                         let mut status = (*trust_status).clone();
                         status.ready = is_healthy;
                         if !is_healthy {
                             status.last_error = Some("client is stopping".to_string());
                         }
                         match serde_json::to_string(&status) {
-                            Ok(body) => (body, true),
+                            Ok(body) => (body, true, false),
                             Err(error) => (
                                 serde_json::json!({
                                     "error": format!("status serialization failed: {error}")
                                 })
                                 .to_string(),
                                 false,
+                                false,
                             ),
                         }
                     } else if is_healthy && path_is_health {
-                        (r#"{"status":"SERVING"}"#.to_string(), true)
+                        (r#"{"status":"SERVING"}"#.to_string(), true, false)
                     } else {
-                        (r#"{"status":"NOT_SERVING"}"#.to_string(), true)
+                        (r#"{"status":"NOT_SERVING"}"#.to_string(), true, false)
                     };
                     let ok =
-                        is_healthy && (path_is_health || path_is_status) && serialized;
-                    let status = if ok { "200 OK" } else { "503 Service Unavailable" };
+                        is_healthy && (path_is_health || path_is_status) && serialized
+                            || verification_ok;
+                    let status = if ok {
+                        "200 OK"
+                    } else if verification_id.is_some() {
+                        "422 Unprocessable Entity"
+                    } else {
+                        "503 Service Unavailable"
+                    };
                     let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -727,6 +797,43 @@ async fn health_server(
         }
     }
     Ok(())
+}
+
+async fn verify_artifact_evidence(
+    id: u64,
+    artifact_store: &ArtifactStore,
+    trusted_root: &TrustedRoot,
+    policy: &VerificationPolicy,
+    trust_status: &ClientTrustStatus,
+) -> Result<ArtifactVerificationEvidence> {
+    match validate_once(id, artifact_store, trusted_root, policy).await? {
+        ValidationAction::Validated => {}
+        ValidationAction::Pending(_) => bail!("artifact {id} is not sealed"),
+        ValidationAction::Missing(reason) => bail!("{reason}"),
+        ValidationAction::Wait => bail!("artifact {id} is unavailable"),
+    }
+    let artifact = match artifact_store.artifact(id).await? {
+        ArtifactFetch::Found(value) => value,
+        ArtifactFetch::Missing => bail!("artifact {id} is missing"),
+        ArtifactFetch::Pending(_) => bail!("artifact {id} is not sealed"),
+    };
+    let bundle = match artifact_store.signature(id).await? {
+        ArtifactFetch::Found(value) => value,
+        ArtifactFetch::Missing => bail!("artifact {id} signature is missing"),
+        ArtifactFetch::Pending(_) => bail!("artifact {id} is not sealed"),
+    };
+    Ok(ArtifactVerificationEvidence {
+        schema_version: 1,
+        resource: "rust-client",
+        language: "rust",
+        verified: true,
+        artifact_id: id,
+        artifact_sha256: sha256_hex(&artifact),
+        bundle_sha256: sha256_hex(bundle.as_bytes()),
+        generation: trust_status.generation,
+        generation_id: trust_status.generation_id.clone(),
+        trusted_root_sha256: trust_status.trusted_root_sha256.clone(),
+    })
 }
 
 fn build_client_trust_status(
@@ -932,6 +1039,9 @@ async fn main() -> Result<(), BoxError> {
         config.port,
         healthy.clone(),
         Arc::new(trust_status),
+        artifact_store.clone(),
+        trusted_root.clone(),
+        config.clone(),
         shutdown_rx.clone(),
     ));
     let producer = tokio::spawn(producer_loop(

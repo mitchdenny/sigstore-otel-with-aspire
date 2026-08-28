@@ -439,7 +439,13 @@ func rotateTsaGeneration(
 		TSAPriorGenerationID:   current.GenerationID,
 		TSAPriorRootSHA256:     current.TsaRootSHA256,
 		TSAPriorLeafSHA256:     current.TsaLeafSHA256,
-		Files:                  newFiles,
+
+		FulcioRotationOperationID: currentManifest.FulcioRotationOperationID,
+		FulcioPriorGeneration:     currentManifest.FulcioPriorGeneration,
+		FulcioPriorGenerationID:   currentManifest.FulcioPriorGenerationID,
+		FulcioPriorRootSHA256:     currentManifest.FulcioPriorRootSHA256,
+
+		Files: newFiles,
 	}
 	manifestBytes, err := json.MarshalIndent(genManifest, "", "  ")
 	if err != nil {
@@ -447,10 +453,9 @@ func rotateTsaGeneration(
 		return bootstrapManifest{}, fmt.Errorf("marshal TSA generation manifest: %w", err)
 	}
 	manifestBytes = append(manifestBytes, '\n')
-	if err := os.WriteFile(
+	if err := writeGenerationManifest(
 		filepath.Join(stagingGenerationPath, "manifest.json"),
 		manifestBytes,
-		0o644,
 	); err != nil {
 		_ = os.RemoveAll(stagingGenerationPath)
 		return bootstrapManifest{}, fmt.Errorf("write TSA generation manifest: %w", err)

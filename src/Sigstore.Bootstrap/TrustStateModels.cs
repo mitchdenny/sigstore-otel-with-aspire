@@ -32,6 +32,10 @@ internal sealed record GenerationManifest(
     string? TsaPriorGenerationId,
     string? TsaPriorRootSha256,
     string? TsaPriorLeafSha256,
+    string? FulcioRotationOperationId,
+    int FulcioPriorGeneration,
+    string? FulcioPriorGenerationId,
+    string? FulcioPriorRootSha256,
     SortedDictionary<string, string> Files);
 
 internal sealed record GenerationReference(

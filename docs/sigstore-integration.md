@@ -1179,6 +1179,8 @@ limitation reported rather than masked.**
 
 ## Step 11: Implement Fulcio CA rotation
 
+**Status: Implemented**
+
 ### Scope
 
 - Generate a new Fulcio CA generation.
@@ -1193,6 +1195,160 @@ limitation reported rather than masked.**
 - Existing artifacts rooted in the old CA still validate.
 - New artifacts validate in all six clients.
 - Restart order and rollback behavior are explicit and tested.
+
+### Implementation
+
+`rotate-fulcio-ca` is a confirmed parent-resource command. Its progress UI hides
+cancel, and cancellation is honored only before the schema-versioned operation
+journal and worker request are durable. Once trust mutation can begin, the
+command owns an unlinked bounded critical section and either completes or leaves
+an explicit recovery phase. The shared in-process operation gate rejects
+contention immediately; the parent, bootstrapper, and Go worker serialize
+filesystem mutations through the same `state.lock`.
+
+The bootstrapper creates the operation-bound candidate with the existing Fulcio
+profile:
+
+```text
+fulcio-rotation/<operation-id>/
+|-- command.json
+`-- candidate/
+    |-- private/fulcio/
+    |   |-- root.key                  # encrypted PKCS#8 ECDSA P-256
+    |   `-- password                  # random 32-byte base64url value
+    `-- public/fulcio/
+        `-- root.pem                  # self-signed ECDSA-SHA256 CA
+```
+
+Generation N+1 replaces only `private/fulcio` and `public/fulcio`. Its manifest
+binds the operation ID and prior generation/root; the previous generation
+remains immutable bounded rollback history. The active Fulcio private subtree
+contains exactly the new key and password. Candidate private material is
+removed after worker completion while the candidate public root remains as
+journal evidence.
+
+The Go worker validates the CA profile and key match independently, commits the
+immutable generation, and clones the active TUF publication. It validates every
+existing Fulcio CA entry, preserves their exact order, and appends the new root.
+The active `fulcio_v1.crt.pem` alias changes to the new root;
+`trusted_root.json`, `client_trust_config.json`, and
+`trust_status.v1.json` are rebuilt. All CT, Rekor, TSA, standby, and historical
+entries and every unrelated target remain byte-identical.
+`signing_config.v0.2.json`, its canonical URLs/routes, TUF root, and immutable
+bootstrap root do not change. Targets, snapshot, and timestamp advance through
+the existing preparing/candidate-committed/active-switched/history transaction
+before `active-generation` switches.
+
+### Mount and activation safety
+
+Fulcio and Tesseract use stable component-scoped runtime projections instead of
+bind-mounting a replaceable `active-generation` descendant:
+
+```text
+runtime/
+|-- fulcio/
+|   |-- root.pem
+|   |-- root.key
+|   |-- password
+|   `-- ctlog.pub
+`-- tesseract/
+    |-- privkey.pem
+    `-- accepted-roots.pem
+```
+
+The worker updates only Tesseract's deterministic accepted-root bundle after
+additive TUF trust and generation commit. Fulcio's active projection remains on
+the old CA, preventing an unexpected container recreation from activating the
+candidate before CT acceptance is proven. Tesseract receives only its CT key
+and Fulcio roots; Fulcio receives only its CA material and the CT public key.
+Neither container can read unrelated OIDC, Rekor, TSA, or TUF private keys.
+
+The enforced lifecycle is:
+
+1. Commit additive TUF trust and generation N+1.
+2. Restart and converge all six clients in sorted resource-name order.
+3. Verify a retained old-CA artifact in every language against N+1 trust.
+4. Restart Tesseract exactly once with all old roots followed by the new root.
+5. Keep Fulcio on the old in-memory signer and prove real issuance with an
+   embedded SCT signed by that exact replacement Tesseract identity.
+6. Atomically promote the operation-bound Fulcio runtime projection.
+7. Restart Fulcio exactly once, then prove its read-only root endpoint, real
+   issuance chain, identity, and embedded SCT use the new CA and unchanged CT
+   key.
+8. Retain a new-CA artifact carrying Rekor and RFC3161 material and verify it in
+   all six languages.
+
+OIDC, timestamp, Rekor server/proxy, TUF nginx, and `shady-blob-store` are
+protected by exact container ID/start-time postconditions and are never
+restarted. Tesseract keeps the same signing key, origin, CT log ID,
+`data/ctlog` directory, and append-only checkpoint/data across its one restart.
+This is root acceptance only; no CT shard or key is created, because Step 13
+owns that lifecycle.
+
+### Recovery and status
+
+Durable replay boundaries cover the request, candidate, immutable generation,
+TUF preparing/commit, generation switch, each client, Tesseract restart,
+old-CA proof, Fulcio projection promotion/restart, new-CA proof, old/new
+artifact verification, CT checkpoint, and final command journal. Before the
+old-CA proof, replay requires the original Fulcio issuer and never promotes its
+runtime projection. After promotion or an observed new-CA replacement, replay
+only completes forward. A recorded Tesseract replacement and old-CA SCT proof
+are mandatory before any Fulcio restart. Existing client and service lifecycle
+evidence suppresses duplicate restarts; mismatched or tampered operation IDs,
+roots, generations, publications, projections, checkpoints, or container
+identities fail loudly.
+
+`status` parses every Fulcio TrustedRoot entry and requires unique canonical
+roots in append order. It validates the active CA profile and certificate/key
+match, component runtime projections, Tesseract bundle bytes, live Fulcio
+`/api/v1/rootCert`, unchanged CT public key/log ID, and a signed CT checkpoint.
+The parent becomes Healthy only when disk and served TUF agree, all six clients
+report the current additive trust, Tesseract accepts the complete history, the
+live Fulcio root matches the active generation, and no recovery phase remains.
+
+Every client also exposes a local read-only
+`GET /artifacts/{id}/verify` endpoint. It invokes that language's normal
+verifier and returns the exact artifact/bundle hashes and trust generation used.
+This supplies deterministic old/new all-six evidence without changing bundle
+serialization.
+
+### Known limitation
+
+The existing sigstore-python omitted-index-zero protobuf JSON issue remains out
+of scope. Sequential Python validation may remain blocked on an affected
+artifact. Step 11 does not rewrite, normalize, skip, or replace that bundle;
+the targeted endpoint proves selected old/new artifacts with the same
+generation-pinned Python verifier and reports a real failure if either bundle is
+affected.
+
+### Validation evidence
+
+- All 63 Bootstrap tests and 32 Hosting tests pass. Coverage includes the CA
+  profile/key/password, exact runtime file sets and modes, Go-shaped manifest
+  portability, additive root order/deduplication, two consecutive rotations,
+  bounded active secrets, partial promotion repair, contention, tampering, and
+  worker fault injection at every committed filesystem/publication boundary.
+- The uncached TUF/Go suite, `go vet`, AppHost and .NET client builds, Go and
+  JavaScript tests, Python and Java container builds, Rust tests, and
+  `git diff --check` pass.
+- A non-isolated recovery validation advanced generation 1 to 2 and passed all
+  33 command postconditions. The old root
+  `3fc09930fed807a5deddc884e9b24ceb331d226b153a28515d5359f074fedd8a`
+  and new root
+  `f8f6198938be6fce590478e40e44dad7b81effc5d1db419ad209eead218a1ee3`
+  both produced SCTs under unchanged CT log ID
+  `9b8283c3f7998f05f2d8598c46c5022c2dc6a3edc6bba0eb961958ed5c61b2c9`.
+  Its signed checkpoint advanced from tree size 14 to 72 without changing
+  origin.
+- All six clients restarted on additive generation-2 trust before Tesseract.
+  Tesseract and Fulcio then each changed exactly once in the required order.
+  OIDC, timestamp, Rekor server/proxy, TUF nginx, and `shady-blob-store`
+  retained their container IDs and start times.
+- Retained old artifact 14 and new artifact 70 included Rekor and RFC3161
+  material and passed the .NET, Go, Java, JavaScript, Python, and Rust targeted
+  native verification routes with identical artifact/bundle hashes. No public
+  endpoint fallback appeared, and runtime state remained ignored.
 
 ## Step 12: Implement Rekor shard rotation
 

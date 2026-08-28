@@ -11,6 +11,7 @@ public sealed class SigstoreResource(
     private readonly List<SigstoreClientRegistration> _clients = [];
     private SigstoreComponents? _components;
     private EndpointReference? _tufEndpoint;
+    private EndpointReference? _artifactStoreEndpoint;
     private SigstoreRuntimeHealthSnapshot _runtimeHealth =
         SigstoreRuntimeHealthSnapshot.Starting([]);
     private SigstoreOperationState? _operation;
@@ -30,6 +31,11 @@ public sealed class SigstoreResource(
         _tufEndpoint
         ?? throw new InvalidOperationException(
             "The Sigstore TUF endpoint has not been initialized.");
+
+    internal EndpointReference ArtifactStoreEndpoint =>
+        _artifactStoreEndpoint
+        ?? throw new InvalidOperationException(
+            "The Sigstore artifact-store endpoint has not been initialized.");
 
     internal void SetComponents(
         SigstoreComponents components,
@@ -73,6 +79,24 @@ public sealed class SigstoreResource(
 
             _requiredResources.Add(resource);
         }
+    }
+
+    internal void SetArtifactStore(
+        IResource resource,
+        EndpointReference endpoint)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        ArgumentNullException.ThrowIfNull(endpoint);
+        lock (_sync)
+        {
+            if (_artifactStoreEndpoint is not null)
+            {
+                throw new InvalidOperationException(
+                    "The Sigstore artifact store has already been registered.");
+            }
+            _artifactStoreEndpoint = endpoint;
+        }
+        RegisterRequiredResource(resource);
     }
 
     internal void RegisterClient(SigstoreClientRegistration client)

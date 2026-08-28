@@ -317,6 +317,7 @@ func TestTsaRotationAppendsAuthorityAndPreservesOldTsaAndNonTsaEntries(t *testin
 	}
 
 	assertTsaRotationGeneration(t, statePath, 2, "10000000000000000000000000000001", 1)
+	assertGenerationManifestReadOnly(t, statePath, "generation-00000002")
 
 	trustedRootAfter := readActiveTrustedRoot(t, statePath)
 	if len(trustedRootAfter.TimestampAuthorities) != 2 {

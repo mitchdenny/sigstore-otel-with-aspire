@@ -991,7 +991,9 @@ func newTestState(t *testing.T) string {
 			NotAfter:              createdAt.AddDate(1, 0, 0),
 			IsCA:                  true,
 			BasicConstraintsValid: true,
-			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+			KeyUsage: x509.KeyUsageDigitalSignature |
+				x509.KeyUsageCertSign |
+				x509.KeyUsageCRLSign,
 		},
 		nil,
 		fulcioKey,
@@ -999,9 +1001,26 @@ func newTestState(t *testing.T) string {
 	)
 	fulcioPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: fulcioDER})
 	writeTestFile(t, filepath.Join(generationPath, "public", "fulcio", "root.pem"), fulcioPEM)
+	fulcioPassword := []byte("test-fulcio-password")
+	writeTestFile(
+		t,
+		filepath.Join(generationPath, "private", "fulcio", "password"),
+		fulcioPassword,
+	)
+	writeTestFile(
+		t,
+		filepath.Join(generationPath, "private", "fulcio", "root.key"),
+		mustMarshalEncryptedECDSAKey(t, fulcioKey, fulcioPassword),
+	)
 
-	ctPEM := testPublicKeyPEM(t, newTestKey(t))
+	ctKey := newTestKey(t)
+	ctPEM := testPublicKeyPEM(t, ctKey)
 	writeTestFile(t, filepath.Join(generationPath, "public", "ctlog", "pubkey.pem"), ctPEM)
+	writeTestFile(
+		t,
+		filepath.Join(generationPath, "private", "ctlog", "privkey.pem"),
+		testECPrivateKeyPEM(t, ctKey),
+	)
 	rekorPEM := testPublicKeyPEM(t, newTestKey(t))
 	writeTestFile(t, filepath.Join(generationPath, "public", "rekor", "signer.pub"), rekorPEM)
 
@@ -1114,7 +1133,7 @@ func newTestState(t *testing.T) string {
 	manifest := bootstrapManifest{
 		SchemaVersion:        4,
 		CreatedAtUTC:         createdAt,
-		FulcioRootSHA256:     testHash(fulcioPEM),
+		FulcioRootSHA256:     testHash(fulcioDER),
 		CtLogPublicKeySHA256: testHash(ctPEM),
 		RekorPublicKeySHA256: testHash(rekorPEM),
 		TsaRootSHA256:        testHash(tsaRootDER),
@@ -1271,6 +1290,15 @@ func testPublicKeyPEM(t *testing.T, key *ecdsa.PrivateKey) []byte {
 		t.Fatal(err)
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+}
+
+func testECPrivateKeyPEM(t *testing.T, key *ecdsa.PrivateKey) []byte {
+	t.Helper()
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
 }
 
 func writeTestFile(t *testing.T, path string, data []byte) {

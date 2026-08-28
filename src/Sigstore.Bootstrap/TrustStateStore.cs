@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 
@@ -29,15 +30,45 @@ internal static partial class SigstoreStateBootstrapper
     private const string MigrationOperation = "migrate-schema-4";
     private const string OidcRotationOperation = "oidc-rotation";
     private const string TsaRotationOperation = "tsa-rotation";
+    private const string FulcioRotationOperation = "fulcio-rotation";
     private const string GenerationAdvanceOperation = "generation-advance";
     private const string OidcRotationDirectoryName = "oidc-rotation";
     private const string TsaRotationDirectoryName = "tsa-rotation";
+    private const string FulcioRotationDirectoryName = "fulcio-rotation";
     private const string OidcRotationCompletionFileName =
         "rotate-oidc-signing-key.completed";
     private const string TsaRotationCompletionFileName =
         "rotate-timestamp-authority.completed";
     private const string TsaRotationRequestFileName =
         "rotate-timestamp-authority.request";
+    private const string FulcioRotationCompletionFileName =
+        "rotate-fulcio-ca.completed";
+    private const string FulcioRotationRequestFileName =
+        "rotate-fulcio-ca.request";
+    private const string RuntimeDirectoryName = "runtime";
+    private const string RuntimeFulcioComponentName = "fulcio";
+    private const string RuntimeFulcioStagedComponentName = "fulcio.next";
+    private const string RuntimeTesseractComponentName = "tesseract";
+    private const string RuntimeFulcioRootCertificateFileName = "root.pem";
+    private const string RuntimeFulcioRootKeyFileName = "root.key";
+    private const string RuntimeFulcioPasswordFileName = "password";
+    private const string RuntimeFulcioCtLogPublicKeyFileName = "ctlog.pub";
+    private const string RuntimeTesseractPrivateKeyFileName = "privkey.pem";
+    private const string RuntimeAcceptedRootsFileName = "accepted-roots.pem";
+
+    private static readonly string[] RuntimeFulcioFileNames =
+    [
+        RuntimeFulcioCtLogPublicKeyFileName,
+        RuntimeFulcioPasswordFileName,
+        RuntimeFulcioRootKeyFileName,
+        RuntimeFulcioRootCertificateFileName
+    ];
+
+    private static readonly string[] RuntimeTesseractFileNames =
+    [
+        RuntimeAcceptedRootsFileName,
+        RuntimeTesseractPrivateKeyFileName
+    ];
 
     private static readonly string[] GenerationMaterialFiles =
         LegacyRequiredStateFiles
@@ -64,7 +95,11 @@ internal static partial class SigstoreStateBootstrapper
         string TransitionState,
         string Migration,
         string LegacyManifest,
-        string LegacyManifestArchive);
+        string LegacyManifestArchive,
+        string Runtime,
+        string RuntimeFulcio,
+        string RuntimeFulcioStaged,
+        string RuntimeTesseract);
 
     private static BootstrapResult EnsureTrustStateLocked(
         string rootPath,
@@ -391,6 +426,13 @@ internal static partial class SigstoreStateBootstrapper
             TrustTransitionCheckpoint.ActiveGenerationSwitched,
             options);
 
+        EnsureRuntimeProjection(
+            layout,
+            Path.Combine(
+                layout.Generations,
+                journal.Candidate.GenerationId),
+            journal.CandidateManifest);
+
         journal = RecordCheckpoint(
             layout,
             journal with
@@ -515,7 +557,7 @@ internal static partial class SigstoreStateBootstrapper
                 "The trust transition has not reached a stable state.");
         }
 
-        var domain = ReadCanonicalJson<TrustDomainManifest>(
+        var domain = ReadPortableJson<TrustDomainManifest>(
             layout.TrustDomain);
         ValidateTrustDomain(
             layout,
@@ -525,6 +567,12 @@ internal static partial class SigstoreStateBootstrapper
             "trust-domain manifest hash",
             journal.TrustDomainManifestSha256,
             domainHash);
+        if (!TrustDomainManifestsEqual(journal.TrustDomain, domain))
+        {
+            throw new InvalidDataException(
+                "The journaled trust domain does not match the immutable " +
+                "trust-domain manifest.");
+        }
 
         var activeGeneration = ReadActiveGeneration(
             layout.ActiveGeneration);
@@ -536,7 +584,7 @@ internal static partial class SigstoreStateBootstrapper
         var generationPath = Path.Combine(
             layout.Generations,
             activeGeneration);
-        var generation = ReadCanonicalJson<GenerationManifest>(
+        var generation = ReadPortableJson<GenerationManifest>(
             Path.Combine(
                 generationPath,
                 GenerationManifestFileName));
@@ -554,16 +602,18 @@ internal static partial class SigstoreStateBootstrapper
         ValidateLegacyArchive(
             layout,
             generation);
+        ValidateRuntimeProjection(
+            layout,
+            generationPath,
+            generation);
         ValidateCurrentRootEntries(layout, generation);
 
-        if (HashSerialized(journal.CandidateManifest)
-            != journal.Candidate.ManifestSha256)
-        {
-            throw new InvalidDataException(
-                "The journaled candidate generation manifest hash is invalid.");
-        }
-        if (HashSerialized(generation)
-            != journal.Candidate.ManifestSha256)
+        // The journal binds the candidate by the SHA-256 of the manifest
+        // bytes actually on disk, never by a re-serialization: the Go worker
+        // writes these manifests and its encoder is not byte-identical to the
+        // C# one. ValidateGenerationDirectory already asserted the file hash,
+        // so what remains is that the journaled copy says the same thing.
+        if (!GenerationManifestsEqual(journal.CandidateManifest, generation))
         {
             throw new InvalidDataException(
                 "The active generation does not match the transition journal.");
@@ -587,6 +637,14 @@ internal static partial class SigstoreStateBootstrapper
             "trust-domain manifest hash",
             journal.TrustDomainManifestSha256,
             HashFile(layout.TrustDomain));
+        if (!TrustDomainManifestsEqual(
+                journal.TrustDomain,
+                ReadPortableJson<TrustDomainManifest>(layout.TrustDomain)))
+        {
+            throw new InvalidDataException(
+                "The journaled trust domain does not match the immutable " +
+                "trust-domain manifest.");
+        }
         ValidateGenerationDirectory(
             Path.Combine(
                 layout.Generations,
@@ -597,6 +655,12 @@ internal static partial class SigstoreStateBootstrapper
             "active generation",
             journal.Candidate.GenerationId,
             ReadActiveGeneration(layout.ActiveGeneration));
+        ValidateRuntimeProjection(
+            layout,
+            Path.Combine(
+                layout.Generations,
+                journal.Candidate.GenerationId),
+            journal.CandidateManifest);
         ValidateLegacyArchive(
             layout,
             journal.CandidateManifest);
@@ -616,6 +680,7 @@ internal static partial class SigstoreStateBootstrapper
             or MigrationOperation
             or OidcRotationOperation
             or TsaRotationOperation
+            or FulcioRotationOperation
             or GenerationAdvanceOperation))
         {
             throw new InvalidDataException(
@@ -639,6 +704,7 @@ internal static partial class SigstoreStateBootstrapper
         }
         if (journal.Operation is OidcRotationOperation
             or TsaRotationOperation
+            or FulcioRotationOperation
             or GenerationAdvanceOperation)
         {
             if (journal.PriorGeneration is null)
@@ -662,14 +728,13 @@ internal static partial class SigstoreStateBootstrapper
             "journaled candidate generation",
             journal.Candidate.GenerationId,
             journal.CandidateManifest.GenerationId);
-        EnsureEqual(
-            "journaled candidate manifest hash",
-            journal.Candidate.ManifestSha256,
-            HashSerialized(journal.CandidateManifest));
-        EnsureEqual(
-            "journaled trust-domain manifest hash",
+        // Both manifest hashes are hashes of the immutable files on disk, so
+        // they are validated for shape here and bound to the real bytes where
+        // those files are read. Re-serializing the journaled copies to compare
+        // hashes would only be valid for C#-written state.
+        ValidateSha256(
             journal.TrustDomainManifestSha256,
-            HashSerialized(journal.TrustDomain));
+            "journaled trust-domain manifest");
         if (journal.Operation == MigrationOperation)
         {
             ValidateSha256(
@@ -777,13 +842,13 @@ internal static partial class SigstoreStateBootstrapper
     {
         if (File.Exists(layout.TrustDomain))
         {
-            ValidateImmutableJson(
+            ValidateImmutableTrustDomain(
                 layout.TrustDomain,
                 journal.TrustDomain,
                 journal.TrustDomainManifestSha256);
             if (File.Exists(layout.TrustDomainPending))
             {
-                ValidateImmutableJson(
+                ValidateImmutableTrustDomain(
                     layout.TrustDomainPending,
                     journal.TrustDomain,
                     journal.TrustDomainManifestSha256);
@@ -798,7 +863,7 @@ internal static partial class SigstoreStateBootstrapper
                 layout.TrustDomainPending,
                 journal.TrustDomain);
         }
-        ValidateImmutableJson(
+        ValidateImmutableTrustDomain(
             layout.TrustDomainPending,
             journal.TrustDomain,
             journal.TrustDomainManifestSha256);
@@ -814,7 +879,7 @@ internal static partial class SigstoreStateBootstrapper
                 layout.TrustDomainPending,
                 layout.TrustDomain);
         }
-        ValidateImmutableJson(
+        ValidateImmutableTrustDomain(
             layout.TrustDomain,
             journal.TrustDomain,
             journal.TrustDomainManifestSha256);
@@ -1032,6 +1097,10 @@ internal static partial class SigstoreStateBootstrapper
             null,
             null,
             null,
+            null,
+            0,
+            null,
+            null,
             files);
 
     private static void ValidateTrustDomain(
@@ -1130,6 +1199,7 @@ internal static partial class SigstoreStateBootstrapper
         ValidateGenerationFileMap(generation);
         ValidateOidcRotationMetadata(generation);
         ValidateTsaRotationMetadata(generation);
+        ValidateFulcioRotationMetadata(generation);
     }
 
     private static void ValidateGenerationCryptography(
@@ -1195,7 +1265,7 @@ internal static partial class SigstoreStateBootstrapper
         var manifestPath = Path.Combine(
             generationPath,
             GenerationManifestFileName);
-        ValidateImmutableJson(
+        ValidateImmutableGenerationManifest(
             manifestPath,
             expected,
             expectedManifestHash);
@@ -1432,6 +1502,51 @@ internal static partial class SigstoreStateBootstrapper
         }
     }
 
+    /// <summary>
+    /// Fulcio rotation metadata is optional: generations that never rotated
+    /// their certificate authority carry no rotation identity at all, and a
+    /// rotated generation must carry a complete, self-consistent binding to
+    /// the operation and the immutable prior generation it replaced.
+    /// </summary>
+    private static void ValidateFulcioRotationMetadata(
+        GenerationManifest generation)
+    {
+        if (generation.FulcioRotationOperationId is null)
+        {
+            if (generation.FulcioPriorGeneration != 0
+                || generation.FulcioPriorGenerationId is not null
+                || generation.FulcioPriorRootSha256 is not null)
+            {
+                throw new InvalidDataException(
+                    "Generation contains partial Fulcio rotation metadata.");
+            }
+            return;
+        }
+
+        if (!Guid.TryParseExact(
+                generation.FulcioRotationOperationId,
+                "N",
+                out _)
+            || generation.FulcioRotationOperationId.Any(char.IsUpper)
+            || generation.FulcioPriorGeneration < InitialGeneration
+            || generation.FulcioPriorGeneration >= generation.Generation
+            || generation.FulcioPriorGenerationId
+                != GenerationId(generation.FulcioPriorGeneration))
+        {
+            throw new InvalidDataException(
+                "Generation contains invalid Fulcio rotation identity " +
+                "metadata.");
+        }
+        ValidateSha256(
+            generation.FulcioPriorRootSha256,
+            "prior Fulcio root");
+        if (generation.FulcioPriorRootSha256 == generation.FulcioRootSha256)
+        {
+            throw new InvalidDataException(
+                "Fulcio rotation did not replace the certificate authority.");
+        }
+    }
+
     private static void ValidateOidcRotationMetadata(
             GenerationManifest generation)
         {
@@ -1613,6 +1728,7 @@ internal static partial class SigstoreStateBootstrapper
             GenerationsDirectoryName,
             TransitionDirectoryName,
             MigrationDirectoryName,
+            RuntimeDirectoryName,
             "data"
         };
         if (Directory.Exists(
@@ -1642,6 +1758,21 @@ internal static partial class SigstoreStateBootstrapper
         {
             allowed.Add(TsaRotationRequestFileName);
         }
+        if (Directory.Exists(
+                Path.Combine(layout.Root, FulcioRotationDirectoryName)))
+        {
+            allowed.Add(FulcioRotationDirectoryName);
+        }
+        if (File.Exists(
+                Path.Combine(layout.Root, FulcioRotationCompletionFileName)))
+        {
+            allowed.Add(FulcioRotationCompletionFileName);
+        }
+        if (File.Exists(
+                Path.Combine(layout.Root, FulcioRotationRequestFileName)))
+        {
+            allowed.Add(FulcioRotationRequestFileName);
+        }
         EnsureOnlyEntries(
             layout.Root,
             allowed);
@@ -1661,6 +1792,679 @@ internal static partial class SigstoreStateBootstrapper
             migrationExpected);
     }
 
+    /// <summary>
+    /// Describes the fixed component-scoped runtime projection files and the
+    /// generation material each one mirrors. The projection paths never change
+    /// as generations advance, which is what lets long-lived containers
+    /// bind-mount them once at startup. Fulcio additionally receives the CT log
+    /// public key because it must verify SCTs; publishing a public key there is
+    /// safe and keeps Fulcio's mount to a single stable directory.
+    /// </summary>
+    private static IEnumerable<(string Name, string Source, bool IsPrivate)>
+        FulcioRuntimeSources(string generationPath)
+    {
+        yield return (
+            RuntimeFulcioRootCertificateFileName,
+            Resolve(generationPath, FulcioRootCertificatePath),
+            false);
+        yield return (
+            RuntimeFulcioRootKeyFileName,
+            Resolve(generationPath, FulcioPrivateKeyPath),
+            true);
+        yield return (
+            RuntimeFulcioPasswordFileName,
+            Resolve(generationPath, FulcioPrivateKeyPasswordPath),
+            true);
+        yield return (
+            RuntimeFulcioCtLogPublicKeyFileName,
+            Resolve(generationPath, CtLogPublicKeyPath),
+            false);
+    }
+
+    private static IEnumerable<(string Name, string Source, bool IsPrivate)>
+        TesseractRuntimeSources(string generationPath)
+    {
+        yield return (
+            RuntimeTesseractPrivateKeyFileName,
+            Resolve(generationPath, CtLogPrivateKeyPath),
+            true);
+    }
+
+    /// <summary>
+    /// Atomically promotes the staged Fulcio runtime projection onto the
+    /// stable <c>runtime/fulcio</c> path. This is the only place the active
+    /// certificate authority a running Fulcio serves is allowed to change, and
+    /// Hosting must call it only after clients and Tesseract have restarted
+    /// and the old CA has been proven to still issue — otherwise an unexpected
+    /// Fulcio recreation could activate the candidate before the log accepts
+    /// it. The promotion is bound to the operation and the active generation,
+    /// is idempotent on replay, and repairs only the recognized partial state
+    /// where some projected files were already replaced. The caller must
+    /// already hold the shared state lock.
+    /// </summary>
+    internal static FulcioRuntimeProjectionInfo
+        ActivateFulcioRuntimeProjection(
+            string statePath,
+            string operationId,
+            string expectedOldRootSha256,
+            string expectedNewRootSha256)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
+        if (!Guid.TryParseExact(operationId, "N", out _)
+            || operationId.Any(char.IsUpper))
+        {
+            throw new InvalidDataException(
+                $"Fulcio rotation operation ID '{operationId}' is invalid.");
+        }
+        ValidateSha256(expectedOldRootSha256, "expected old Fulcio root");
+        ValidateSha256(expectedNewRootSha256, "expected new Fulcio root");
+        if (expectedOldRootSha256 == expectedNewRootSha256)
+        {
+            throw new InvalidDataException(
+                "Fulcio runtime activation must change the certificate " +
+                "authority.");
+        }
+
+        var layout = CreateTrustStateLayout(Path.GetFullPath(statePath));
+        var generation = ReadActiveGenerationManifest(
+            layout,
+            out var generationPath);
+        if (generation.FulcioRotationOperationId != operationId
+            || generation.FulcioPriorRootSha256 != expectedOldRootSha256
+            || generation.FulcioRootSha256 != expectedNewRootSha256
+            || generation.FulcioPriorGenerationId is null)
+        {
+            throw new InvalidDataException(
+                "The active generation is not bound to this Fulcio rotation " +
+                "operation.");
+        }
+        var priorGenerationPath = Path.Combine(
+            layout.Generations,
+            generation.FulcioPriorGenerationId);
+
+        EnsureRuntimeProjectionDirectories(
+            layout,
+            includeStaged: false);
+        var stagedExists = PathExists(layout.RuntimeFulcioStaged);
+        if (stagedExists)
+        {
+            EnsureRealDirectory(
+                layout.RuntimeFulcioStaged,
+                "staged Fulcio runtime projection");
+            if (!RuntimeComponentMatches(
+                    layout.RuntimeFulcioStaged,
+                    FulcioRuntimeSources(generationPath)))
+            {
+                throw new InvalidDataException(
+                    "The staged Fulcio runtime projection does not match the " +
+                    "rotated generation.");
+            }
+        }
+
+        // Only two per-file states are recognized: still serving the prior
+        // generation, or already promoted. Anything else is tampering and is
+        // never silently overwritten.
+        var pending = new List<(string Path, string Source, bool IsPrivate)>();
+        foreach (var (name, source, isPrivate) in FulcioRuntimeSources(
+            generationPath))
+        {
+            var projectedPath = Path.Combine(layout.RuntimeFulcio, name);
+            EnsureRegularFile(
+                projectedPath,
+                "runtime projection");
+            var projected = File.ReadAllBytes(projectedPath);
+            if (projected.SequenceEqual(File.ReadAllBytes(source)))
+            {
+                continue;
+            }
+            var priorSource = Resolve(
+                priorGenerationPath,
+                RuntimeFulcioGenerationPath(name));
+            if (!projected.SequenceEqual(File.ReadAllBytes(priorSource)))
+            {
+                throw new InvalidDataException(
+                    $"Runtime projection '{projectedPath}' matches neither " +
+                    "the prior nor the rotated generation.");
+            }
+            pending.Add((projectedPath, source, isPrivate));
+        }
+        if (pending.Count != 0 && !stagedExists)
+        {
+            throw new InvalidDataException(
+                "The rotated Fulcio runtime projection is pending promotion " +
+                "but was never staged.");
+        }
+
+        EnsureOnlyEntries(
+            layout.RuntimeFulcio,
+            RuntimeFulcioFileNames);
+        foreach (var (path, source, isPrivate) in pending)
+        {
+            WriteRuntimeFile(
+                path,
+                File.ReadAllBytes(source),
+                isPrivate);
+        }
+        if (stagedExists)
+        {
+            Directory.Delete(
+                layout.RuntimeFulcioStaged,
+                recursive: true);
+        }
+
+        return CreateFulcioRuntimeProjectionInfo(
+            layout,
+            generationPath,
+            generation);
+    }
+
+    /// <summary>
+    /// Reads and strictly validates the component-scoped Fulcio runtime
+    /// projection: the certificate authority Fulcio is actually serving (its
+    /// root fingerprint, public key, subject and validity window, proven
+    /// against the projected encrypted private key and password), the CT log
+    /// public key Fulcio verifies SCTs with, the staged rotation candidate if
+    /// a promotion is outstanding, and the ordered accepted-root bundle
+    /// Tesseract enforces. An unrecognized projection is an error rather than
+    /// a status. The caller must already hold the shared state lock.
+    /// </summary>
+    internal static FulcioRuntimeProjectionInfo
+        ReadFulcioRuntimeProjection(string statePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
+        var layout = CreateTrustStateLayout(Path.GetFullPath(statePath));
+        var generation = ReadActiveGenerationManifest(
+            layout,
+            out var generationPath);
+        return CreateFulcioRuntimeProjectionInfo(
+            layout,
+            generationPath,
+            generation);
+    }
+
+    private static FulcioRuntimeProjectionInfo
+        CreateFulcioRuntimeProjectionInfo(
+            TrustStateLayout layout,
+            string generationPath,
+            GenerationManifest generation)
+    {
+        ValidateRuntimeProjection(
+            layout,
+            generationPath,
+            generation);
+
+        var serving = ValidateFulcioCertificateAuthority(
+            Path.Combine(
+                layout.RuntimeFulcio,
+                RuntimeFulcioRootKeyFileName),
+            Path.Combine(
+                layout.RuntimeFulcio,
+                RuntimeFulcioPasswordFileName),
+            Path.Combine(
+                layout.RuntimeFulcio,
+                RuntimeFulcioRootCertificateFileName));
+        using var ctLogPublicKey = LoadEcdsaKey(
+            Path.Combine(
+                layout.RuntimeFulcio,
+                RuntimeFulcioCtLogPublicKeyFileName));
+
+        var acceptedRootsPath = Path.Combine(
+            layout.RuntimeTesseract,
+            RuntimeAcceptedRootsFileName);
+        var acceptedRoots = ReadAcceptedRootsBundle(acceptedRootsPath);
+        return new FulcioRuntimeProjectionInfo(
+            serving.RootSha256,
+            serving.PublicKeySha256,
+            serving.SubjectDistinguishedName,
+            serving.NotBeforeUtc,
+            serving.NotAfterUtc,
+            Fingerprint(ctLogPublicKey.ExportSubjectPublicKeyInfo()),
+            PathExists(layout.RuntimeFulcioStaged)
+                ? generation.FulcioRootSha256
+                : null,
+            serving.RootSha256 != generation.FulcioRootSha256,
+            Fingerprint(File.ReadAllBytes(acceptedRootsPath)),
+            acceptedRoots
+                .Select(certificate => Fingerprint(certificate.RawData))
+                .ToArray());
+    }
+
+    /// <summary>
+    /// Loads the active generation manifest for the runtime projection APIs
+    /// and binds it to the transition journal exactly as the bootstrap
+    /// validation path does: the journal must be stable and internally
+    /// consistent, the active-generation link must select the journaled
+    /// candidate, the manifest bytes on disk must hash to the journaled
+    /// candidate hash, and the journaled copy must describe the same
+    /// generation. That keeps tamper detection identical whether the
+    /// generation was written by C# or by the Go rotation worker.
+    /// </summary>
+    private static GenerationManifest ReadActiveGenerationManifest(
+        TrustStateLayout layout,
+        out string generationPath)
+    {
+        var journal = ReadTransitionJournal(layout);
+        ValidateTransitionJournal(journal);
+        if (journal.Status is not (
+            TransitionStatusCommitted
+            or TransitionStatusRecovered)
+            || journal.LastCheckpoint != CheckpointName(
+                TrustTransitionCheckpoint.TransitionFinalized))
+        {
+            throw new InvalidDataException(
+                "The trust transition has not reached a stable state.");
+        }
+
+        var generationId = ReadActiveGeneration(layout.ActiveGeneration);
+        EnsureEqual(
+            "active generation",
+            journal.Candidate.GenerationId,
+            generationId);
+        generationPath = Path.Combine(
+            layout.Generations,
+            generationId);
+        var generation = ReadPortableJson<GenerationManifest>(
+            Path.Combine(
+                generationPath,
+                GenerationManifestFileName));
+        // Binds the read-only manifest bytes to the journaled candidate hash
+        // and the manifest's file map to the material actually on disk.
+        ValidateGenerationDirectory(
+            generationPath,
+            generation,
+            journal.Candidate.ManifestSha256);
+        if (!GenerationManifestsEqual(journal.CandidateManifest, generation))
+        {
+            throw new InvalidDataException(
+                "The active generation does not match the transition journal.");
+        }
+        ValidateGenerationIdentity(
+            journal.TrustDomain,
+            generation);
+        return generation;
+    }
+
+    private static string RuntimeFulcioGenerationPath(string name)
+        => name switch
+        {
+            RuntimeFulcioRootCertificateFileName => FulcioRootCertificatePath,
+            RuntimeFulcioRootKeyFileName => FulcioPrivateKeyPath,
+            RuntimeFulcioPasswordFileName => FulcioPrivateKeyPasswordPath,
+            RuntimeFulcioCtLogPublicKeyFileName => CtLogPublicKeyPath,
+            _ => throw new InvalidOperationException(
+                $"Unknown Fulcio runtime projection file '{name}'.")
+        };
+
+    private static X509Certificate2Collection ReadAcceptedRootsBundle(
+        string bundlePath)
+    {
+        EnsureRegularFile(
+            bundlePath,
+            "accepted Fulcio roots");
+        var certificates = new X509Certificate2Collection();
+        try
+        {
+            certificates.ImportFromPem(
+                File.ReadAllText(bundlePath));
+        }
+        catch (CryptographicException exception)
+        {
+            throw new InvalidDataException(
+                $"Accepted Fulcio roots '{bundlePath}' are not valid PEM " +
+                "certificates.",
+                exception);
+        }
+        if (certificates.Count == 0)
+        {
+            throw new InvalidDataException(
+                $"Accepted Fulcio roots '{bundlePath}' contain no " +
+                "certificates.");
+        }
+        return certificates;
+    }
+
+    private static void EnsureRuntimeProjectionDirectories(
+        TrustStateLayout layout,
+        bool includeStaged)
+    {
+        var directories = new List<string>
+        {
+            layout.Runtime,
+            layout.RuntimeFulcio,
+            layout.RuntimeTesseract
+        };
+        if (includeStaged)
+        {
+            directories.Add(layout.RuntimeFulcioStaged);
+        }
+        foreach (var directory in directories)
+        {
+            if (PathExists(directory))
+            {
+                EnsureRealDirectory(
+                    directory,
+                    "runtime projection");
+            }
+            else
+            {
+                Directory.CreateDirectory(directory);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Materializes the component-scoped runtime projection under
+    /// <c>runtime/</c>. These are stable, real directories (never links) that
+    /// containers bind-mount, so their paths must not change when the active
+    /// generation advances. The Fulcio component is only (re)written when it
+    /// is not deliberately serving a prior generation while a rotation awaits
+    /// Hosting promotion; the accepted-root bundle is created with the single
+    /// active root at bootstrap and is thereafter owned by the rotation
+    /// worker, which appends historical roots.
+    /// </summary>
+    private static void EnsureRuntimeProjection(
+        TrustStateLayout layout,
+        string generationPath,
+        GenerationManifest generation)
+    {
+        EnsureRuntimeProjectionDirectories(
+            layout,
+            includeStaged: false);
+
+        if (!IsFulcioPromotionPending(
+                layout,
+                generation))
+        {
+            foreach (var (name, source, isPrivate) in FulcioRuntimeSources(
+                generationPath))
+            {
+                WriteRuntimeFile(
+                    Path.Combine(layout.RuntimeFulcio, name),
+                    File.ReadAllBytes(source),
+                    isPrivate);
+            }
+        }
+        foreach (var (name, source, isPrivate) in TesseractRuntimeSources(
+            generationPath))
+        {
+            WriteRuntimeFile(
+                Path.Combine(layout.RuntimeTesseract, name),
+                File.ReadAllBytes(source),
+                isPrivate);
+        }
+
+        var acceptedRootsPath = Path.Combine(
+            layout.RuntimeTesseract,
+            RuntimeAcceptedRootsFileName);
+        if (!PathExists(acceptedRootsPath))
+        {
+            using var root = X509Certificate2.CreateFromPem(
+                File.ReadAllText(
+                    Resolve(generationPath, FulcioRootCertificatePath)));
+            WriteRuntimeFile(
+                acceptedRootsPath,
+                Encoding.UTF8.GetBytes(NormalizeCertificatePem(root)),
+                isPrivate: false);
+        }
+
+        ValidateRuntimeProjection(
+            layout,
+            generationPath,
+            generation);
+    }
+
+    private static bool IsFulcioPromotionPending(
+        TrustStateLayout layout,
+        GenerationManifest generation)
+    {
+        if (generation.FulcioRotationOperationId is null
+            || generation.FulcioPriorGenerationId is null
+            || !PathExists(layout.RuntimeFulcio))
+        {
+            return false;
+        }
+        var priorGenerationPath = Path.Combine(
+            layout.Generations,
+            generation.FulcioPriorGenerationId);
+        return Directory.Exists(priorGenerationPath)
+            && RuntimeComponentMatches(
+                layout.RuntimeFulcio,
+                FulcioRuntimeSources(priorGenerationPath));
+    }
+
+    /// <summary>
+    /// Validates the runtime projection against the two recognized states: the
+    /// steady state, where <c>runtime/fulcio</c> tracks the active generation,
+    /// and the post-rotation state, where it deliberately still serves the
+    /// prior certificate authority while <c>runtime/fulcio.next</c> stages the
+    /// rotated one for Hosting to promote after proof.
+    /// </summary>
+    private static void ValidateRuntimeProjection(
+        TrustStateLayout layout,
+        string generationPath,
+        GenerationManifest generation)
+    {
+        var promoted = RuntimeComponentMatches(
+            layout.RuntimeFulcio,
+            FulcioRuntimeSources(generationPath));
+        var servingGenerationPath = generationPath;
+        if (!promoted)
+        {
+            if (generation.FulcioRotationOperationId is null
+                || generation.FulcioPriorGenerationId is null)
+            {
+                throw new InvalidDataException(
+                    "The Fulcio runtime projection does not match the active " +
+                    "generation.");
+            }
+            servingGenerationPath = Path.Combine(
+                layout.Generations,
+                generation.FulcioPriorGenerationId);
+            if (!RuntimeComponentMatches(
+                    layout.RuntimeFulcio,
+                    FulcioRuntimeSources(servingGenerationPath)))
+            {
+                throw new InvalidDataException(
+                    "The Fulcio runtime projection matches neither the prior " +
+                    "nor the rotated generation.");
+            }
+        }
+
+        var allowedRuntimeEntries = new List<string>
+        {
+            RuntimeFulcioComponentName,
+            RuntimeTesseractComponentName
+        };
+        var stagedExists = PathExists(layout.RuntimeFulcioStaged);
+        if (stagedExists)
+        {
+            allowedRuntimeEntries.Add(RuntimeFulcioStagedComponentName);
+            if (!RuntimeComponentMatches(
+                    layout.RuntimeFulcioStaged,
+                    FulcioRuntimeSources(generationPath)))
+            {
+                throw new InvalidDataException(
+                    "The staged Fulcio runtime projection does not match the " +
+                    "rotated generation.");
+            }
+        }
+        else if (!promoted)
+        {
+            throw new InvalidDataException(
+                "The rotated Fulcio runtime projection is pending promotion " +
+                "but was never staged.");
+        }
+
+        EnsureOnlyEntries(
+            layout.Runtime,
+            allowedRuntimeEntries);
+        EnsureOnlyEntries(
+            layout.RuntimeTesseract,
+            RuntimeTesseractFileNames);
+        foreach (var (name, source, _) in TesseractRuntimeSources(
+            generationPath))
+        {
+            var projectedPath = Path.Combine(layout.RuntimeTesseract, name);
+            EnsureRegularFile(
+                projectedPath,
+                "runtime projection");
+            if (!File.ReadAllBytes(projectedPath).SequenceEqual(
+                    File.ReadAllBytes(source)))
+            {
+                throw new InvalidDataException(
+                    $"Runtime projection '{projectedPath}' does not match " +
+                    "the active generation.");
+            }
+        }
+
+        ValidateAcceptedRootsBundle(
+            Path.Combine(
+                layout.RuntimeTesseract,
+                RuntimeAcceptedRootsFileName),
+            Resolve(generationPath, FulcioRootCertificatePath),
+            Resolve(servingGenerationPath, FulcioRootCertificatePath));
+    }
+
+    /// <summary>
+    /// Reports whether a projected component carries exactly a generation's
+    /// material. An unexpected file set is always rejected; carrying a
+    /// different generation's bytes merely returns false, because that is the
+    /// legitimate pending-promotion state.
+    /// </summary>
+    private static bool RuntimeComponentMatches(
+        string componentPath,
+        IEnumerable<(string Name, string Source, bool IsPrivate)> sources)
+    {
+        var materialized = sources.ToArray();
+        EnsureOnlyEntries(
+            componentPath,
+            materialized.Select(source => source.Name));
+        foreach (var (name, source, _) in materialized)
+        {
+            var projectedPath = Path.Combine(componentPath, name);
+            EnsureRegularFile(
+                projectedPath,
+                "runtime projection");
+            if (!File.ReadAllBytes(projectedPath).SequenceEqual(
+                    File.ReadAllBytes(source)))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// The accepted-root bundle must be a deterministic, normalized PEM
+    /// concatenation of distinct certificates whose final entry is the
+    /// currently active Fulcio root, and which still contains the root the
+    /// runtime projection is serving. Re-encoding and comparing byte-for-byte
+    /// rejects trailing junk, duplicate roots, and non-normalized encodings
+    /// that would otherwise let unrelated material ride along.
+    /// </summary>
+    private static void ValidateAcceptedRootsBundle(
+        string bundlePath,
+        string activeRootPath,
+        string servingRootPath)
+    {
+        var bundleBytes = File.ReadAllBytes(bundlePath);
+        var certificates = ReadAcceptedRootsBundle(bundlePath);
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var builder = new StringBuilder();
+        foreach (var certificate in certificates)
+        {
+            if (!seen.Add(Fingerprint(certificate.RawData)))
+            {
+                throw new InvalidDataException(
+                    $"Accepted Fulcio roots '{bundlePath}' contain duplicate " +
+                    "certificates.");
+            }
+            builder.Append(NormalizeCertificatePem(certificate));
+        }
+        if (!Encoding.UTF8.GetBytes(builder.ToString())
+            .SequenceEqual(bundleBytes))
+        {
+            throw new InvalidDataException(
+                $"Accepted Fulcio roots '{bundlePath}' are not a normalized " +
+                "certificate bundle.");
+        }
+
+        using var activeRoot = X509Certificate2.CreateFromPem(
+            File.ReadAllText(activeRootPath));
+        if (!certificates[^1].RawData.SequenceEqual(activeRoot.RawData))
+        {
+            throw new InvalidDataException(
+                $"Accepted Fulcio roots '{bundlePath}' do not end with the " +
+                "active Fulcio root.");
+        }
+        using var servingRoot = X509Certificate2.CreateFromPem(
+            File.ReadAllText(servingRootPath));
+        if (!seen.Contains(Fingerprint(servingRoot.RawData)))
+        {
+            throw new InvalidDataException(
+                $"Accepted Fulcio roots '{bundlePath}' omit the Fulcio root " +
+                "the runtime projection is serving.");
+        }
+    }
+
+    private static string NormalizeCertificatePem(
+        X509Certificate2 certificate)
+        => certificate.ExportCertificatePem() + "\n";
+
+    private static void WriteRuntimeFile(
+        string path,
+        byte[] contents,
+        bool isPrivate)
+    {
+        if (PathExists(path))
+        {
+            EnsureRegularFile(
+                path,
+                "runtime projection");
+            if (File.ReadAllBytes(path).SequenceEqual(contents))
+            {
+                SetRuntimeFileMode(path, isPrivate);
+                return;
+            }
+        }
+        WriteAtomicBytes(
+            path,
+            contents,
+            isReadOnly: false);
+        SetRuntimeFileMode(path, isPrivate);
+    }
+
+    private static void SetRuntimeFileMode(
+        string path,
+        bool isPrivate)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+        File.SetUnixFileMode(
+            path,
+            isPrivate
+                ? UnixFileMode.UserRead | UnixFileMode.UserWrite
+                : UnixFileMode.UserRead
+                    | UnixFileMode.UserWrite
+                    | UnixFileMode.GroupRead
+                    | UnixFileMode.OtherRead);
+    }
+
+    private static void EnsureRegularFile(
+        string path,
+        string description)
+    {
+        var attributes = File.GetAttributes(path);
+        if (attributes.HasFlag(FileAttributes.Directory)
+            || attributes.HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new InvalidDataException(
+                $"{description} '{path}' must be a regular file.");
+        }
+    }
     private static void EnsureFreshRootIsEmpty(
         TrustStateLayout layout)
     {
@@ -1778,6 +2582,9 @@ internal static partial class SigstoreStateBootstrapper
         var migration = Path.Combine(
             rootPath,
             MigrationDirectoryName);
+        var runtime = Path.Combine(
+            rootPath,
+            RuntimeDirectoryName);
         return new TrustStateLayout(
             rootPath,
             Path.Combine(rootPath, TrustDomainFileName),
@@ -1791,7 +2598,11 @@ internal static partial class SigstoreStateBootstrapper
             Path.Combine(transition, TransitionStateFileName),
             migration,
             Path.Combine(rootPath, ManifestFileName),
-            Path.Combine(migration, LegacyManifestArchiveFileName));
+            Path.Combine(migration, LegacyManifestArchiveFileName),
+            runtime,
+            Path.Combine(runtime, RuntimeFulcioComponentName),
+            Path.Combine(runtime, RuntimeFulcioStagedComponentName),
+            Path.Combine(runtime, RuntimeTesseractComponentName));
     }
 
     private static string ReadActiveGeneration(
@@ -1854,9 +2665,20 @@ internal static partial class SigstoreStateBootstrapper
         return target;
     }
 
-    private static void ValidateImmutableJson<T>(
+    /// <summary>
+    /// Validates an immutable generation manifest that may have been written
+    /// by either the C# bootstrapper or the Go worker. Integrity is bound to
+    /// the SHA-256 of the bytes on disk — the value the transition journal
+    /// records — and to the semantic content of the manifest, rather than to
+    /// one language's JSON encoding. The two encoders legitimately differ in
+    /// property order, in whether absent optional fields are emitted as null,
+    /// and in timestamp formatting, so requiring byte-identical
+    /// re-serialization would reject valid cross-language state while adding
+    /// no tamper resistance the hash does not already provide.
+    /// </summary>
+    private static void ValidateImmutableGenerationManifest(
         string path,
-        T expected,
+        GenerationManifest expected,
         string expectedHash)
     {
         EnsureReadOnlyRegularFile(
@@ -1866,35 +2688,152 @@ internal static partial class SigstoreStateBootstrapper
             $"{Path.GetFileName(path)} hash",
             expectedHash,
             HashFile(path));
-        var expectedBytes = SerializeCanonical(expected);
-        var actualBytes = File.ReadAllBytes(path);
-        if (!actualBytes.SequenceEqual(expectedBytes))
+        if (!GenerationManifestsEqual(
+                expected,
+                ReadPortableJson<GenerationManifest>(path)))
         {
             throw new InvalidDataException(
-                $"Immutable metadata '{path}' is not the expected canonical " +
-                "document.");
+                $"Immutable metadata '{path}' does not describe the expected " +
+                "generation.");
         }
     }
 
-    private static T ReadCanonicalJson<T>(string path)
+    private static void ValidateImmutableTrustDomain(
+        string path,
+        TrustDomainManifest expected,
+        string expectedHash)
     {
-        var data = File.ReadAllBytes(path);
-        var value = JsonSerializer.Deserialize<T>(
-            data,
-            JsonOptions)
-            ?? throw new InvalidDataException(
-                $"Metadata '{path}' is empty.");
-        if (!data.SequenceEqual(SerializeCanonical(value)))
+        EnsureReadOnlyRegularFile(
+            path,
+            Path.GetFileName(path));
+        EnsureEqual(
+            $"{Path.GetFileName(path)} hash",
+            expectedHash,
+            HashFile(path));
+        if (!TrustDomainManifestsEqual(
+                expected,
+                ReadPortableJson<TrustDomainManifest>(path)))
         {
             throw new InvalidDataException(
-                $"Metadata '{path}' is not in canonical form.");
+                $"Immutable metadata '{path}' does not describe the expected " +
+                "trust domain.");
         }
-        return value;
     }
+
+    /// <summary>
+    /// Reads a document that either language may have produced. Unknown
+    /// members are still rejected, so injected fields cannot ride along, but
+    /// property order and omitted optional members are accepted.
+    /// </summary>
+    private static T ReadPortableJson<T>(string path)
+        => JsonSerializer.Deserialize<T>(
+            File.ReadAllBytes(path),
+            PortableJsonOptions)
+            ?? throw new InvalidDataException(
+                $"Metadata '{path}' is empty.");
+
+    private static bool TrustDomainManifestsEqual(
+        TrustDomainManifest expected,
+        TrustDomainManifest actual)
+        => expected.SchemaVersion == actual.SchemaVersion
+            && string.Equals(
+                expected.TrustDomainId,
+                actual.TrustDomainId,
+                StringComparison.Ordinal)
+            && expected.CreatedAtUtc.ToUniversalTime()
+                == actual.CreatedAtUtc.ToUniversalTime()
+            && string.Equals(
+                expected.CtLogStateId,
+                actual.CtLogStateId,
+                StringComparison.Ordinal)
+            && string.Equals(
+                expected.RekorStateId,
+                actual.RekorStateId,
+                StringComparison.Ordinal);
+
+    /// <summary>
+    /// Compares two generation manifests by value. The compiler-generated
+    /// record equality cannot be used because it compares the file map and
+    /// the retained-key list by reference, and because an absent optional
+    /// list must compare equal to an empty one: Go omits empty slices while
+    /// C# writes an explicit null.
+    /// </summary>
+    private static bool GenerationManifestsEqual(
+        GenerationManifest expected,
+        GenerationManifest actual)
+        => expected.SchemaVersion == actual.SchemaVersion
+            && expected.Generation == actual.Generation
+            && OrdinalEquals(expected.GenerationId, actual.GenerationId)
+            && OrdinalEquals(expected.TrustDomainId, actual.TrustDomainId)
+            && expected.CreatedAtUtc.ToUniversalTime()
+                == actual.CreatedAtUtc.ToUniversalTime()
+            && expected.SourceSchemaVersion == actual.SourceSchemaVersion
+            && OrdinalEquals(
+                expected.SourceManifestSha256,
+                actual.SourceManifestSha256)
+            && OrdinalEquals(
+                expected.FulcioRootSha256,
+                actual.FulcioRootSha256)
+            && OrdinalEquals(
+                expected.CtLogPublicKeySha256,
+                actual.CtLogPublicKeySha256)
+            && OrdinalEquals(
+                expected.RekorPublicKeySha256,
+                actual.RekorPublicKeySha256)
+            && OrdinalEquals(expected.TsaRootSha256, actual.TsaRootSha256)
+            && OrdinalEquals(expected.TsaLeafSha256, actual.TsaLeafSha256)
+            && OrdinalEquals(expected.OidcKeyId, actual.OidcKeyId)
+            && OrdinalEquals(
+                expected.OidcRotationOperationId,
+                actual.OidcRotationOperationId)
+            && expected.OidcPriorGeneration == actual.OidcPriorGeneration
+            && OrdinalEquals(
+                expected.OidcPriorGenerationId,
+                actual.OidcPriorGenerationId)
+            && OrdinalEquals(expected.OidcPriorKeyId, actual.OidcPriorKeyId)
+            && expected.OidcOverlapExpiresAtUtc?.ToUniversalTime()
+                == actual.OidcOverlapExpiresAtUtc?.ToUniversalTime()
+            && PathListsEqual(
+                expected.OidcRetainedPrivateKeyPaths,
+                actual.OidcRetainedPrivateKeyPaths)
+            && OrdinalEquals(
+                expected.TsaRotationOperationId,
+                actual.TsaRotationOperationId)
+            && expected.TsaPriorGeneration == actual.TsaPriorGeneration
+            && OrdinalEquals(
+                expected.TsaPriorGenerationId,
+                actual.TsaPriorGenerationId)
+            && OrdinalEquals(
+                expected.TsaPriorRootSha256,
+                actual.TsaPriorRootSha256)
+            && OrdinalEquals(
+                expected.TsaPriorLeafSha256,
+                actual.TsaPriorLeafSha256)
+            && OrdinalEquals(
+                expected.FulcioRotationOperationId,
+                actual.FulcioRotationOperationId)
+            && expected.FulcioPriorGeneration == actual.FulcioPriorGeneration
+            && OrdinalEquals(
+                expected.FulcioPriorGenerationId,
+                actual.FulcioPriorGenerationId)
+            && OrdinalEquals(
+                expected.FulcioPriorRootSha256,
+                actual.FulcioPriorRootSha256)
+            && FileMapsEqual(expected.Files, actual.Files);
+
+    private static bool OrdinalEquals(string? expected, string? actual)
+        => string.Equals(expected, actual, StringComparison.Ordinal);
+
+    private static bool PathListsEqual(
+        IReadOnlyList<string>? expected,
+        IReadOnlyList<string>? actual)
+        => (expected ?? []).SequenceEqual(
+            actual ?? [],
+            StringComparer.Ordinal);
 
     private static TrustTransitionJournal ReadTransitionJournal(
         TrustStateLayout layout)
-        => ReadCanonicalJson<TrustTransitionJournal>(
+        => ReadPortableJson<TrustTransitionJournal>(
             layout.TransitionState);
 
     private static void WriteTransitionJournal(

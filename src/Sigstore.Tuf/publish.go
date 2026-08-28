@@ -567,7 +567,13 @@ func advanceTrustGeneration(statePath string, current bootstrapManifest) (bootst
 		TSAPriorGenerationID:   currentGenerationManifest.TSAPriorGenerationID,
 		TSAPriorRootSHA256:     currentGenerationManifest.TSAPriorRootSHA256,
 		TSAPriorLeafSHA256:     currentGenerationManifest.TSAPriorLeafSHA256,
-		Files:                  newFiles,
+
+		FulcioRotationOperationID: currentGenerationManifest.FulcioRotationOperationID,
+		FulcioPriorGeneration:     currentGenerationManifest.FulcioPriorGeneration,
+		FulcioPriorGenerationID:   currentGenerationManifest.FulcioPriorGenerationID,
+		FulcioPriorRootSHA256:     currentGenerationManifest.FulcioPriorRootSHA256,
+
+		Files: newFiles,
 	}
 	manifestBytes, err := json.MarshalIndent(genManifest, "", "  ")
 	if err != nil {
@@ -575,7 +581,7 @@ func advanceTrustGeneration(statePath string, current bootstrapManifest) (bootst
 		return bootstrapManifest{}, "", fmt.Errorf("marshal generation manifest: %w", err)
 	}
 	manifestBytes = append(manifestBytes, '\n')
-	if err := os.WriteFile(manifestPath, manifestBytes, 0o644); err != nil {
+	if err := writeGenerationManifest(manifestPath, manifestBytes); err != nil {
 		_ = os.RemoveAll(newGenerationPath)
 		return bootstrapManifest{}, "", fmt.Errorf("write generation manifest: %w", err)
 	}
@@ -641,8 +647,19 @@ func switchActiveGeneration(statePath string, current bootstrapManifest, newBoot
 	}
 	operation := "generation-advance"
 	transitionID := journal.TransitionID
+	// Rotation provenance is carried forward across generations, so a
+	// generation is only classified as a given rotation when that rotation
+	// actually happened in this step: the prior generation must be the
+	// generation being replaced and the rotated material must have changed.
 	switch {
-	case genManifest.OIDCRotationOperationID != "":
+	case genManifest.FulcioRotationOperationID != "" &&
+		genManifest.FulcioPriorGeneration == current.Generation &&
+		genManifest.FulcioRootSHA256 != current.FulcioRootSHA256:
+		operation = "fulcio-rotation"
+		transitionID = genManifest.FulcioRotationOperationID
+	case genManifest.OIDCRotationOperationID != "" &&
+		genManifest.OIDCPriorGeneration == current.Generation &&
+		genManifest.OIDCKeyID != current.OIDCKeyID:
 		operation = "oidc-rotation"
 		transitionID = genManifest.OIDCRotationOperationID
 	case genManifest.TSARotationOperationID != "" &&

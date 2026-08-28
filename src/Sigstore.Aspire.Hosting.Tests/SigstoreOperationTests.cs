@@ -37,7 +37,8 @@ public sealed class SigstoreOperationTests
                 SigstoreOperationCommand.RestartClientsCommand,
                 SigstoreOperationCommand.PublishTrustedRootCommand,
                 SigstoreOperationCommand.RotateOidcSigningKeyCommand,
-                SigstoreOperationCommand.RotateTimestampAuthorityCommand
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+                SigstoreOperationCommand.RotateFulcioCaCommand
             ],
             annotations.Keys);
 
@@ -48,7 +49,8 @@ public sealed class SigstoreOperationTests
             SigstoreOperationCommand.RestartClientsCommand,
             SigstoreOperationCommand.PublishTrustedRootCommand,
             SigstoreOperationCommand.RotateOidcSigningKeyCommand,
-            SigstoreOperationCommand.RotateTimestampAuthorityCommand
+            SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+            SigstoreOperationCommand.RotateFulcioCaCommand
         })
         {
             var annotation = annotations[name];
@@ -132,6 +134,50 @@ public sealed class SigstoreOperationTests
                 .UpdateState(NewUpdateContext()));
         model.Parent.Resource.ClearOperationRecovery(
             SigstoreOperationCommand.RotateTimestampAuthorityCommand);
+
+        var statePath = model.Parent.Resource.StatePath;
+        var fulcioMounts = model.Parent.Resource.Components.Fulcio.Resource
+            .Annotations
+            .OfType<ContainerMountAnnotation>()
+            .Where(
+                mount => mount.Target
+                    == "/var/lib/sigstore/fulcio")
+            .ToArray();
+        Assert.Single(fulcioMounts);
+        Assert.Equal(
+            System.IO.Path.Combine(
+                statePath,
+                "runtime",
+                "fulcio"),
+            fulcioMounts[0].Source);
+        Assert.Equal(
+            "/var/lib/sigstore/fulcio",
+            fulcioMounts[0].Target);
+        Assert.True(fulcioMounts[0].IsReadOnly);
+
+        var tesseractMounts = model.Parent.Resource.Components.Tesseract
+            .Resource
+            .Annotations
+            .OfType<ContainerMountAnnotation>()
+            .OrderBy(mount => mount.Target, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(2, tesseractMounts.Length);
+        Assert.Contains(
+            tesseractMounts,
+            mount => mount.Source == System.IO.Path.Combine(
+                    statePath,
+                    "runtime",
+                    "tesseract")
+                && mount.Target == "/var/lib/sigstore/tesseract"
+                && mount.IsReadOnly);
+        Assert.Contains(
+            tesseractMounts,
+            mount => mount.Source == System.IO.Path.Combine(
+                    statePath,
+                    "data",
+                    "ctlog")
+                && mount.Target == "/var/lib/sigstore/data/ctlog"
+                && !mount.IsReadOnly);
     }
 
     [Fact]
@@ -857,6 +903,418 @@ public sealed class SigstoreOperationTests
             Assert.Equal("contention", output.Phase);
             Assert.Contains(
                 "rotate-timestamp-authority is already active",
+                output.Message,
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            lease!.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task FulcioRotationOrdersTrustClientsTesseractAndIssuer()
+    {
+        using var model = new OperationModelFixture();
+        var statePath = model.Parent.Resource.StatePath;
+        var bootstrap = SigstoreStateBootstrapper.EnsureInitialized(
+            statePath);
+        var oldRoot = bootstrap.Generation.FulcioRootSha256;
+        var newRoot = Hash('f');
+        var acceptedHash = Hash('d');
+        var ctKey = bootstrap.Generation.CtLogPublicKeySha256;
+        var before = NewTufState();
+        var after = NewFulcioRotationTufState(before);
+        var checkpointBefore = new SigstoreCtCheckpoint(
+            SigstoreFulcio.CtOrigin,
+            10,
+            1_000,
+            Hash('1'),
+            Hash('2'),
+            ctKey);
+        var checkpointAfter = checkpointBefore with
+        {
+            TreeSize = 12,
+            Timestamp = 4_000,
+            RootHash = Hash('3'),
+            SignatureSha256 = Hash('4')
+        };
+        var oldArtifact = NewArtifact(
+            100,
+            oldRoot,
+            ctKey,
+            'a');
+        var newArtifact = NewArtifact(
+            120,
+            newRoot,
+            ctKey,
+            'b');
+        var oldStatus = NewFulcioStatus(
+            oldRoot,
+            oldRoot,
+            [oldRoot],
+            Hash('0'),
+            ctKey,
+            checkpointBefore,
+            runtimeMatches: true);
+        var overlapStatus = NewFulcioStatus(
+            newRoot,
+            oldRoot,
+            [oldRoot, newRoot],
+            acceptedHash,
+            ctKey,
+            checkpointBefore,
+            runtimeMatches: false);
+        var activatedStatus = overlapStatus with
+        {
+            RuntimeFulcioMatchesActive = true,
+            RuntimePromotionPending = false,
+            StagedRootSha256 = null
+        };
+        var finalStatus = activatedStatus with
+        {
+            LiveRootSha256 = newRoot,
+            LiveRootMatchesActive = true,
+            Checkpoint = checkpointAfter
+        };
+
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events)
+        {
+            FulcioCandidate = new FulcioCaMaterialInfo(
+                newRoot,
+                Hash('e'),
+                "CN=Fulcio Root, O=Sigstore Aspire Demo",
+                DateTimeOffset.UtcNow.AddMinutes(-5),
+                DateTimeOffset.UtcNow.AddYears(10)),
+            FulcioProjection = new FulcioRuntimeProjectionInfo(
+                newRoot,
+                Hash('e'),
+                "CN=Fulcio Root, O=Sigstore Aspire Demo",
+                DateTimeOffset.UtcNow.AddMinutes(-5),
+                DateTimeOffset.UtcNow.AddYears(10),
+                ctKey,
+                null,
+                false,
+                acceptedHash,
+                [oldRoot, newRoot])
+        };
+        inspector.TufStates.Enqueue(before);
+        inspector.TufStates.Enqueue(after);
+        inspector.TrustFingerprints.Enqueue(Hash('5'));
+        inspector.TrustFingerprints.Enqueue(Hash('6'));
+        inspector.MaterialFingerprints.Enqueue(Hash('7'));
+        inspector.MaterialFingerprints.Enqueue(Hash('8'));
+
+        var runtime = NewRuntime(model, events, inspector);
+        runtime.ServedStates.Enqueue(NewServed(before));
+        runtime.ServedStates.Enqueue(NewServed(after));
+        runtime.FulcioStatuses.Enqueue(oldStatus);
+        runtime.FulcioStatuses.Enqueue(overlapStatus);
+        runtime.FulcioStatuses.Enqueue(overlapStatus);
+        runtime.FulcioStatuses.Enqueue(activatedStatus);
+        runtime.FulcioStatuses.Enqueue(finalStatus);
+        runtime.Artifacts.Enqueue(oldArtifact);
+        runtime.Artifacts.Enqueue(newArtifact);
+        runtime.OidcTokens.Enqueue((CreateOidcJwt(new string('a', 43)), null));
+        runtime.OidcTokens.Enqueue((CreateOidcJwt(new string('a', 43)), null));
+        runtime.FulcioProofs.Enqueue(
+            NewFulcioProof(oldRoot, ctKey, 2_000, 'c'));
+        runtime.FulcioProofs.Enqueue(
+            NewFulcioProof(newRoot, ctKey, 3_000, 'd'));
+        runtime.CtCheckpoints.Enqueue(checkpointAfter);
+        runtime.Statuses.Enqueue(NewAggregate(model, before));
+        runtime.Statuses.Enqueue(
+            NewAggregate(model, after) with
+            {
+                Fulcio = finalStatus
+            });
+
+        var workerBefore = Exited(
+            "tuf-bootstrap",
+            "worker-before",
+            0);
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.TufBootstrap.Resource,
+            workerBefore);
+        runtime.WaitResults["tuf-bootstrap"] = Exited(
+            "tuf-bootstrap",
+            "worker-after",
+            0,
+            offsetSeconds: 10);
+
+        var fulcioBefore = Running(
+            "fulcio",
+            "fulcio-before");
+        var fulcioAfter = Running(
+            "fulcio",
+            "fulcio-after",
+            offsetSeconds: 40);
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Fulcio.Resource,
+            fulcioBefore,
+            fulcioBefore);
+        runtime.WaitResults["fulcio"] = fulcioAfter;
+        var tesseractBefore = Running(
+            "tesseract",
+            "tesseract-before");
+        var tesseractAfter = Running(
+            "tesseract",
+            "tesseract-after",
+            offsetSeconds: 30);
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Tesseract.Resource,
+            tesseractBefore,
+            tesseractBefore);
+        runtime.WaitResults["tesseract"] = tesseractAfter;
+
+        var clientRegistrations = model.Parent.Resource
+            .GetRegistrations()
+            .Clients
+            .OrderBy(
+                client => client.Resource.Name,
+                StringComparer.Ordinal)
+            .ToArray();
+        foreach (var client in clientRegistrations)
+        {
+            var clientBefore = Running(
+                client.Resource.Name,
+                $"{client.Resource.Name}-before");
+            var clientAfter = Running(
+                client.Resource.Name,
+                $"{client.Resource.Name}-after",
+                offsetSeconds: 20);
+            runtime.SetSnapshotSequence(
+                client.Resource,
+                clientBefore);
+            runtime.WaitResults[client.Resource.Name] = clientAfter;
+            runtime.ClientStatusSequences[client.Resource.Name] =
+                new Queue<SigstoreClientTrustStatus>(
+                    [
+                        NewClientStatus(client, before.Trust),
+                        NewClientStatus(client, after.Trust)
+                    ]);
+            runtime.ArtifactVerifications[client.Resource.Name] =
+                new Queue<SigstoreClientArtifactVerification>(
+                    [
+                        NewArtifactVerification(
+                            client,
+                            oldArtifact,
+                            after.Trust),
+                        NewArtifactVerification(
+                            client,
+                            newArtifact,
+                            after.Trust)
+                    ]);
+        }
+
+        var excluded = clientRegistrations
+            .Select(client => client.Resource.Name)
+            .Append("fulcio")
+            .Append("tesseract")
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var protectedResource in model.Parent.Resource
+            .GetRegistrations()
+            .RequiredResources
+            .Where(resource => !excluded.Contains(resource.Name)))
+        {
+            var snapshot = Running(
+                protectedResource.Name,
+                $"{protectedResource.Name}-stable");
+            runtime.SetSnapshotSequence(
+                protectedResource,
+                snapshot,
+                snapshot,
+                snapshot,
+                snapshot,
+                snapshot,
+                snapshot);
+        }
+
+        runtime.OnExecuteCommand = (target, command) =>
+        {
+            if (target.Name != "tuf-bootstrap"
+                || command != KnownResourceCommands.StartCommand)
+            {
+                return;
+            }
+            using var request = JsonDocument.Parse(
+                File.ReadAllBytes(
+                    System.IO.Path.Combine(
+                        statePath,
+                        "rotate-fulcio-ca.request")));
+            var operationId = request.RootElement
+                .GetProperty("operationId")
+                .GetString()!;
+            var oldGenerationPath = System.IO.Path.Combine(
+                statePath,
+                "generations",
+                bootstrap.Generation.GenerationId);
+            const string newGenerationId = "generation-00000002";
+            var newGenerationPath = System.IO.Path.Combine(
+                statePath,
+                "generations",
+                newGenerationId);
+            CopyDirectory(
+                oldGenerationPath,
+                newGenerationPath);
+            File.Delete(
+                System.IO.Path.Combine(
+                    newGenerationPath,
+                    "manifest.json"));
+            File.WriteAllText(
+                System.IO.Path.Combine(
+                    newGenerationPath,
+                    "manifest.json"),
+                JsonSerializer.Serialize(
+                    new
+                    {
+                        generation = 2,
+                        generationId = newGenerationId,
+                        fulcioRootSha256 = newRoot,
+                        fulcioRotationOperationId = operationId
+                    }));
+            Directory.Delete(
+                System.IO.Path.Combine(
+                    statePath,
+                    "active-generation"));
+            Directory.CreateSymbolicLink(
+                System.IO.Path.Combine(
+                    statePath,
+                    "active-generation"),
+                System.IO.Path.Combine(
+                    "generations",
+                    newGenerationId));
+            File.WriteAllText(
+                System.IO.Path.Combine(
+                    statePath,
+                    "rotate-fulcio-ca.completed"),
+                JsonSerializer.Serialize(
+                    new
+                    {
+                        schemaVersion = 1,
+                        operationId,
+                        trustDomainId = before.Trust.TrustDomainId,
+                        completedAtUtc = DateTimeOffset.UtcNow,
+                        priorGeneration = 1,
+                        priorGenerationId =
+                            bootstrap.Generation.GenerationId,
+                        priorFulcioRootSha256 = oldRoot,
+                        newGeneration = 2,
+                        newGenerationId,
+                        newFulcioRootSha256 = newRoot,
+                        manifestSha256 =
+                            after.Trust.GenerationManifestSha256,
+                        publicationId = after.Trust.PublicationId,
+                        publicationManifestSha256 =
+                            after.Trust.PublicationManifestSha256,
+                        trustedRootSha256 =
+                            after.Trust.TrustedRootSha256,
+                        signingConfigSha256 =
+                            after.Trust.SigningConfigSha256,
+                        fulcioTrustEntryCount = 2,
+                        acceptedRootsSha256 = acceptedHash,
+                        acceptedRootFingerprints =
+                            new[] { oldRoot, newRoot },
+                        activeFulcioRuntimeRootSha256 = oldRoot,
+                        stagedFulcioRuntimeRootSha256 = newRoot
+                    }));
+            File.Delete(
+                System.IO.Path.Combine(
+                    statePath,
+                    "rotate-fulcio-ca.request"));
+        };
+
+        var result = await NewExecutor(model, runtime, inspector)
+            .ExecuteRotateFulcioCaAsync(CancellationToken.None);
+        var output = ReadResult(result);
+
+        Assert.True(
+            result.Success,
+            output.Message + ": " + string.Join(
+                "; ",
+                output.Errors.Select(error => error.Message)));
+        Assert.NotNull(output.FulcioRotation);
+        Assert.Equal(oldRoot, output.FulcioRotation.OldRootSha256);
+        Assert.Equal(newRoot, output.FulcioRotation.NewRootSha256);
+        Assert.Equal(6, output.FulcioRotation.Clients.Count);
+        Assert.Equal(
+            6,
+            output.FulcioRotation.OldArtifactValidations.Count);
+        Assert.Equal(
+            6,
+            output.FulcioRotation.NewArtifactValidations.Count);
+        Assert.Equal(
+            1,
+            runtime.ExecutedCommands.Count(
+                item => item.Resource == "tesseract"));
+        Assert.Equal(
+            1,
+            runtime.ExecutedCommands.Count(
+                item => item.Resource == "fulcio"));
+        Assert.DoesNotContain(
+            runtime.ExecutedCommands,
+            item => item.Resource is
+                "oidc" or "timestamp" or "rekor-server" or "rekor"
+                or "tuf" or "shady-blob-store");
+
+        var orderedEvents = events.ToArray();
+        var lastClientRestart = Array.FindLastIndex(
+            orderedEvents,
+            item => item.StartsWith(
+                "execute:",
+                StringComparison.Ordinal)
+                && item.Contains(
+                    "-client:restart",
+                    StringComparison.Ordinal));
+        var tesseractRestart = Array.IndexOf(
+            orderedEvents,
+            "execute:tesseract:restart");
+        var oldProof = Array.IndexOf(
+            orderedEvents,
+            $"fulcio-proof:{oldRoot}");
+        var runtimeActivation = Array.IndexOf(
+            orderedEvents,
+            "fulcio-runtime-activate");
+        var fulcioRestart = Array.IndexOf(
+            orderedEvents,
+            "execute:fulcio:restart");
+        var newProof = Array.IndexOf(
+            orderedEvents,
+            $"fulcio-proof:{newRoot}");
+        Assert.True(lastClientRestart < tesseractRestart);
+        Assert.True(tesseractRestart < oldProof);
+        Assert.True(oldProof < runtimeActivation);
+        Assert.True(runtimeActivation < fulcioRestart);
+        Assert.True(fulcioRestart < newProof);
+    }
+
+    [Fact]
+    public async Task FulcioRotationContentionIsRejectedByGate()
+    {
+        using var model = new OperationModelFixture();
+        Assert.True(
+            model.Parent.Resource.TryBeginOperation(
+                SigstoreOperationCommand.RotateFulcioCaCommand,
+                "Rotating Fulcio CA",
+                out var lease,
+                out _));
+        try
+        {
+            var events = new ConcurrentQueue<string>();
+            var inspector = new FakeStateInspector(events);
+            var result = await NewExecutor(
+                    model,
+                    NewRuntime(model, events, inspector),
+                    inspector)
+                .ExecuteRotateFulcioCaAsync(
+                    CancellationToken.None);
+            var output = ReadResult(result);
+
+            Assert.False(result.Success);
+            Assert.Equal("contention", output.Phase);
+            Assert.Contains(
+                "rotate-fulcio-ca is already active",
                 output.Message,
                 StringComparison.Ordinal);
         }
@@ -1618,6 +2076,98 @@ public sealed class SigstoreOperationTests
         };
     }
 
+    private static SigstoreTufStateSnapshot NewFulcioRotationTufState(
+        SigstoreTufStateSnapshot prior) =>
+        NewTsaRotationTufState(prior);
+
+    private static SigstoreFulcioStatus NewFulcioStatus(
+        string activeRoot,
+        string liveRoot,
+        IReadOnlyList<string> roots,
+        string acceptedRootsSha256,
+        string ctKey,
+        SigstoreCtCheckpoint checkpoint,
+        bool runtimeMatches)
+    {
+        var trusted = roots
+            .Select(
+                (root, index) => new SigstoreFulcioTrustEntry(
+                    index,
+                    SigstoreFulcio.CanonicalUri,
+                    root,
+                    "CN=Fulcio Root, O=Sigstore Aspire Demo",
+                    DateTime.UtcNow.AddMinutes(-5),
+                    DateTime.UtcNow.AddYears(10)))
+            .ToArray();
+        return new SigstoreFulcioStatus(
+            activeRoot,
+            liveRoot,
+            true,
+            runtimeMatches,
+            !runtimeMatches,
+            runtimeMatches ? null : activeRoot,
+            activeRoot == liveRoot,
+            trusted,
+            roots,
+            acceptedRootsSha256,
+            true,
+            ctKey,
+            ctKey,
+            "ct-state",
+            checkpoint);
+    }
+
+    private static SigstoreArtifactEvidence NewArtifact(
+        long id,
+        string root,
+        string ctLogId,
+        char marker) =>
+        new(
+            id,
+            Hash(marker),
+            Hash((char)(marker + 1)),
+            Hash((char)(marker + 2)),
+            root,
+            ctLogId,
+            1_500,
+            1,
+            1);
+
+    private static SigstoreFulcioIssuanceProof NewFulcioProof(
+        string root,
+        string ctLogId,
+        ulong timestamp,
+        char marker) =>
+        new(
+            Hash(marker),
+            root,
+            "CN=leaf",
+            "CN=Fulcio Root",
+            SigstoreDefaults.ExpectedIdentity,
+            DateTimeOffset.UtcNow.AddMinutes(-1),
+            DateTimeOffset.UtcNow.AddMinutes(9),
+            ctLogId,
+            timestamp,
+            Hash((char)(marker + 1)),
+            true);
+
+    private static SigstoreClientArtifactVerification
+        NewArtifactVerification(
+            SigstoreClientRegistration client,
+            SigstoreArtifactEvidence artifact,
+            SigstoreDiskTrustStatus trust) =>
+        new(
+            1,
+            client.Resource.Name,
+            client.Language,
+            true,
+            artifact.ArtifactId,
+            artifact.ArtifactSha256,
+            artifact.BundleSha256,
+            trust.Generation,
+            trust.GenerationId,
+            trust.TrustedRootSha256);
+
     private static SigstoreTimestampAuthorityProbeEvidence
         NewTimestampProof(
             string rootSha256,
@@ -1913,10 +2463,14 @@ public sealed class SigstoreOperationTests
                 {
                     SourcePath = sourcePath
                 });
-            Parent.WithRequiredResource(
-                builder.AddContainer(
-                    "shady-blob-store",
-                    "alpine"));
+            Parent.WithArtifactStore(
+                builder
+                    .AddContainer(
+                        "shady-blob-store",
+                        "alpine")
+                    .WithHttpEndpoint(
+                        targetPort: 8080,
+                        name: "http"));
             foreach (var (name, language) in new[]
             {
                 ("rust-client", "rust"),
@@ -1993,6 +2547,27 @@ public sealed class SigstoreOperationTests
 
         public Queue<string> MaterialFingerprints { get; } = [];
 
+        public FulcioCaMaterialInfo FulcioCandidate { get; set; } =
+            new(
+                Hash('f'),
+                Hash('e'),
+                "CN=Fulcio Root, O=Sigstore Aspire Demo",
+                DateTimeOffset.UtcNow.AddMinutes(-5),
+                DateTimeOffset.UtcNow.AddYears(10));
+
+        public FulcioRuntimeProjectionInfo FulcioProjection { get; set; } =
+            new(
+                Hash('f'),
+                Hash('e'),
+                "CN=Fulcio Root, O=Sigstore Aspire Demo",
+                DateTimeOffset.UtcNow.AddMinutes(-5),
+                DateTimeOffset.UtcNow.AddYears(10),
+                Hash('c'),
+                null,
+                false,
+                Hash('d'),
+                [Hash('a'), Hash('f')]);
+
         public bool LockHeld => Volatile.Read(ref _lockCount) != 0;
 
         public IDisposable AcquireLock(
@@ -2022,6 +2597,24 @@ public sealed class SigstoreOperationTests
 
         public string ReadTrustMaterialFingerprint(string statePath) =>
             MaterialFingerprints.Dequeue();
+
+        public FulcioCaMaterialInfo EnsureFulcioCaRotationCandidate(
+            string candidatePath)
+        {
+            events.Enqueue("fulcio-candidate");
+            Directory.CreateDirectory(candidatePath);
+            return FulcioCandidate;
+        }
+
+        public FulcioRuntimeProjectionInfo ActivateFulcioRuntimeProjection(
+            string statePath,
+            string operationId,
+            string priorFulcioRootSha256,
+            string newFulcioRootSha256)
+        {
+            events.Enqueue("fulcio-runtime-activate");
+            return FulcioProjection;
+        }
     }
 
     private sealed class FakeRuntime(
@@ -2048,6 +2641,20 @@ public sealed class SigstoreOperationTests
 
         public Queue<SigstoreTimestampAuthorityProbeEvidence>
             StoredTimestampProofs { get; } = [];
+
+        public Queue<SigstoreFulcioStatus> FulcioStatuses { get; } = [];
+
+        public Queue<SigstoreFulcioIssuanceProof> FulcioProofs { get; } = [];
+
+        public Queue<SigstoreCtCheckpoint> CtCheckpoints { get; } = [];
+
+        public Queue<SigstoreArtifactEvidence> Artifacts { get; } = [];
+
+        public Dictionary<
+            string,
+            Queue<SigstoreClientArtifactVerification>>
+            ArtifactVerifications { get; } =
+                new(StringComparer.Ordinal);
 
         public Dictionary<string, SigstoreResourceInstanceSnapshot>
             WaitResults { get; } = new(StringComparer.Ordinal);
@@ -2227,6 +2834,62 @@ public sealed class SigstoreOperationTests
         {
             events.Enqueue("timestamp-proof");
             return Task.FromResult(StoredTimestampProofs.Dequeue());
+        }
+
+        public Task<SigstoreFulcioStatus> ReadFulcioStatusAsync(
+            CancellationToken cancellationToken)
+        {
+            events.Enqueue("fulcio-status");
+            return Task.FromResult(FulcioStatuses.Dequeue());
+        }
+
+        public Task<SigstoreFulcioIssuanceProof>
+            ProveFulcioIssuanceAsync(
+                string oidcToken,
+                string subject,
+                string expectedRootSha256,
+                CancellationToken cancellationToken)
+        {
+            events.Enqueue($"fulcio-proof:{expectedRootSha256}");
+            return Task.FromResult(FulcioProofs.Dequeue());
+        }
+
+        public Task<SigstoreCtCheckpoint> ReadCtCheckpointAsync(
+            CancellationToken cancellationToken)
+        {
+            events.Enqueue("ct-checkpoint");
+            return Task.FromResult(CtCheckpoints.Dequeue());
+        }
+
+        public Task<long> ReadArtifactHeadAsync(
+            CancellationToken cancellationToken)
+        {
+            events.Enqueue("artifact-head");
+            return Task.FromResult(
+                Artifacts.Count == 0
+                    ? 0
+                    : Artifacts.Peek().ArtifactId);
+        }
+
+        public Task<SigstoreArtifactEvidence> FindArtifactAsync(
+            long minimumExclusiveId,
+            string expectedRootSha256,
+            CancellationToken cancellationToken)
+        {
+            events.Enqueue($"find-artifact:{expectedRootSha256}");
+            return Task.FromResult(Artifacts.Dequeue());
+        }
+
+        public Task<SigstoreClientArtifactVerification>
+            VerifyArtifactAsync(
+                SigstoreClientRegistration client,
+                SigstoreArtifactEvidence artifact,
+                CancellationToken cancellationToken)
+        {
+            events.Enqueue(
+                $"verify-artifact:{client.Resource.Name}:{artifact.ArtifactId}");
+            return Task.FromResult(
+                ArtifactVerifications[client.Resource.Name].Dequeue());
         }
 
         public Task PublishParentStateAsync(SigstoreResource target)

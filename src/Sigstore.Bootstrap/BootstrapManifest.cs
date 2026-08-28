@@ -33,3 +33,22 @@ internal sealed record TimestampAuthorityMaterialInfo(
     bool HasRootPrivateKey,
     DateTimeOffset NotBeforeUtc,
     DateTimeOffset NotAfterUtc);
+
+internal sealed record FulcioCaMaterialInfo(
+    string RootSha256,
+    string PublicKeySha256,
+    string SubjectDistinguishedName,
+    DateTimeOffset NotBeforeUtc,
+    DateTimeOffset NotAfterUtc);
+
+internal sealed record FulcioRuntimeProjectionInfo(
+    string ActiveRootSha256,
+    string ActivePublicKeySha256,
+    string ActiveRootSubject,
+    DateTimeOffset ActiveNotBeforeUtc,
+    DateTimeOffset ActiveNotAfterUtc,
+    string ActiveCtLogPublicKeySha256,
+    string? StagedRootSha256,
+    bool PromotionPending,
+    string AcceptedRootsSha256,
+    IReadOnlyList<string> AcceptedRootSha256);

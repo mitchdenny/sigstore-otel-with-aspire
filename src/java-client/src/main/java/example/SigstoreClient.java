@@ -109,7 +109,14 @@ public final class SigstoreClient {
     var workerPool = Executors.newFixedThreadPool(2);
     var healthServer =
         startHealthServer(
-            config.port(), running, workersHealthy, trust.status());
+            config.port(),
+            running,
+            workersHealthy,
+            trust.status(),
+            artifactStore,
+            tracer,
+            verifier,
+            verificationOptions);
 
     Runtime.getRuntime()
         .addShutdownHook(
@@ -471,7 +478,11 @@ public final class SigstoreClient {
       int port,
       AtomicBoolean running,
       AtomicBoolean workersHealthy,
-      ClientTrustStatus trustStatus)
+      ClientTrustStatus trustStatus,
+      ArtifactStore artifactStore,
+      Tracer tracer,
+      KeylessVerifier verifier,
+      VerificationOptions verificationOptions)
       throws Exception {
     HttpServer server =
         HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
@@ -508,8 +519,85 @@ public final class SigstoreClient {
           exchange.getResponseBody().write(body);
           exchange.close();
         });
+    server.createContext(
+        "/artifacts/",
+        exchange -> {
+          String path = exchange.getRequestURI().getPath();
+          String prefix = "/artifacts/";
+          String suffix = "/verify";
+          if (!exchange.getRequestMethod().equals("GET")
+              || !path.startsWith(prefix)
+              || !path.endsWith(suffix)) {
+            sendJson(
+                exchange,
+                404,
+                Map.of("error", "Unknown artifact verification route."));
+            return;
+          }
+          String idText =
+              path.substring(prefix.length(), path.length() - suffix.length());
+          try {
+            long id = Long.parseLong(idText);
+            if (id <= 0) {
+              throw new IllegalArgumentException(
+                  "Artifact ID must be positive.");
+            }
+            FetchResult artifact = artifactStore.artifact(id);
+            FetchResult signature = artifactStore.signature(id);
+            if (artifact.state() != FetchState.FOUND
+                || signature.state() != FetchState.FOUND) {
+              sendJson(
+                  exchange,
+                  404,
+                  Map.of("error", "Artifact or signature is unavailable."));
+              return;
+            }
+            validateOnce(
+                tracer,
+                verifier,
+                verificationOptions,
+                id,
+                artifact.content(),
+                signature.content());
+            sendJson(
+                exchange,
+                200,
+                Map.of(
+                    "schemaVersion", 1,
+                    "resource", "java-client",
+                    "language", "java",
+                    "verified", true,
+                    "artifactId", id,
+                    "artifactSha256", sha256(artifact.content()),
+                    "bundleSha256", sha256(signature.content()),
+                    "generation", trustStatus.generation(),
+                    "generationId", trustStatus.generationId(),
+                    "trustedRootSha256", trustStatus.trustedRootSha256()));
+          } catch (Exception exception) {
+            sendJson(
+                exchange,
+                422,
+                Map.of(
+                    "error",
+                    Optional.ofNullable(exception.getMessage())
+                        .orElse(exception.getClass().getSimpleName())));
+          }
+        });
     server.start();
     return server;
+  }
+
+  private static void sendJson(
+      com.sun.net.httpserver.HttpExchange exchange,
+      int status,
+      Object value)
+      throws IOException {
+    byte[] body =
+        STATUS_GSON.toJson(value).getBytes(StandardCharsets.UTF_8);
+    exchange.getResponseHeaders().set("Content-Type", "application/json");
+    exchange.sendResponseHeaders(status, body.length);
+    exchange.getResponseBody().write(body);
+    exchange.close();
   }
 
   private static void sleep(Duration duration) {

@@ -108,6 +108,7 @@ func TestPublishTrustedRootAdvancesGenerationAndPreservesHistoricalMaterial(t *t
 	if activeGenID != "generation-00000002" {
 		t.Fatalf("active generation = %q, want generation-00000002", activeGenID)
 	}
+	assertGenerationManifestReadOnly(t, statePath, "generation-00000002")
 
 	// Prior generation directory must still exist.
 	if _, err := os.Stat(filepath.Join(statePath, "generations", "generation-00000001")); err != nil {
@@ -555,6 +556,10 @@ func TestCrossGenRejectsTamperedDomainInCommittedForward(t *testing.T) {
 	}
 	manifest.TrustDomainID = "tampered-domain-id"
 	tamperedBytes, _ := json.Marshal(manifest)
+	// Generation manifests are written read-only, so replace rather than reopen.
+	if err := os.Remove(gen2ManifestPath); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(gen2ManifestPath, tamperedBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -622,6 +627,10 @@ func TestCrossGenRejectsTamperedDomainInPreparingForward(t *testing.T) {
 	}
 	manifest.TrustDomainID = "tampered-domain-id"
 	tamperedBytes, _ := json.Marshal(manifest)
+	// Generation manifests are written read-only, so replace rather than reopen.
+	if err := os.Remove(gen2ManifestPath); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(gen2ManifestPath, tamperedBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -57,7 +57,7 @@ var shadyBlobStore = builder
     .WithExternalHttpEndpoints()
     .WithOtlpExporter(OtlpProtocol.Grpc);
 
-sigstore.WithRequiredResource(shadyBlobStore);
+sigstore.WithArtifactStore(shadyBlobStore);
 
 shadyBlobStore
     .WithEnvironment(
