@@ -764,8 +764,8 @@ internal sealed partial class SigstoreOperationExecutor
                     await execution.ReportAsync(
                         "restart-client",
                         14 + index,
-                        $"Restarting {client.Resource.Name} before Rekor " +
-                        "shard activation.");
+                        $"Restarting {client.Resource.Name} on the active " +
+                        "Rekor shard routing.");
                     var restart = await runtime.ExecuteCommandAsync(
                         client.Resource,
                         KnownResourceCommands.RestartCommand,
