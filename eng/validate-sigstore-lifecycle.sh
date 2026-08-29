@@ -344,7 +344,7 @@ assert_status "${final_status}" 7 2 8 true
 jq -e --arg trust_domain "${trust_domain}" '
   .disk.trustDomainId == $trust_domain
   and (.timestampAuthority.trustedAuthorities | length) == 2
-  and (.fulcio.trustedAuthorities | length) == 2
+  and (.fulcio.trustedRoots | length) == 2
   and .rekor.trustedRootTlogCount == 3
   and .ctLog.trustedRootCtlogCount == 2
   and (.recovery == null)
