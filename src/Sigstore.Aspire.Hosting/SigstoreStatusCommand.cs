@@ -2308,7 +2308,7 @@ internal static class SigstoreStatusCommand
             == second.CtLogBaseUrl
         && DictionariesEqual(first.Files, second.Files);
 
-    private static void ValidateFulcioRotationMetadata(
+    internal static void ValidateFulcioRotationMetadata(
         GenerationManifestStatus generation)
     {
         if (generation.FulcioRotationOperationId is null)
@@ -2327,8 +2327,8 @@ internal static class SigstoreStatusCommand
                 "N",
                 out _)
             || generation.FulcioRotationOperationId.Any(char.IsUpper)
-            || generation.FulcioPriorGeneration
-                != generation.Generation - 1
+            || generation.FulcioPriorGeneration < 1
+            || generation.FulcioPriorGeneration >= generation.Generation
             || generation.FulcioPriorGenerationId
                 != $"generation-{generation.FulcioPriorGeneration:D8}"
             || !IsLowerHexSha256(
@@ -2380,7 +2380,7 @@ internal static class SigstoreStatusCommand
         }
     }
 
-    private static void ValidateRekorRotationMetadata(
+    internal static void ValidateRekorRotationMetadata(
         GenerationManifestStatus generation)
     {
         if (generation.RekorRotationOperationId is null)
@@ -2404,8 +2404,8 @@ internal static class SigstoreStatusCommand
                 "N",
                 out _)
             || generation.RekorRotationOperationId.Any(char.IsUpper)
-            || generation.RekorPriorGeneration
-                != generation.Generation - 1
+            || generation.RekorPriorGeneration < 1
+            || generation.RekorPriorGeneration >= generation.Generation
             || generation.RekorPriorGenerationId
                 != $"generation-{generation.RekorPriorGeneration:D8}"
             || !IsLowerHexSha256(

@@ -222,6 +222,65 @@ public sealed class SigstoreStatusTests
     }
 
     [Fact]
+    public void RotationProvenanceRemainsValidAfterLaterGenerations()
+    {
+        var generation = JsonSerializer.Deserialize<GenerationManifestStatus>(
+            JsonSerializer.SerializeToUtf8Bytes(
+                new
+                {
+                    schemaVersion = 5,
+                    generation = 7,
+                    generationId = "generation-00000007",
+                    trustDomainId = "sha256-" + new string('a', 64),
+                    createdAtUtc = DateTimeOffset.UtcNow,
+                    sourceSchemaVersion = 5,
+                    fulcioRootSha256 = new string('b', 64),
+                    fulcioRotationOperationId =
+                        "11111111111111111111111111111111",
+                    fulcioPriorGeneration = 4,
+                    fulcioPriorGenerationId = "generation-00000004",
+                    fulcioPriorRootSha256 = new string('c', 64),
+                    ctLogPublicKeySha256 = new string('d', 64),
+                    rekorPublicKeySha256 = new string('e', 64),
+                    rekorRotationOperationId =
+                        "22222222222222222222222222222222",
+                    rekorPriorGeneration = 5,
+                    rekorPriorGenerationId = "generation-00000005",
+                    rekorPriorPublicKeySha256 = new string('f', 64),
+                    rekorPriorShardId = "sha256-" + new string('f', 64),
+                    rekorPriorBaseUrl =
+                        "http://rekor-sigstore.dev.localhost:3000",
+                    rekorShardId = "sha256-" + new string('e', 64),
+                    rekorBaseUrl =
+                        "http://rekor-secondary-sigstore.dev.localhost:3000",
+                    tsaRootSha256 = new string('1', 64),
+                    tsaLeafSha256 = new string('2', 64),
+                    oidcKeyId = "test-oidc-key",
+                    files = new SortedDictionary<string, string>(
+                        StringComparer.Ordinal)
+                }),
+            JsonOptions)!;
+
+        SigstoreStatusCommand.ValidateFulcioRotationMetadata(generation);
+        SigstoreStatusCommand.ValidateRekorRotationMetadata(generation);
+
+        Assert.Throws<SigstoreStatusException>(
+            () => SigstoreStatusCommand.ValidateFulcioRotationMetadata(
+                generation with
+                {
+                    FulcioPriorGeneration = generation.Generation,
+                    FulcioPriorGenerationId = generation.GenerationId
+                }));
+        Assert.Throws<SigstoreStatusException>(
+            () => SigstoreStatusCommand.ValidateRekorRotationMetadata(
+                generation with
+                {
+                    RekorPriorGeneration = generation.Generation,
+                    RekorPriorGenerationId = generation.GenerationId
+                }));
+    }
+
+    [Fact]
     public void TufSnapshotReportsAllRolesAndTrustFingerprints()
     {
         using var fixture = new TrustStatusFixture();
