@@ -2426,7 +2426,7 @@ internal static class SigstoreStatusCommand
         }
     }
 
-    private static void ValidateCtLogRotationMetadata(
+    internal static void ValidateCtLogRotationMetadata(
         GenerationManifestStatus generation)
     {
         if (generation.CtLogRotationOperationId is null)
@@ -2451,8 +2451,8 @@ internal static class SigstoreStatusCommand
                 "N",
                 out _)
             || generation.CtLogRotationOperationId.Any(char.IsUpper)
-            || generation.CtLogPriorGeneration
-                != generation.Generation - 1
+            || generation.CtLogPriorGeneration < 1
+            || generation.CtLogPriorGeneration >= generation.Generation
             || generation.CtLogPriorGenerationId
                 != $"generation-{generation.CtLogPriorGeneration:D8}"
             || !IsLowerHexSha256(

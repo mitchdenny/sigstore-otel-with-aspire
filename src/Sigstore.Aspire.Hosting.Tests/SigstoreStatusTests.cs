@@ -241,6 +241,17 @@ public sealed class SigstoreStatusTests
                     fulcioPriorGenerationId = "generation-00000004",
                     fulcioPriorRootSha256 = new string('c', 64),
                     ctLogPublicKeySha256 = new string('d', 64),
+                    ctLogRotationOperationId =
+                        "33333333333333333333333333333333",
+                    ctLogPriorGeneration = 3,
+                    ctLogPriorGenerationId = "generation-00000003",
+                    ctLogPriorPublicKeySha256 = new string('4', 64),
+                    ctLogPriorShardId = "sha256-" + new string('4', 64),
+                    ctLogPriorBaseUrl =
+                        "http://tesseract-sigstore.dev.localhost:6962",
+                    ctLogShardId = "sha256-" + new string('d', 64),
+                    ctLogBaseUrl =
+                        "http://tesseract-secondary-sigstore.dev.localhost:6963",
                     rekorPublicKeySha256 = new string('e', 64),
                     rekorRotationOperationId =
                         "22222222222222222222222222222222",
@@ -263,6 +274,7 @@ public sealed class SigstoreStatusTests
 
         SigstoreStatusCommand.ValidateFulcioRotationMetadata(generation);
         SigstoreStatusCommand.ValidateRekorRotationMetadata(generation);
+        SigstoreStatusCommand.ValidateCtLogRotationMetadata(generation);
 
         Assert.Throws<SigstoreStatusException>(
             () => SigstoreStatusCommand.ValidateFulcioRotationMetadata(
@@ -277,6 +289,13 @@ public sealed class SigstoreStatusTests
                 {
                     RekorPriorGeneration = generation.Generation,
                     RekorPriorGenerationId = generation.GenerationId
+                }));
+        Assert.Throws<SigstoreStatusException>(
+            () => SigstoreStatusCommand.ValidateCtLogRotationMetadata(
+                generation with
+                {
+                    CtLogPriorGeneration = generation.Generation,
+                    CtLogPriorGenerationId = generation.GenerationId
                 }));
     }
 
