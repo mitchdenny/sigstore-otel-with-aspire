@@ -524,6 +524,27 @@ public sealed class SigstoreStatusTests
             SigstoreOperationExecutor.IsReadyForCtLogFinalization(
                 status with
                 {
+                    Ready = true,
+                    Errors = [],
+                    Recovery = null,
+                    CtLog = null
+                },
+                operationId,
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status with
+                {
+                    Errors = [new("operation", "rotation active")],
+                    Recovery = null,
+                    CtLog = null
+                },
+                operationId,
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status with
+                {
                     Errors =
                     [
                         .. status.Errors,

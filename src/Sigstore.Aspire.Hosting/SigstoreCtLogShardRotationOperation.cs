@@ -1280,11 +1280,6 @@ internal sealed partial class SigstoreOperationExecutor
         string operationId,
         string operationStatus)
     {
-        if (IsReadyForActiveOperation(status))
-        {
-            return true;
-        }
-
         var ctLog = status.CtLog;
         return status.Operation is
             {

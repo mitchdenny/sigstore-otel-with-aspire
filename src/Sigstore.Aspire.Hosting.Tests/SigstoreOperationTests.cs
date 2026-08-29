@@ -1695,37 +1695,6 @@ public sealed class SigstoreOperationTests
         runtime.CtShardProofs.Enqueue(
             NewFulcioProof(fulcioRoot, secondaryCtKey, 3_000, 'd'));
         runtime.Statuses.Enqueue(NewAggregate(model, before));
-        runtime.Statuses.Enqueue(
-            NewAggregate(model, after) with
-            {
-                CtLog = new SigstoreCtLogStatus(
-                    $"sha256-{secondaryCtKey}",
-                    SigstoreCtLogShard.SecondarySlot,
-                    SigstoreCtLogShard.SecondaryOrigin,
-                    secondaryCtKey,
-                    false,
-                    null,
-                    2,
-                    [],
-                    [
-                        NewShardHealth(
-                            SigstoreCtLogShard.PrimarySlot,
-                            primaryCtKey,
-                            "historical",
-                            primaryCheckpoint,
-                            acceptedRootsSha256,
-                            acceptedFingerprints),
-                        NewShardHealth(
-                            SigstoreCtLogShard.SecondarySlot,
-                            secondaryCtKey,
-                            "active",
-                            secondaryCheckpoint,
-                            acceptedRootsSha256,
-                            acceptedFingerprints)
-                    ],
-                    null,
-                    null)
-            });
 
         var workerBefore = Exited("tuf-bootstrap", "worker-before", 0);
         runtime.SetSnapshotSequence(
@@ -1840,6 +1809,7 @@ public sealed class SigstoreOperationTests
             var createdAtUtc = request.RootElement
                 .GetProperty("candidateCreatedAtUtc")
                 .GetDateTimeOffset();
+            const string operationStatus = "new-shard-proved";
 
             var newGenerationPath = System.IO.Path.Combine(
                 generationsPath,
@@ -1905,6 +1875,58 @@ public sealed class SigstoreOperationTests
                 System.IO.Path.Combine(
                     statePath,
                     "rotate-ct-log-shard.request"));
+            runtime.Statuses.Enqueue(
+                NewAggregate(model, after) with
+                {
+                    Ready = false,
+                    State = "Degraded",
+                    Reason = "ctlog: recovery pending",
+                    Errors =
+                    [
+                        new("ctlog", "bound recovery pending"),
+                        new("operation", "rotation active")
+                    ],
+                    Operation = new(
+                        SigstoreOperationCommand.RotateCtLogShardCommand,
+                        "aggregate-status",
+                        25,
+                        26,
+                        "Finalizing CT log rotation.",
+                        DateTimeOffset.UtcNow),
+                    Recovery = new(
+                        SigstoreOperationCommand.RotateCtLogShardCommand,
+                        operationStatus,
+                        "Lifecycle Recovery Pending",
+                        "The durable journal is not finalized.",
+                        DateTimeOffset.UtcNow),
+                    CtLog = new SigstoreCtLogStatus(
+                        $"sha256-{secondaryCtKey}",
+                        SigstoreCtLogShard.SecondarySlot,
+                        SigstoreCtLogShard.SecondaryOrigin,
+                        secondaryCtKey,
+                        false,
+                        null,
+                        2,
+                        [],
+                        [
+                            NewShardHealth(
+                                SigstoreCtLogShard.PrimarySlot,
+                                primaryCtKey,
+                                "historical",
+                                primaryCheckpoint,
+                                acceptedRootsSha256,
+                                acceptedFingerprints),
+                            NewShardHealth(
+                                SigstoreCtLogShard.SecondarySlot,
+                                secondaryCtKey,
+                                "active",
+                                secondaryCheckpoint,
+                                acceptedRootsSha256,
+                                acceptedFingerprints)
+                        ],
+                        operationId,
+                        operationStatus)
+                });
         };
 
         var result = await NewExecutor(model, runtime, inspector)
