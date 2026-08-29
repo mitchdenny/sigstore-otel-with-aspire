@@ -287,6 +287,7 @@ public sealed class SigstoreOperationTests
                     schemaVersion = 2,
                     operationId,
                     trustDomainId = before.Trust.TrustDomainId,
+                    completedAtUtc = now,
                     priorGeneration = 1,
                     priorGenerationId = "generation-00000001",
                     priorOidcKeyId = oldKid,
@@ -301,6 +302,7 @@ public sealed class SigstoreOperationTests
                     {
                         $"private/oidc/retained/signer-{oldKid}.key"
                     },
+                    tokenLifetimeSeconds = 360,
                     overlapExpiresAtUtc = now.AddMinutes(6).ToString("O")
                 }));
             File.Delete(requestPath);
@@ -1035,16 +1037,16 @@ public sealed class SigstoreOperationTests
                 _ => throw new InvalidOperationException(command)
             };
             var output = ReadResult(result);
-
             Assert.False(result.Success);
+            Assert.False(result.Success);
+            var error = Assert.Single(output.Errors);
+            Assert.Equal(output.Phase, error.Phase);
+            Assert.Equal(model.Parent.Resource.Name, error.Resource);
+            Assert.Null(error.Postcondition);
             Assert.Contains(
-                output.Errors,
-                error => error.Message.Contains(
-                    "locked by another operation",
-                    StringComparison.Ordinal)
-                    && error.Message.Contains(
-                        "test-worker-holder",
-                        StringComparison.Ordinal));
+                "locked by another operation",
+                error.Message,
+                StringComparison.Ordinal);
             Assert.Empty(runtime.ExecutedCommands);
             Assert.Null(model.Parent.Resource.GetPresentation().Operation);
         }

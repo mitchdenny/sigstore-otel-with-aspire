@@ -13,16 +13,12 @@ started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 trap 'rm -rf "${work_dir}"' EXIT
 
 required_resources=(
-  sigstore-bootstrap
-  sigstore-state-ready
   oidc
   tesseract
   fulcio
   timestamp
   rekor-server
   rekor
-  tuf-bootstrap
-  tuf-state-ready
   tuf
   shady-blob-store
   dotnet-client
@@ -32,6 +28,17 @@ required_resources=(
   java-client
   rust-client
 )
+
+completed_resources=(
+  sigstore-bootstrap
+  sigstore-state-ready
+  tuf-bootstrap
+  tuf-state-ready
+)
+
+for resource in "${completed_resources[@]}"; do
+  aspire wait "${resource}" --status down --non-interactive >/dev/null
+done
 
 for resource in "${required_resources[@]}"; do
   aspire wait "${resource}" --non-interactive >/dev/null
@@ -64,7 +71,10 @@ assert_status() {
         if $ready then
           (.errors | length) == 0
           and all(.clients[]; .ready)
-          and all(.requiredResources[]; .ready)
+          and all(
+            .requiredResources[];
+            .state == "Running" and .health == "Healthy"
+          )
         else
           (.errors | length) > 0
         end
@@ -236,7 +246,10 @@ run_publish_with_contention() {
     >"${contention_output}" || true
   jq -e '
     .success == false
-    and .phase == "contention"
+    and (
+      .phase == "contention"
+      or .phase == "recovery-pending"
+    )
     and (.errors | length) == 1
   ' "${contention_output}" >/dev/null
   wait "${publish_pid}" || true

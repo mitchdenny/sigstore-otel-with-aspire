@@ -3154,11 +3154,14 @@ internal sealed partial class SigstoreOperationExecutor(
             || !IsLowerHexSha256(completion.ManifestSha256)
             || !IsLowerHexSha256(completion.JwksSha256)
             || string.IsNullOrWhiteSpace(completion.PublicationId)
+            || completion.CompletedAtUtc == default
+            || completion.TokenLifetimeSeconds <= 0
             || !DateTimeOffset.TryParse(
                 completion.OverlapExpiresAtUtc,
                 CultureInfo.InvariantCulture,
                 DateTimeStyles.AssumeUniversal,
-                out _))
+                out var overlapExpiresAtUtc)
+            || overlapExpiresAtUtc <= completion.CompletedAtUtc)
         {
             throw new InvalidDataException(
                 "The OIDC worker completion is invalid.");
@@ -6607,6 +6610,7 @@ internal sealed record OidcRotationWorkerCompletion(
     int SchemaVersion,
     string OperationId,
     string TrustDomainId,
+    DateTimeOffset CompletedAtUtc,
     int PriorGeneration,
     string PriorGenerationId,
     string PriorOidcKeyId,
@@ -6618,6 +6622,7 @@ internal sealed record OidcRotationWorkerCompletion(
     string JwksSha256,
     IReadOnlyList<string> JwksKeyIds,
     IReadOnlyList<string> RetainedKeyPaths,
+    int TokenLifetimeSeconds,
     string OverlapExpiresAtUtc);
 
 internal sealed record OidcTokenEvidence(

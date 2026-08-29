@@ -10,6 +10,50 @@ namespace Sigstore.Aspire.Hosting.Tests;
 public sealed class SigstoreRekorShardTests
 {
     [Fact]
+    public void PreflightAcceptsBoundAdditiveStandbyEntry()
+    {
+        var active = new string('a', 64);
+        var standby = new string('b', 64);
+
+        SigstoreOperationExecutor.ValidatePreflightTlogEntries(
+            active,
+            standby,
+            [
+                new(
+                    0,
+                    "http://rekor-sigstore.dev.localhost:3000",
+                    active),
+                new(
+                    1,
+                    "http://rekor-sigstore.dev.localhost:3000/standby",
+                    standby)
+            ]);
+    }
+
+    [Fact]
+    public void PreflightRejectsUnboundAdditionalEntry()
+    {
+        var active = new string('a', 64);
+        var standby = new string('b', 64);
+
+        Assert.Throws<InvalidDataException>(
+            () => SigstoreOperationExecutor
+                .ValidatePreflightTlogEntries(
+                    active,
+                    standby,
+                    [
+                        new(
+                            0,
+                            "http://rekor-sigstore.dev.localhost:3000",
+                            active),
+                        new(
+                            1,
+                            "http://rekor-sigstore.dev.localhost:3000/standby",
+                            new string('c', 64))
+                    ]));
+    }
+
+    [Fact]
     public void ReadTlogEntriesParsesAValidSingleShardTrustedRoot()
     {
         using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);

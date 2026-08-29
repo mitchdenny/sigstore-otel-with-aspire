@@ -976,19 +976,13 @@ internal sealed partial class SigstoreOperationExecutor
             resource.StatePath);
         var tlogEntries = SigstoreRekorShard.ReadTlogEntries(
             resource.StatePath);
-        if (!tlogEntries.Any(
-                entry => entry.PublicKeySha256 == active.PublicKeySha256))
-        {
-            throw new InvalidDataException(
-                "TrustedRoot does not contain the running Rekor shard.");
-        }
-        if (tlogEntries.Count != 1
-            || tlogEntries[0].BaseUrl != RekorPrimaryUrl)
-        {
-            throw new InvalidDataException(
-                "TrustedRoot Rekor routing does not match the canonical " +
-                "single-shard state.");
-        }
+        ValidatePreflightTlogEntries(
+            active.PublicKeySha256,
+            SigstoreStateBootstrapper.ValidateRekorStandbyPublicKey(
+                Path.Combine(
+                    resource.StatePath,
+                    "active-generation")),
+            tlogEntries);
 
         var fulcioStatus = await runtime.ReadFulcioStatusAsync(
             cancellationToken);
@@ -1053,6 +1047,32 @@ internal sealed partial class SigstoreOperationExecutor
             "generation or replay must complete before other trust " +
             "mutations.");
         return operation;
+    }
+
+    internal static void ValidatePreflightTlogEntries(
+        string activePublicKeySha256,
+        string? standbyPublicKeySha256,
+        IReadOnlyList<SigstoreRekorTlogEntry> entries)
+    {
+        var activeEntries = entries.Where(
+                entry => entry.PublicKeySha256 == activePublicKeySha256
+                    && entry.BaseUrl == RekorPrimaryUrl)
+            .ToArray();
+        var standbyEntries = entries.Where(
+                entry => standbyPublicKeySha256 is not null
+                    && entry.PublicKeySha256 == standbyPublicKeySha256
+                    && entry.BaseUrl == $"{RekorPrimaryUrl}/standby")
+            .ToArray();
+        var expectedStandbyCount =
+            standbyPublicKeySha256 is null ? 0 : 1;
+        if (activeEntries.Length != 1
+            || standbyEntries.Length != expectedStandbyCount
+            || entries.Count != 1 + expectedStandbyCount)
+        {
+            throw new InvalidDataException(
+                "TrustedRoot Rekor entries do not match the active shard and " +
+                "its optional additive standby verification key.");
+        }
     }
 
     /// <summary>

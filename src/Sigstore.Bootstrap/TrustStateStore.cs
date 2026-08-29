@@ -71,6 +71,8 @@ internal static partial class SigstoreStateBootstrapper
     private const string RuntimeFulcioPasswordFileName = "password";
     private const string RuntimeTesseractPrivateKeyFileName = "privkey.pem";
     private const string RuntimeAcceptedRootsFileName = "accepted-roots.pem";
+    private const string RekorStandbyPublicKeyPath =
+        "public/rekor/rekor-standby.pub";
 
     // The certificate-transparency selection Fulcio boots from is exactly
     // one atomically replaced manifest inside a stable, bind-mounted
@@ -1302,6 +1304,17 @@ internal static partial class SigstoreStateBootstrapper
                 generationPath,
                 RekorPrivateKeyPath,
                 RekorPublicKeyPath));
+        if (generation.Files.ContainsKey(RekorStandbyPublicKeyPath))
+        {
+            var standbyFingerprint = ValidateRekorStandbyPublicKey(
+                generationPath);
+            if (standbyFingerprint == generation.RekorPublicKeySha256)
+            {
+                throw new InvalidDataException(
+                    "The standby Rekor public key must differ from the active " +
+                    "Rekor public key.");
+            }
+        }
         if (generation.RekorRotationOperationId is not null)
         {
             var priorGenerationPath = Path.Combine(
@@ -1343,6 +1356,27 @@ internal static partial class SigstoreStateBootstrapper
             stateRootPath,
             "Rekor",
             "data/rekor");
+    }
+
+    internal static string? ValidateRekorStandbyPublicKey(
+        string generationPath)
+    {
+        var path = Resolve(
+            generationPath,
+            RekorStandbyPublicKeyPath);
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        using var standbyKey = LoadEcdsaKey(path);
+        if (standbyKey.KeySize != 256)
+        {
+            throw new InvalidDataException(
+                "The standby Rekor public key must use ECDSA P-256.");
+        }
+        return Fingerprint(
+            standbyKey.ExportSubjectPublicKeyInfo());
     }
 
     private static void ValidateGenerationDirectory(
@@ -1536,7 +1570,9 @@ internal static partial class SigstoreStateBootstrapper
         }
         foreach (var path in actual.Except(required, StringComparer.Ordinal))
         {
-            if (!IsRetainedOidcKeyPath(path))
+            if (!IsRetainedOidcKeyPath(path)
+                && (path != RekorStandbyPublicKeyPath
+                    || generation.Generation == InitialGeneration))
             {
                 throw new InvalidDataException(
                     $"The generation manifest contains unexpected file '{path}'.");
