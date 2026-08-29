@@ -35,6 +35,8 @@ internal static partial class SigstoreStateBootstrapper
         "data/rekor/bootstrap-state";
     private const string RekorSecondaryDataPath =
         "data/rekor-shards/secondary";
+    private const string CtLogSecondaryDataPath =
+        "data/ctlog-shards/secondary";
 
     private static readonly string[] LegacyRequiredStateFiles =
     [
@@ -81,6 +83,12 @@ internal static partial class SigstoreStateBootstrapper
         RekorPublicKeyPath
     ];
 
+    private static readonly string[] CtLogRotationCandidateFiles =
+    [
+        CtLogPrivateKeyPath,
+        CtLogPublicKeyPath
+    ];
+
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
         {
@@ -124,6 +132,8 @@ internal static partial class SigstoreStateBootstrapper
             options);
         Directory.CreateDirectory(
             Resolve(rootPath, RekorSecondaryDataPath));
+        Directory.CreateDirectory(
+            Resolve(rootPath, CtLogSecondaryDataPath));
         return result;
     }
 
@@ -670,6 +680,291 @@ internal static partial class SigstoreStateBootstrapper
         }
 
         return ValidateRekorRuntimeSigner(runtimePath);
+    }
+
+    /// <summary>
+    /// Deterministically materializes the certificate-transparency shard
+    /// rotation candidate at <paramref name="candidatePath"/>: a fresh,
+    /// isolated ECDSA P-256 signer that will belong exclusively to the new
+    /// secondary CT shard. Generation is atomic — material is produced in a
+    /// sibling staging directory, fully validated, and only then renamed into
+    /// place — and an already-present candidate is re-validated rather than
+    /// regenerated, which makes the operation idempotent under replay and
+    /// makes tampering a hard failure.
+    /// </summary>
+    internal static CtLogShardMaterialInfo
+        EnsureCtLogShardRotationCandidate(string candidatePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidatePath);
+        candidatePath = Path.GetFullPath(candidatePath);
+        var parentPath = Directory.GetParent(candidatePath)?.FullName
+            ?? throw new InvalidOperationException(
+                $"Cannot determine the parent directory for '{candidatePath}'.");
+        Directory.CreateDirectory(parentPath);
+
+        if (Directory.Exists(candidatePath))
+        {
+            ValidateCtLogRotationCandidateFileSet(candidatePath);
+            return ValidateCtLogShardMaterial(candidatePath);
+        }
+        if (File.Exists(candidatePath))
+        {
+            throw new InvalidDataException(
+                $"CT log rotation candidate '{candidatePath}' is not a " +
+                "directory.");
+        }
+
+        var stagingPath = candidatePath + ".staging";
+        if (Directory.Exists(stagingPath))
+        {
+            Directory.Delete(stagingPath, recursive: true);
+        }
+        else if (File.Exists(stagingPath))
+        {
+            throw new InvalidDataException(
+                $"CT log rotation staging path '{stagingPath}' is not a " +
+                "directory.");
+        }
+
+        try
+        {
+            Directory.CreateDirectory(stagingPath);
+            GenerateEcdsaKeyPair(
+                stagingPath,
+                CtLogPrivateKeyPath,
+                CtLogPublicKeyPath);
+            ValidateCtLogRotationCandidateFileSet(stagingPath);
+            _ = ValidateCtLogShardMaterial(stagingPath);
+            Directory.Move(stagingPath, candidatePath);
+        }
+        catch
+        {
+            if (Directory.Exists(stagingPath))
+            {
+                Directory.Delete(stagingPath, recursive: true);
+            }
+            throw;
+        }
+
+        ValidateCtLogRotationCandidateFileSet(candidatePath);
+        return ValidateCtLogShardMaterial(candidatePath);
+    }
+
+    /// <summary>
+    /// Stages the isolated secondary CT shard runtime projection at
+    /// <c>runtime/tesseract-secondary</c>: the candidate's private signer
+    /// plus a byte-identical copy of the accepted Fulcio root bundle the
+    /// historical primary shard already enforces, so the secondary shard
+    /// accepts exactly the same complete set of Fulcio certificate
+    /// authorities. The projection is written atomically and is never
+    /// rewritten once it exists; a mismatched existing projection is a hard
+    /// failure rather than being silently repaired.
+    /// </summary>
+    internal static CtLogShardRuntimeInfo StageCtLogShardRuntime(
+        string statePath,
+        string candidatePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidatePath);
+        candidatePath = Path.GetFullPath(candidatePath);
+        var expected = ValidateCtLogShardMaterial(candidatePath);
+        var rootPath = Path.GetFullPath(statePath);
+        var acceptedRootsPath = Path.Combine(
+            rootPath,
+            RuntimeDirectoryName,
+            RuntimeTesseractComponentName,
+            RuntimeAcceptedRootsFileName);
+        EnsureRegularFile(
+            acceptedRootsPath,
+            "accepted Fulcio roots");
+        var acceptedRoots = File.ReadAllBytes(acceptedRootsPath);
+        var privateKey = File.ReadAllText(
+            Resolve(candidatePath, CtLogPrivateKeyPath));
+        var runtimePath = Path.Combine(
+            rootPath,
+            RuntimeDirectoryName,
+            RuntimeTesseractSecondaryComponentName);
+
+        if (Directory.Exists(runtimePath))
+        {
+            var actual = ValidateCtLogRuntimeSigner(runtimePath);
+            if (actual != expected)
+            {
+                throw new InvalidDataException(
+                    "The staged secondary CT log signer does not match the " +
+                    "immutable rotation candidate.");
+            }
+            if (!File.ReadAllBytes(
+                    Path.Combine(
+                        runtimePath,
+                        RuntimeAcceptedRootsFileName))
+                .SequenceEqual(acceptedRoots))
+            {
+                throw new InvalidDataException(
+                    "The staged secondary CT log accepted-root bundle does " +
+                    "not match the primary shard bundle.");
+            }
+            return DescribeCtLogShardRuntime(runtimePath, actual);
+        }
+        if (File.Exists(runtimePath))
+        {
+            throw new InvalidDataException(
+                $"CT log runtime path '{runtimePath}' is not a directory.");
+        }
+
+        var stagingPath = runtimePath + ".staging";
+        if (Directory.Exists(stagingPath))
+        {
+            Directory.Delete(stagingPath, recursive: true);
+        }
+        else if (File.Exists(stagingPath))
+        {
+            throw new InvalidDataException(
+                $"CT log runtime staging path '{stagingPath}' is not a " +
+                "directory.");
+        }
+
+        try
+        {
+            Directory.CreateDirectory(stagingPath);
+            WriteFile(
+                Path.Combine(
+                    stagingPath,
+                    RuntimeTesseractPrivateKeyFileName),
+                privateKey,
+                isPrivate: true);
+            WriteRuntimeFile(
+                Path.Combine(
+                    stagingPath,
+                    RuntimeAcceptedRootsFileName),
+                acceptedRoots,
+                isPrivate: false);
+            var actual = ValidateCtLogRuntimeSigner(stagingPath);
+            if (actual != expected)
+            {
+                throw new InvalidDataException(
+                    "The staged secondary CT log signer changed during copy.");
+            }
+            Directory.Move(stagingPath, runtimePath);
+        }
+        catch
+        {
+            if (Directory.Exists(stagingPath))
+            {
+                Directory.Delete(stagingPath, recursive: true);
+            }
+            throw;
+        }
+
+        return DescribeCtLogShardRuntime(
+            runtimePath,
+            ValidateCtLogRuntimeSigner(runtimePath));
+    }
+
+    /// <summary>
+    /// Describes one certificate-transparency shard's least-privilege
+    /// runtime projection: its signer identity plus the validated identity
+    /// of the complete Fulcio root bundle it accepts. The bundle identity is
+    /// both its SHA-256 and its ordered per-root fingerprints, so a shard's
+    /// accepted trust can be bound durably in the shard catalog and any
+    /// added, removed or reordered root is detectable.
+    /// </summary>
+    internal static CtLogShardRuntimeInfo DescribeCtLogShardRuntime(
+        string runtimePath,
+        CtLogShardMaterialInfo signer)
+    {
+        var bundlePath = Path.Combine(
+            runtimePath,
+            RuntimeAcceptedRootsFileName);
+        var certificates = ReadAcceptedRootsBundle(bundlePath);
+        try
+        {
+            return new CtLogShardRuntimeInfo(
+                signer.PublicKeySha256,
+                signer.LogId,
+                signer.ShardId,
+                Fingerprint(File.ReadAllBytes(bundlePath)),
+                certificates
+                    .Select(certificate => Fingerprint(certificate.RawData))
+                    .ToArray());
+        }
+        finally
+        {
+            foreach (var certificate in certificates)
+            {
+                certificate.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates a certificate-transparency signer material tree — a
+    /// generation directory or a rotation candidate — and returns its
+    /// identity. The CT log ID is the SHA-256 fingerprint of the signer's
+    /// SubjectPublicKeyInfo, exactly the value Tesseract embeds in SCTs and
+    /// the Go worker publishes as the TrustedRoot <c>ctlogs</c> log ID.
+    /// </summary>
+    internal static CtLogShardMaterialInfo ValidateCtLogShardMaterial(
+        string rootPath)
+    {
+        var publicKeySha256 = ValidateEcdsaKeyPair(
+            rootPath,
+            CtLogPrivateKeyPath,
+            CtLogPublicKeyPath);
+        return new(
+            publicKeySha256,
+            publicKeySha256,
+            $"sha256-{publicKeySha256}");
+    }
+
+    /// <summary>
+    /// Validates the secondary CT shard runtime projection
+    /// (<c>runtime/tesseract-secondary</c>), which is deliberately
+    /// least-privilege: exactly the signer Tesseract needs plus the accepted
+    /// Fulcio root bundle, and never the public key or any other generation
+    /// material.
+    /// </summary>
+    internal static CtLogShardMaterialInfo ValidateCtLogRuntimeSigner(
+        string runtimePath)
+    {
+        EnsureOnlyEntries(
+            runtimePath,
+            RuntimeTesseractFileNames);
+        using var privateKey = LoadEcdsaKey(
+            Path.Combine(
+                runtimePath,
+                RuntimeTesseractPrivateKeyFileName));
+        if (privateKey.KeySize != 256)
+        {
+            throw new InvalidDataException(
+                "The CT log shard signer must use ECDSA P-256.");
+        }
+        var publicKeySha256 = Fingerprint(
+            privateKey.ExportSubjectPublicKeyInfo());
+        return new(
+            publicKeySha256,
+            publicKeySha256,
+            $"sha256-{publicKeySha256}");
+    }
+
+    private static void ValidateCtLogRotationCandidateFileSet(
+        string rootPath)
+    {
+        var actual = Directory.EnumerateFiles(
+                rootPath,
+                "*",
+                SearchOption.AllDirectories)
+            .Select(path => Path.GetRelativePath(rootPath, path)
+                .Replace(Path.DirectorySeparatorChar, '/'))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (!actual.SequenceEqual(
+                CtLogRotationCandidateFiles.Order(StringComparer.Ordinal),
+                StringComparer.Ordinal))
+        {
+            throw new InvalidDataException(
+                "The CT log rotation candidate has an unexpected file set.");
+        }
     }
 
     /// <summary>

@@ -584,6 +584,14 @@ func advanceTrustGeneration(statePath string, current bootstrapManifest) (bootst
 		RekorPriorBaseURL:         currentGenerationManifest.RekorPriorBaseURL,
 		RekorShardID:              currentGenerationManifest.RekorShardID,
 		RekorBaseURL:              currentGenerationManifest.RekorBaseURL,
+		CtLogRotationOperationID:  currentGenerationManifest.CtLogRotationOperationID,
+		CtLogPriorGeneration:      currentGenerationManifest.CtLogPriorGeneration,
+		CtLogPriorGenerationID:    currentGenerationManifest.CtLogPriorGenerationID,
+		CtLogPriorPublicKeySHA256: currentGenerationManifest.CtLogPriorPublicKeySHA256,
+		CtLogPriorShardID:         currentGenerationManifest.CtLogPriorShardID,
+		CtLogPriorBaseURL:         currentGenerationManifest.CtLogPriorBaseURL,
+		CtLogShardID:              currentGenerationManifest.CtLogShardID,
+		CtLogBaseURL:              currentGenerationManifest.CtLogBaseURL,
 
 		Files: newFiles,
 	}
@@ -685,6 +693,11 @@ func switchActiveGeneration(statePath string, current bootstrapManifest, newBoot
 		genManifest.RekorPublicKeySHA256 != current.RekorPublicKeySHA256:
 		operation = "rekor-shard-rotation"
 		transitionID = genManifest.RekorRotationOperationID
+	case genManifest.CtLogRotationOperationID != "" &&
+		genManifest.CtLogPriorGeneration == current.Generation &&
+		genManifest.CtLogPublicKeySHA256 != current.CtLogPublicKeySHA256:
+		operation = "ct-log-shard-rotation"
+		transitionID = genManifest.CtLogRotationOperationID
 	}
 	now := time.Now().UTC()
 	newJournal := trustTransitionJournal{

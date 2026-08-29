@@ -57,6 +57,7 @@ public sealed class SigstoreResource(
         _tufEndpoint = tufEndpoint;
         RegisterRequiredResource(components.Oidc.Resource);
         RegisterRequiredResource(components.Tesseract.Resource);
+        RegisterConditionalResource(components.TesseractSecondary.Resource);
         RegisterRequiredResource(components.Fulcio.Resource);
         RegisterRequiredResource(components.Timestamp.Resource);
         RegisterRequiredResource(components.RekorServer.Resource);

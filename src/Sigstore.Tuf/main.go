@@ -155,6 +155,16 @@ func main() {
 		return
 	}
 
+	ctRotationRequest := filepath.Join(statePath, ctRotationRequestFile)
+	if pathExists(ctRotationRequest) {
+		action, err := dispatchCtRotation(statePath)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		fmt.Printf("%s Sigstore TUF repository at %s.\n", action, filepath.Join(statePath, "tuf"))
+		return
+	}
+
 	rotationRequest := filepath.Join(statePath, "rotate-root.request")
 	if pathExists(rotationRequest) {
 		action, err := rotateTUFRootKey(statePath)

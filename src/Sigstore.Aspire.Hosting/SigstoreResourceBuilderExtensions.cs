@@ -49,6 +49,23 @@ public static class SigstoreResourceBuilderExtensions
             statePath,
             "runtime",
             "tesseract");
+        var secondaryTesseractRuntimePath = Path.Combine(
+            statePath,
+            "runtime",
+            "tesseract-secondary");
+        var fulcioCtRuntimePath = Path.Combine(
+            statePath,
+            "runtime",
+            "fulcio-ct");
+        var primaryCtLogDataPath = Path.Combine(
+            statePath,
+            "data",
+            "ctlog");
+        var secondaryCtLogDataPath = Path.Combine(
+            statePath,
+            "data",
+            "ctlog-shards",
+            "secondary");
 
         var parent = builder
             .AddResource(
@@ -159,6 +176,16 @@ public static class SigstoreResourceBuilderExtensions
                         context),
                 commandOptions:
                     SigstoreRekorShardRotationCommand.CreateOptions(
+                        parent.Resource))
+            .WithCommand(
+                name: SigstoreOperationCommand.RotateCtLogShardCommand,
+                displayName: "Rotate CT Log Shard",
+                executeCommand: context =>
+                    SigstoreCtLogShardRotationCommand.ExecuteAsync(
+                        parent.Resource,
+                        context),
+                commandOptions:
+                    SigstoreCtLogShardRotationCommand.CreateOptions(
                         parent.Resource))
             .OnInitializeResource(
                (resource, context, cancellationToken) =>
@@ -290,6 +317,48 @@ public static class SigstoreResourceBuilderExtensions
             "http",
             url => url.DisplayText = "Certificate transparency log");
 
+        // The bounded secondary certificate-transparency shard. It is a
+        // separate logical log with its own immutable signer, canonical
+        // origin, stable URL and isolated storage, and it never shares any
+        // state with the historical primary shard. It only starts when the
+        // rotation command explicitly starts it.
+        var tesseractSecondary = builder
+            .AddContainer(
+                "tesseract-secondary",
+                "ghcr.io/transparency-dev/tesseract/posix",
+                "v0.1.2")
+            .WithContainerRuntimeArgs("--user", "root")
+            .WithBindMount(
+                secondaryTesseractRuntimePath,
+                "/var/lib/sigstore/tesseract",
+                isReadOnly: true)
+            .WithBindMount(
+                secondaryCtLogDataPath,
+                "/var/lib/sigstore/data/ctlog")
+            .WithArgs(
+                "--private_key=/var/lib/sigstore/tesseract/privkey.pem",
+                "--origin=tesseract-secondary-sigstore.dev.localhost",
+                "--storage_dir=/var/lib/sigstore/data/ctlog",
+                "--roots_pem_file=/var/lib/sigstore/tesseract/accepted-roots.pem",
+                "--ext_key_usages=CodeSigning",
+                "--http_endpoint=0.0.0.0:6962",
+                "--slog_level=1")
+            .WithHttpEndpoint(
+                port: 6963,
+                targetPort: 6962,
+                name: "http")
+            .WithHttpHealthCheck(
+                "/healthz",
+                endpointName: "http")
+            .WithExternalHttpEndpoints()
+            .WithExplicitStart()
+            .WithParentRelationship(parent.Resource);
+
+        tesseractSecondary.WithUrlForEndpoint(
+            "http",
+            url => url.DisplayText =
+                "Certificate transparency log (secondary shard)");
+
         var fulcio = builder
             .AddDockerfile(
                 "fulcio",
@@ -304,12 +373,30 @@ public static class SigstoreResourceBuilderExtensions
                 "/var/lib/sigstore/fulcio",
                 isReadOnly: true)
             .WithBindMount(
+                fulcioCtRuntimePath,
+                "/var/lib/sigstore/fulcio-ct",
+                isReadOnly: true)
+            .WithBindMount(
                 Path.Combine(
                     sourcePath,
                     "Sigstore.Fulcio",
                     "config.yaml"),
                 "/etc/fulcio-config/config.yaml",
                 isReadOnly: true)
+            .WithEnvironment(
+                "SIGSTORE_CT_LOG_URL_PRIMARY",
+                tesseract.GetEndpoint(
+                    "http",
+                    KnownNetworkIdentifiers.DefaultAspireContainerNetwork))
+            // The secondary shard is explicit-start, so its endpoint is not
+            // allocated while Fulcio boots on the primary shard. Its
+            // container-network address is fully determined by its resource
+            // name and fixed target port, exactly like the Rekor gateway's
+            // secondary upstream, so it is supplied literally and only ever
+            // used once the promoted runtime selection names it.
+            .WithEnvironment(
+                "SIGSTORE_CT_LOG_URL_SECONDARY",
+                "http://tesseract-secondary:6962")
             .WithArgs(
                 "serve",
                 "--host=0.0.0.0",
@@ -320,12 +407,6 @@ public static class SigstoreResourceBuilderExtensions
                 "--fileca-cert=/var/lib/sigstore/fulcio/root.pem",
                 "--fileca-key=/var/lib/sigstore/fulcio/root.key",
                 "--fileca-watch=false",
-                "--ct-log-url",
-                tesseract.GetEndpoint(
-                    "http",
-                    KnownNetworkIdentifiers.DefaultAspireContainerNetwork),
-                "--ct-log-origin=tesseract-sigstore.dev.localhost",
-                "--ct-log-public-key-path=/var/lib/sigstore/fulcio/ctlog.pub",
                 "--config-path=/etc/fulcio-config/config.yaml")
             .WithDeveloperCertificateTrust(true)
             .WithHttpEndpoint(
@@ -572,6 +653,7 @@ public static class SigstoreResourceBuilderExtensions
                 stateReady,
                 oidc,
                 tesseract,
+                tesseractSecondary,
                 fulcio,
                 timestamp,
                 rekorServer,

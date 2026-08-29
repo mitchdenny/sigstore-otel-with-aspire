@@ -16,20 +16,23 @@ import (
 )
 
 const (
-	runtimeDirectory            = "runtime"
-	runtimeFulcioComponent      = "fulcio"
-	runtimeFulcioNextComponent  = "fulcio.next"
-	runtimeTesseractComponent   = "tesseract"
-	runtimeRekorComponent       = "rekor-secondary"
-	runtimeFulcioRootCertFile   = "root.pem"
-	runtimeFulcioRootKeyFile    = "root.key"
-	runtimeFulcioPasswordFile   = "password"
-	runtimeFulcioCtLogKeyFile   = "ctlog.pub"
-	runtimeTesseractKeyFile     = "privkey.pem"
-	runtimeAcceptedRootsFile    = "accepted-roots.pem"
-	ctLogPrivateKeyRelPath      = "private/ctlog/privkey.pem"
-	ctLogPublicKeyRelPath       = "public/ctlog/pubkey.pem"
-	runtimeProjectionFilePrefix = ".runtime-"
+	runtimeDirectory             = "runtime"
+	runtimeFulcioComponent       = "fulcio"
+	runtimeFulcioNextComponent   = "fulcio.next"
+	runtimeTesseractComponent    = "tesseract"
+	runtimeRekorComponent        = "rekor-secondary"
+	runtimeCtSecondaryComponent  = "tesseract-secondary"
+	runtimeFulcioCtComponent     = "fulcio-ct"
+	runtimeFulcioCtNextComponent = "fulcio-ct.next"
+	runtimeFulcioRootCertFile    = "root.pem"
+	runtimeFulcioRootKeyFile     = "root.key"
+	runtimeFulcioPasswordFile    = "password"
+	runtimeFulcioCtLogKeyFile    = "ctlog.pub"
+	runtimeTesseractKeyFile      = "privkey.pem"
+	runtimeAcceptedRootsFile     = "accepted-roots.pem"
+	ctLogPrivateKeyRelPath       = "private/ctlog/privkey.pem"
+	ctLogPublicKeyRelPath        = "public/ctlog/pubkey.pem"
+	runtimeProjectionFilePrefix  = ".runtime-"
 )
 
 // runtimeSource binds one fixed runtime projection file name to the
@@ -41,9 +44,10 @@ type runtimeSource struct {
 }
 
 // fulcioRuntimeSources describes the component-scoped Fulcio projection.
-// Fulcio needs its own CA material plus the CT log public key, because it
-// verifies SCTs against that key; exposing a public key here is safe and it
-// keeps the container's bind mount to a single stable directory.
+// It carries only the certificate-authority material Fulcio signs with; the
+// certificate-transparency key Fulcio verifies SCTs against lives in the
+// separate `fulcio-ct` component, because it identifies the CT shard Fulcio
+// is bound to rather than a property of the active generation.
 func fulcioRuntimeSources(generationPath string) []runtimeSource {
 	return []runtimeSource{
 		{
@@ -61,11 +65,6 @@ func fulcioRuntimeSources(generationPath string) []runtimeSource {
 			source: filepath.Join(generationPath, filepath.FromSlash(fulcioPasswordRelPath)),
 			mode:   0o600,
 		},
-		{
-			name:   runtimeFulcioCtLogKeyFile,
-			source: filepath.Join(generationPath, filepath.FromSlash(ctLogPublicKeyRelPath)),
-			mode:   0o644,
-		},
 	}
 }
 
@@ -80,6 +79,18 @@ func tesseractRuntimeSources(generationPath string) []runtimeSource {
 			mode:   0o600,
 		},
 	}
+}
+
+// ctServingGenerationPath resolves the generation whose CT signer the
+// historical primary Tesseract shard must keep serving. Before a CT shard
+// rotation that is the active generation; afterwards the primary shard is
+// append-only and immutable, so it keeps the CT prior generation's signer
+// forever while the active generation carries the secondary shard's signer.
+func ctServingGenerationPath(statePath string, manifest generationManifest) string {
+	if manifest.CtLogRotationOperationID == "" {
+		return generationPathFor(statePath, manifest.GenerationID)
+	}
+	return generationPathFor(statePath, manifest.CtLogPriorGenerationID)
 }
 
 func runtimeComponentPath(statePath, component string) string {
@@ -152,6 +163,10 @@ func ensureRuntimeBaselineProjection(statePath string) ([]byte, []string, error)
 	if err != nil {
 		return nil, nil, err
 	}
+	manifest, err := readOIDCGenerationManifest(statePath, bootstrap.GenerationID)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err := ensureRuntimeDirectories(
 		statePath,
 		runtimeFulcioComponent,
@@ -165,10 +180,73 @@ func ensureRuntimeBaselineProjection(statePath string) ([]byte, []string, error)
 	); err != nil {
 		return nil, nil, err
 	}
-	if err := writeTesseractRuntimeComponent(statePath, generationPath, bundle); err != nil {
+	if err := ensureFulcioCtBaselineProjection(statePath, manifest); err != nil {
+		return nil, nil, err
+	}
+	if err := writeTesseractRuntimeComponent(statePath, manifest, bundle); err != nil {
 		return nil, nil, err
 	}
 	return bundle, fingerprints, nil
+}
+
+// ensureFulcioCtBaselineProjection creates the certificate-transparency
+// configuration the running Fulcio binds to when it does not exist yet.
+// Only the baseline primary selection is ever written here; once a CT
+// shard rotation exists the projection is owned by the hosting command's
+// staged promotion and is never rewritten.
+func ensureFulcioCtBaselineProjection(
+	statePath string,
+	manifest generationManifest,
+) error {
+	componentPath := runtimeComponentPath(statePath, runtimeFulcioCtComponent)
+	if entries, err := os.ReadDir(componentPath); err == nil && len(entries) != 0 {
+		return nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect Fulcio certificate-transparency projection: %w", err)
+	}
+	if manifest.CtLogRotationOperationID != "" {
+		return errors.New(
+			"the active rotated generation is missing the Fulcio certificate-transparency projection",
+		)
+	}
+	if err := ensureRuntimeDirectories(statePath, runtimeFulcioCtComponent); err != nil {
+		return err
+	}
+	publicKey, err := os.ReadFile(filepath.Join(
+		ctServingGenerationPath(statePath, manifest),
+		filepath.FromSlash(ctLogPublicKeyRelPath),
+	))
+	if err != nil {
+		return fmt.Errorf("read CT log public key for runtime projection: %w", err)
+	}
+	if err := writeRuntimeProjectionFile(
+		filepath.Join(componentPath, ctRuntimePrimaryKeyFile),
+		publicKey,
+		0o644,
+	); err != nil {
+		return err
+	}
+	return writeRuntimeProjectionFile(
+		filepath.Join(componentPath, ctRuntimeSelectionFileName),
+		ctSelectionManifest("primary"),
+		0o644,
+	)
+}
+
+// ctSelectionManifest renders the single atomically replaced manifest that
+// binds selector, origin and key file name together, so promotion can never
+// be observed as a mixed configuration.
+func ctSelectionManifest(selector string) []byte {
+	origin, key, err := ctSelectionExpectations(selector)
+	if err != nil {
+		panic(err)
+	}
+	return []byte(strings.Join([]string{
+		ctRuntimeSelectionHeader,
+		selector,
+		origin,
+		key,
+	}, "\n") + "\n")
 }
 
 // ensureFulcioRotationRuntimeProjection is the projection step of a Fulcio CA
@@ -217,7 +295,14 @@ func ensureFulcioRotationRuntimeProjection(
 			return nil, nil, err
 		}
 	}
-	if err := writeTesseractRuntimeComponent(statePath, generationPath, bundle); err != nil {
+	rotationManifest, err := readOIDCGenerationManifest(statePath, bootstrap.GenerationID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := ensureFulcioCtBaselineProjection(statePath, rotationManifest); err != nil {
+		return nil, nil, err
+	}
+	if err := writeTesseractRuntimeComponent(statePath, rotationManifest, bundle); err != nil {
 		return nil, nil, err
 	}
 
@@ -249,23 +334,47 @@ func deriveAcceptedRootsBundle(
 	return bundle, fingerprints, nil
 }
 
+// writeTesseractRuntimeComponent projects the certificate-transparency
+// shard runtime material. The historical primary shard always keeps the CT
+// signer of the generation it was created with. Its accepted-root bundle is
+// only written while it is still the shard accepting submissions: once the
+// CT log has rotated, the primary shard is frozen and later Fulcio CA
+// rotations extend the active secondary shard's bundle instead, so the
+// active shard always accepts every published Fulcio root and the frozen
+// historical shard is never mutated.
 func writeTesseractRuntimeComponent(
 	statePath string,
-	generationPath string,
+	manifest generationManifest,
 	bundle []byte,
 ) error {
 	tesseractPath := runtimeComponentPath(statePath, runtimeTesseractComponent)
 	if err := writeRuntimeComponent(
 		tesseractPath,
-		tesseractRuntimeSources(generationPath),
+		tesseractRuntimeSources(ctServingGenerationPath(statePath, manifest)),
 	); err != nil {
 		return err
 	}
+	activePath := tesseractPath
+	if manifest.CtLogRotationOperationID != "" {
+		activePath = runtimeComponentPath(statePath, runtimeCtSecondaryComponent)
+		if err := requireRealDirectory(activePath); err != nil {
+			return fmt.Errorf("active secondary CT log runtime projection: %w", err)
+		}
+	}
 	return writeRuntimeProjectionFile(
-		filepath.Join(tesseractPath, runtimeAcceptedRootsFile),
+		filepath.Join(activePath, runtimeAcceptedRootsFile),
 		bundle,
 		0o644,
 	)
+}
+
+// activeCtRuntimeComponentPath resolves the runtime projection of the
+// certificate-transparency shard that is currently accepting submissions.
+func activeCtRuntimeComponentPath(statePath string, manifest generationManifest) string {
+	if manifest.CtLogRotationOperationID == "" {
+		return runtimeComponentPath(statePath, runtimeTesseractComponent)
+	}
+	return runtimeComponentPath(statePath, runtimeCtSecondaryComponent)
 }
 
 // validateFulcioRotationRuntimeProjection asserts the runtime projection is in
@@ -308,15 +417,30 @@ func validateFulcioRotationRuntimeProjection(
 		}
 	}
 
-	expectedRuntimeEntries := []string{runtimeFulcioComponent, runtimeTesseractComponent}
-	if bootstrap.RekorPublicKeySHA256 != "" {
-		manifest, err := readOIDCGenerationManifest(statePath, bootstrap.GenerationID)
-		if err != nil {
-			return err
-		}
-		if manifest.RekorRotationOperationID != "" {
-			expectedRuntimeEntries = append(expectedRuntimeEntries, runtimeRekorComponent)
-		}
+	manifest, err := readOIDCGenerationManifest(statePath, bootstrap.GenerationID)
+	if err != nil {
+		return err
+	}
+	expectedRuntimeEntries := []string{
+		runtimeFulcioComponent,
+		runtimeFulcioCtComponent,
+		runtimeTesseractComponent,
+	}
+	if manifest.RekorRotationOperationID != "" {
+		expectedRuntimeEntries = append(expectedRuntimeEntries, runtimeRekorComponent)
+	}
+	// The secondary CT shard signer and the staged Fulcio selection are
+	// legitimately present before the additive CT trust is committed, so
+	// their presence is tolerated rather than treated as a rotation.
+	if pathExists(runtimeComponentPath(statePath, runtimeCtSecondaryComponent)) {
+		expectedRuntimeEntries = append(
+			expectedRuntimeEntries,
+			runtimeCtSecondaryComponent,
+		)
+	} else if manifest.CtLogRotationOperationID != "" {
+		return errors.New(
+			"the active rotated generation is missing the secondary CT log runtime signer",
+		)
 	}
 	if pathExists(stagePath) {
 		expectedRuntimeEntries = append(expectedRuntimeEntries, runtimeFulcioNextComponent)
@@ -346,14 +470,14 @@ func validateFulcioRotationRuntimeProjection(
 	}
 	if err := runtimeComponentIsExact(
 		runtimeComponentPath(statePath, runtimeTesseractComponent),
-		tesseractRuntimeSources(activeGenerationPath),
+		tesseractRuntimeSources(ctServingGenerationPath(statePath, manifest)),
 		[]string{runtimeAcceptedRootsFile},
 	); err != nil {
 		return err
 	}
 
 	acceptedRootsPath := filepath.Join(
-		runtimeComponentPath(statePath, runtimeTesseractComponent),
+		activeCtRuntimeComponentPath(statePath, manifest),
 		runtimeAcceptedRootsFile,
 	)
 	acceptedRoots, err := os.ReadFile(acceptedRootsPath)
@@ -365,7 +489,41 @@ func validateFulcioRotationRuntimeProjection(
 			"the projected accepted Fulcio roots do not match the committed TrustedRoot",
 		)
 	}
-	return validateAcceptedRootsBundleBytes(acceptedRoots, bootstrap.FulcioRootSHA256)
+	if err := validateAcceptedRootsBundleBytes(
+		acceptedRoots,
+		bootstrap.FulcioRootSHA256,
+	); err != nil {
+		return err
+	}
+	if manifest.CtLogRotationOperationID == "" {
+		return nil
+	}
+	return validateFrozenAcceptedRootsBundle(
+		filepath.Join(
+			runtimeComponentPath(statePath, runtimeTesseractComponent),
+			runtimeAcceptedRootsFile,
+		),
+		acceptedRoots,
+	)
+}
+
+// validateFrozenAcceptedRootsBundle asserts the historical primary CT
+// shard's accepted-root bundle is still exactly the ordered prefix of the
+// active shard's bundle that existed when the shard stopped accepting
+// submissions. Any added, removed or reordered root is rejected.
+func validateFrozenAcceptedRootsBundle(frozenPath string, active []byte) error {
+	frozen, err := os.ReadFile(frozenPath)
+	if err != nil {
+		return fmt.Errorf("read frozen accepted Fulcio roots: %w", err)
+	}
+	if len(frozen) == 0 ||
+		len(frozen) > len(active) ||
+		!bytes.Equal(active[:len(frozen)], frozen) {
+		return errors.New(
+			"the frozen accepted Fulcio roots of the historical primary CT log shard are not the ordered prefix of the active shard bundle",
+		)
+	}
+	return nil
 }
 
 // validateAcceptedRootsBundleBytes independently re-parses an accepted-root

@@ -208,11 +208,14 @@ public sealed class FulcioCaRotationTests
         var runtimePath = Path.Combine(state, "runtime");
 
         Assert.Equal(
-            ["fulcio", "tesseract"],
+            ["fulcio", "fulcio-ct", "tesseract"],
             EntryNames(runtimePath));
         Assert.Equal(
-            ["ctlog.pub", "password", "root.key", "root.pem"],
+            ["password", "root.key", "root.pem"],
             EntryNames(Path.Combine(runtimePath, "fulcio")));
+        Assert.Equal(
+            ["primary.pub", "selection"],
+            EntryNames(Path.Combine(runtimePath, "fulcio-ct")));
         Assert.Equal(
             ["accepted-roots.pem", "privkey.pem"],
             EntryNames(Path.Combine(runtimePath, "tesseract")));
@@ -222,6 +225,17 @@ public sealed class FulcioCaRotationTests
         Assert.Null(
             new DirectoryInfo(Path.Combine(runtimePath, "tesseract"))
                 .LinkTarget);
+
+        AssertSameBytes(
+            Path.Combine(generationPath, "public", "ctlog", "pubkey.pem"),
+            Path.Combine(runtimePath, "fulcio-ct", "primary.pub"));
+        Assert.Equal(
+            "sigstore-fulcio-ct-selection/1\n"
+                + "primary\n"
+                + "tesseract-sigstore.dev.localhost\n"
+                + "primary.pub\n",
+            File.ReadAllText(
+                Path.Combine(runtimePath, "fulcio-ct", "selection")));
 
         AssertSameBytes(
             Path.Combine(generationPath, "public", "fulcio", "root.pem"),
@@ -682,7 +696,7 @@ public sealed class FulcioCaRotationTests
         Assert.False(
             Directory.Exists(Path.Combine(runtimePath, "fulcio.next")));
         Assert.Equal(
-            ["fulcio", "tesseract"],
+            ["fulcio", "fulcio-ct", "tesseract"],
             EntryNames(runtimePath));
         AssertSameBytes(
             Path.Combine(
@@ -1000,6 +1014,14 @@ public sealed class FulcioCaRotationTests
                 prior.RekorPriorBaseUrl,
                 prior.RekorShardId,
                 prior.RekorBaseUrl,
+                prior.CtLogRotationOperationId,
+                prior.CtLogPriorGeneration,
+                prior.CtLogPriorGenerationId,
+                prior.CtLogPriorPublicKeySha256,
+                prior.CtLogPriorShardId,
+                prior.CtLogPriorBaseUrl,
+                prior.CtLogShardId,
+                prior.CtLogBaseUrl,
                 CollectHashes(newGenerationPath));
             var manifestPath = Path.Combine(
                 newGenerationPath,
@@ -1044,8 +1066,7 @@ public sealed class FulcioCaRotationTests
             {
                 ("root.pem", "public/fulcio/root.pem"),
                 ("root.key", "private/fulcio/root.key"),
-                ("password", "private/fulcio/password"),
-                ("ctlog.pub", "public/ctlog/pubkey.pem")
+                ("password", "private/fulcio/password")
             })
             {
                 File.Copy(

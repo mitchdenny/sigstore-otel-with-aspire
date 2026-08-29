@@ -1015,6 +1015,10 @@ func newTestState(t *testing.T) string {
 
 	ctKey := newTestKey(t)
 	ctPEM := testPublicKeyPEM(t, ctKey)
+	ctDER, err := x509.MarshalPKIXPublicKey(&ctKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	writeTestFile(t, filepath.Join(generationPath, "public", "ctlog", "pubkey.pem"), ctPEM)
 	writeTestFile(
 		t,
@@ -1144,7 +1148,7 @@ func newTestState(t *testing.T) string {
 		SchemaVersion:        4,
 		CreatedAtUTC:         createdAt,
 		FulcioRootSHA256:     testHash(fulcioDER),
-		CtLogPublicKeySHA256: testHash(ctPEM),
+		CtLogPublicKeySHA256: testHash(ctDER),
 		RekorPublicKeySHA256: testHash(rekorDER),
 		TsaRootSHA256:        testHash(tsaRootDER),
 		TsaLeafSHA256:        testHash(tsaLeafDER),

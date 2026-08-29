@@ -97,8 +97,22 @@ internal sealed partial class SigstoreOperationExecutor
                 resource.Components.TufBootstrap.Resource);
             var fulcioBefore = runtime.GetRequiredSnapshot(
                 resource.Components.Fulcio.Resource);
-            var tesseractBefore = runtime.GetRequiredSnapshot(
-                resource.Components.Tesseract.Resource);
+            // A Fulcio CA rotation extends the accepted-root bundle of the
+            // certificate-transparency shard that is currently accepting
+            // submissions and restarts exactly that shard. Before a CT log
+            // shard rotation that is the primary shard; afterwards it is
+            // the secondary, and the historical primary stays frozen,
+            // running and never restarted so its append-only tiles remain
+            // verifiable.
+            if (!ValidateCtShardRotationSettled(execution))
+            {
+                return execution.Failure(
+                    "A certificate-transparency log shard rotation is in " +
+                    "flight; the Fulcio certificate authority cannot be " +
+                    "rotated until it completes.");
+            }
+            var ctShard = ResolveActiveCtShardResource();
+            var tesseractBefore = runtime.GetRequiredSnapshot(ctShard);
             if (!execution.Check(
                     "worker-restartable",
                     IsTerminal(workerBefore)
@@ -185,7 +199,7 @@ internal sealed partial class SigstoreOperationExecutor
                     || !SameInstance(
                         SnapshotFromJournal(
                             operation.TesseractResourceId,
-                            resource.Components.Tesseract.Resource.Name,
+                            ctShard.Name,
                             operation.TesseractContainerId,
                             operation.TesseractStartTimeUtc),
                         tesseractBefore))
@@ -507,9 +521,10 @@ internal sealed partial class SigstoreOperationExecutor
         await execution.ReportAsync(
             "restart-tesseract",
             15,
-            "Restarting Tesseract exactly once with old and new roots.");
-        var tesseractCurrent = runtime.GetRequiredSnapshot(
-            resource.Components.Tesseract.Resource);
+            "Restarting the active certificate-transparency shard exactly " +
+            "once with old and new roots.");
+        var activeCtShard = ResolveActiveCtShardResource();
+        var tesseractCurrent = runtime.GetRequiredSnapshot(activeCtShard);
         SigstoreResourceInstanceSnapshot tesseractAfter;
         if (operation.TesseractAfterContainerId is not null)
         {
@@ -529,7 +544,7 @@ internal sealed partial class SigstoreOperationExecutor
         {
             var originalTesseract = SnapshotFromJournal(
                 operation.TesseractResourceId,
-                resource.Components.Tesseract.Resource.Name,
+                activeCtShard.Name,
                 operation.TesseractContainerId,
                 operation.TesseractStartTimeUtc);
             if (IsNewInstance(
@@ -560,7 +575,7 @@ internal sealed partial class SigstoreOperationExecutor
             else
             {
                 var restart = await runtime.ExecuteCommandAsync(
-                    resource.Components.Tesseract.Resource,
+                    activeCtShard,
                     KnownResourceCommands.RestartCommand,
                     cancellationToken);
                 if (!restart.Success)
@@ -570,7 +585,7 @@ internal sealed partial class SigstoreOperationExecutor
                         ?? "Aspire rejected the Tesseract restart.");
                 }
                 tesseractAfter = await runtime.WaitForSnapshotAsync(
-                    resource.Components.Tesseract.Resource,
+                    activeCtShard,
                     snapshot => IsNewInstance(tesseractCurrent, snapshot)
                         && IsRunningHealthy(snapshot),
                     ClientTimeout,
@@ -1146,6 +1161,49 @@ internal sealed partial class SigstoreOperationExecutor
             .ToArray();
     }
 
+    /// <summary>
+    /// Resolves the certificate-transparency shard that currently accepts
+    /// submissions, which is the only shard a Fulcio certificate-authority
+    /// rotation may extend and restart. Before a CT log shard rotation it
+    /// is the historical primary shard; afterwards it is the bounded
+    /// secondary shard, and the primary stays frozen, running and required
+    /// so its append-only tiles and signed checkpoint remain verifiable.
+    /// </summary>
+    private IResource ResolveActiveCtShardResource() =>
+        SigstoreCtLogShard.HasRotatedCtLog(resource.StatePath)
+            ? resource.Components.TesseractSecondary.Resource
+            : resource.Components.Tesseract.Resource;
+
+    /// <summary>
+    /// Rejects a Fulcio certificate-authority rotation before any mutation
+    /// while a certificate-transparency log shard rotation is in flight: in
+    /// that window the shard that accepts submissions, the shard Fulcio is
+    /// bound to, and the accepted-root bundle that must be extended are all
+    /// still moving, so the operation would be ambiguous.
+    /// </summary>
+    private bool ValidateCtShardRotationSettled(
+        OperationExecution execution)
+    {
+        var incomplete = SigstoreCtLogShard.ReadRotationJournals(
+                resource.StatePath)
+            .Where(journal => journal.Status
+                != SigstoreCtLogShard.StatusCompleted)
+            .ToArray();
+        var selection =
+            SigstoreStateBootstrapper.ReadFulcioCtRuntimeProjection(
+                resource.StatePath);
+        return execution.Check(
+            "ct-log-shard-rotation-settled",
+            incomplete.Length == 0 && !selection.PromotionPending,
+            "no in-flight certificate-transparency shard rotation",
+            incomplete.Length != 0
+                ? $"rotation {incomplete[0].OperationId} is " +
+                    incomplete[0].Status
+                : "a promoted certificate-transparency selection is pending",
+            "preflight",
+            resource.Name);
+    }
+
     private IReadOnlyList<SigstoreResourceInstanceSnapshot>
         CaptureFulcioProtectedResources()
     {
@@ -1158,7 +1216,7 @@ internal sealed partial class SigstoreOperationExecutor
                     required.Name
                         != resource.Components.Fulcio.Resource.Name
                     && required.Name
-                        != resource.Components.Tesseract.Resource.Name
+                        != ResolveActiveCtShardResource().Name
                     && !clients.Contains(required.Name))
             .OrderBy(required => required.Name, StringComparer.Ordinal)
             .Select(

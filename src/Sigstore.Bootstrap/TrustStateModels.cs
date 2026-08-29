@@ -44,6 +44,14 @@ internal sealed record GenerationManifest(
     string? RekorPriorBaseUrl,
     string? RekorShardId,
     string? RekorBaseUrl,
+    string? CtLogRotationOperationId,
+    int CtLogPriorGeneration,
+    string? CtLogPriorGenerationId,
+    string? CtLogPriorPublicKeySha256,
+    string? CtLogPriorShardId,
+    string? CtLogPriorBaseUrl,
+    string? CtLogShardId,
+    string? CtLogBaseUrl,
     SortedDictionary<string, string> Files);
 
 internal sealed record GenerationReference(

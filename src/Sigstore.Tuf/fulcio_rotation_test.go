@@ -484,8 +484,22 @@ func TestFulcioRotationUpdatesRuntimeProjectionAndPreservesCtKey(t *testing.T) {
 	}
 
 	if got := runtimeEntryNames(t, statePath, runtimeFulcioComponent); strings.Join(got, ",") !=
-		"ctlog.pub,password,root.key,root.pem" {
+		"password,root.key,root.pem" {
 		t.Fatalf("runtime/fulcio entries = %v", got)
+	}
+	// The CT key Fulcio verifies SCTs with is a separate, promoted
+	// selection and a Fulcio CA rotation must never touch it.
+	if got := runtimeEntryNames(t, statePath, runtimeFulcioCtComponent); strings.Join(got, ",") !=
+		"primary.pub,selection" {
+		t.Fatalf("runtime/fulcio-ct entries = %v", got)
+	}
+	if got := string(runtimeFile(
+		t,
+		statePath,
+		runtimeFulcioCtComponent,
+		ctRuntimeSelectionFileName,
+	)); got != string(ctSelectionManifest("primary")) {
+		t.Fatalf("runtime/fulcio-ct selection = %q", got)
 	}
 	if got := runtimeEntryNames(t, statePath, runtimeTesseractComponent); strings.Join(got, ",") !=
 		"accepted-roots.pem,privkey.pem" {
@@ -504,7 +518,7 @@ func TestFulcioRotationUpdatesRuntimeProjectionAndPreservesCtKey(t *testing.T) {
 		t.Fatal("the worker activated the rotated Fulcio root before promotion")
 	}
 	if got := runtimeEntryNames(t, statePath, runtimeFulcioNextComponent); strings.Join(got, ",") !=
-		"ctlog.pub,password,root.key,root.pem" {
+		"password,root.key,root.pem" {
 		t.Fatalf("runtime/fulcio.next entries = %v", got)
 	}
 
@@ -521,7 +535,6 @@ func TestFulcioRotationUpdatesRuntimeProjectionAndPreservesCtKey(t *testing.T) {
 		{runtimeFulcioRootCertFile, fulcioRootCertRelPath},
 		{runtimeFulcioRootKeyFile, fulcioRootKeyRelPath},
 		{runtimeFulcioPasswordFile, fulcioPasswordRelPath},
-		{runtimeFulcioCtLogKeyFile, ctLogPublicKeyRelPath},
 	} {
 		if string(runtimeFile(t, statePath, runtimeFulcioNextComponent, projected.name)) !=
 			string(readTestFile(t, filepath.Join(
@@ -1405,7 +1418,7 @@ func TestFulcioRotationRepairsPartialRuntimeProjection(t *testing.T) {
 	}
 	assertFulcioRotationGeneration(t, statePath, 2, request.OperationID, 1)
 	if got := runtimeEntryNames(t, statePath, runtimeFulcioNextComponent); strings.Join(got, ",") !=
-		"ctlog.pub,password,root.key,root.pem" {
+		"password,root.key,root.pem" {
 		t.Fatalf("runtime/fulcio.next entries after repair = %v", got)
 	}
 	if string(runtimeFile(t, statePath, runtimeFulcioComponent, runtimeFulcioRootCertFile)) !=

@@ -127,7 +127,8 @@ public sealed record SigstoreAggregateTrustStatus(
     SigstoreActiveOperationStatus? Operation = null,
     SigstoreRecoveryStatus? Recovery = null,
     SigstoreFulcioStatus? Fulcio = null,
-    SigstoreRekorStatus? Rekor = null);
+    SigstoreRekorStatus? Rekor = null,
+    SigstoreCtLogStatus? CtLog = null);
 
 internal sealed record PublishedTrustStatus(
     int SchemaVersion,
@@ -177,6 +178,14 @@ internal sealed record GenerationManifestStatus(
     string? RekorPriorBaseUrl,
     string? RekorShardId,
     string? RekorBaseUrl,
+    string? CtLogRotationOperationId,
+    int CtLogPriorGeneration,
+    string? CtLogPriorGenerationId,
+    string? CtLogPriorPublicKeySha256,
+    string? CtLogPriorShardId,
+    string? CtLogPriorBaseUrl,
+    string? CtLogShardId,
+    string? CtLogBaseUrl,
     SortedDictionary<string, string> Files);
 
 internal sealed record TrustDomainManifestStatus(
@@ -219,6 +228,30 @@ internal sealed record TufManifestStatus(
     int SchemaVersion,
     string SourceFingerprint,
     SortedDictionary<string, string> Files);
+
+internal sealed record CtLogShardCatalogStatus(
+    int SchemaVersion,
+    string TrustDomainId,
+    string ActiveShardId,
+    DateTimeOffset UpdatedAtUtc,
+    IReadOnlyList<CtLogShardCatalogEntryStatus> Shards);
+
+internal sealed record CtLogShardCatalogEntryStatus(
+    string ShardId,
+    string Slot,
+    string BaseUrl,
+    string Origin,
+    string PublicKeySha256,
+    string LogIdSha256,
+    string StateId,
+    string DataPath,
+    string ResourceName,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset ActivatedAtUtc,
+    string Status,
+    string AcceptedRootsSha256,
+    int AcceptedRootCount,
+    IReadOnlyList<string> AcceptedRootFingerprints);
 
 internal sealed record RekorShardCatalogStatus(
     int SchemaVersion,
@@ -324,6 +357,7 @@ internal static class SigstoreStatusCommand
         SigstoreTimestampAuthorityStatus? timestampAuthority = null;
         SigstoreFulcioStatus? fulcio = null;
         SigstoreRekorStatus? rekor = null;
+        SigstoreCtLogStatus? ctLog = null;
 
         try
         {
@@ -530,6 +564,42 @@ internal static class SigstoreStatusCommand
             }
         }
 
+        if (disk is not null)
+        {
+            try
+            {
+                ctLog = await ReadCtLogStatusAsync(
+                    resource,
+                    cancellationToken);
+                foreach (var shard in ctLog.Shards)
+                {
+                    if (!shard.InTrustedRoot)
+                    {
+                        errors.Add(
+                            new(
+                                "ctlog",
+                                $"the {shard.Slot} certificate-transparency " +
+                                "shard is not published in TrustedRoot."));
+                    }
+                }
+                if (ctLog.FulcioCtPromotionPending)
+                {
+                    errors.Add(
+                        new(
+                            "ctlog",
+                            "certificate-transparency cutover is pending: " +
+                            "Fulcio is still bound to the " +
+                            $"{ctLog.SelectedFulcioShardSlot} shard while " +
+                            "a replacement selection is staged."));
+                }
+            }
+            catch (Exception exception)
+                when (IsExpectedStatusFailure(exception))
+            {
+                errors.Add(new("ctlog", exception.Message));
+            }
+        }
+
         if (runtime.State != "Healthy")
         {
             errors.Add(
@@ -572,6 +642,7 @@ internal static class SigstoreStatusCommand
             && timestampAuthority is not null
             && fulcio is not null
             && rekor is not null
+            && ctLog is not null
             && clients.Count == registrations.Clients.Count;
         var reason = errors.Count == 0
             ? null
@@ -610,7 +681,286 @@ internal static class SigstoreStatusCommand
                     recovery.Message,
                     recovery.UpdatedAtUtc),
             fulcio,
-            rekor);
+            rekor,
+            ctLog);
+    }
+
+    /// <summary>
+    /// Collects the certificate-transparency status: every logical shard
+    /// with its verified checkpoint and TrustedRoot membership, and the
+    /// shard the running Fulcio is currently bound to. The historical
+    /// primary shard's compute stays required forever, because its
+    /// append-only tiles and signed checkpoint must remain live for
+    /// certificates that were logged there.
+    /// </summary>
+    internal static async Task<SigstoreCtLogStatus> ReadCtLogStatusAsync(
+        SigstoreResource resource,
+        CancellationToken cancellationToken)
+    {
+        var statePath = resource.StatePath;
+        var generationLink = ReadRequiredLink(
+            Path.Combine(statePath, "active-generation"));
+        var activeGenerationPath = Path.Combine(statePath, generationLink);
+        var generation = DeserializeRequired<GenerationManifestStatus>(
+            ReadRequiredBytes(
+                Path.Combine(activeGenerationPath, "manifest.json")),
+            "active generation manifest");
+        var trustDomain = DeserializeRequired<TrustDomainManifestStatus>(
+            ReadRequiredBytes(Path.Combine(statePath, "trust-domain.json")),
+            "trust-domain manifest");
+
+        var catalogPath = SigstoreCtLogShard.ShardCatalogPath(statePath);
+        CtLogShardCatalogStatus catalog;
+        if (File.Exists(catalogPath))
+        {
+            catalog = DeserializeStrict<CtLogShardCatalogStatus>(
+                ReadRequiredBytes(catalogPath),
+                "CT shard catalog");
+        }
+        else
+        {
+            if (generation.CtLogRotationOperationId is not null)
+            {
+                throw new SigstoreStatusException(
+                    "The rotated CT log generation has no shard catalog.");
+            }
+            var primaryMaterial =
+                SigstoreStateBootstrapper.ValidateCtLogShardMaterial(
+                    Path.Combine(
+                        statePath,
+                        "generations",
+                        "generation-00000001"));
+            // Before any CT rotation the catalog is not materialized yet,
+            // so the single primary shard's accepted-root identity is read
+            // directly from the bundle its runtime projection enforces.
+            var primaryRuntimeRoots =
+                SigstoreCtLogShard.ReadRuntimeAcceptedRoots(
+                    statePath,
+                    SigstoreCtLogShard.PrimarySlot);
+            catalog = new CtLogShardCatalogStatus(
+                1,
+                trustDomain.TrustDomainId,
+                primaryMaterial.ShardId,
+                trustDomain.CreatedAtUtc,
+                [
+                    new CtLogShardCatalogEntryStatus(
+                        primaryMaterial.ShardId,
+                        "primary",
+                        SigstoreCtLogShard.PrimaryUrl,
+                        SigstoreCtLogShard.PrimaryOrigin,
+                        primaryMaterial.PublicKeySha256,
+                        primaryMaterial.LogId,
+                        trustDomain.CtLogStateId,
+                        SigstoreCtLogShard.PrimaryDataRelativePath,
+                        SigstoreCtLogShard.PrimaryResourceName,
+                        trustDomain.CreatedAtUtc,
+                        trustDomain.CreatedAtUtc,
+                        "active",
+                        primaryRuntimeRoots.BundleSha256,
+                        primaryRuntimeRoots.Fingerprints.Count,
+                        primaryRuntimeRoots.Fingerprints)
+                ]);
+        }
+        if (catalog.SchemaVersion != 1
+            || catalog.TrustDomainId != trustDomain.TrustDomainId
+            || catalog.Shards.Count is not (1 or 2)
+            || catalog.Shards[0].Slot != "primary"
+            || (catalog.Shards.Count == 2
+                && (catalog.Shards[1].Slot != "secondary"
+                    || catalog.Shards[0].Status != "historical"
+                    || catalog.Shards[1].Status != "active"
+                    || catalog.ActiveShardId != catalog.Shards[1].ShardId
+                    || generation.CtLogShardId != catalog.Shards[1].ShardId
+                    || generation.CtLogPriorShardId
+                        != catalog.Shards[0].ShardId)))
+        {
+            throw new SigstoreStatusException(
+                "The CT shard catalog does not agree with the active " +
+                "generation.");
+        }
+
+        var ctlogs = SigstoreCtLogShard.ReadCtlogEntries(
+            ReadRequiredBytes(
+                Path.Combine(
+                    statePath,
+                    "tuf",
+                    "active",
+                    "targets",
+                    "trusted_root.json")));
+        var selection =
+            SigstoreStateBootstrapper.ReadFulcioCtRuntimeProjection(
+                statePath);
+
+        var shards = new List<SigstoreCtLogShardHealthStatus>();
+        foreach (var shard in catalog.Shards)
+        {
+            var generationPath =
+                SigstoreCtLogShard.ResolveShardGenerationPath(
+                    statePath,
+                    shard.Slot,
+                    generation.CtLogPriorGenerationId);
+            var material =
+                SigstoreStateBootstrapper.ValidateCtLogShardMaterial(
+                    generationPath);
+            if (material.PublicKeySha256 != shard.PublicKeySha256
+                || material.LogId != shard.LogIdSha256
+                || material.ShardId != shard.ShardId)
+            {
+                throw new SigstoreStatusException(
+                    $"The {shard.Slot} CT log signer does not match its " +
+                    "shard catalog entry.");
+            }
+            var dataPath = Path.Combine(
+                statePath,
+                shard.DataPath.Replace(
+                    '/',
+                    Path.DirectorySeparatorChar));
+            var stateId = File.ReadAllText(
+                Path.Combine(dataPath, "bootstrap-state"));
+            if (stateId != shard.StateId)
+            {
+                throw new SigstoreStatusException(
+                    $"The {shard.Slot} CT log data does not match its shard " +
+                    "state ID.");
+            }
+            using var publicKey = SigstoreCtLogShard.ReadPublicKey(
+                generationPath);
+            var checkpoint = SigstoreCtLogShard.ReadAndVerifyCheckpoint(
+                ReadRequiredBytes(Path.Combine(dataPath, "checkpoint")),
+                shard.Origin,
+                publicKey);
+            var inTrustedRoot = ctlogs.Count(
+                entry => entry.BaseUrl == shard.BaseUrl
+                    && entry.PublicKeySha256 == shard.PublicKeySha256) == 1;
+
+            // Both shards keep running compute: the historical primary is
+            // append-only and must stay live so previously issued
+            // certificates remain auditable against it.
+            bool? computeHealthy = null;
+            var computeRequired = true;
+            if (shard.Slot == "primary"
+                || resource.IsConditionalResourceActive(
+                    resource.Components.TesseractSecondary.Resource.Name))
+            {
+                computeHealthy = await ProbeCtLogAsync(
+                    resource,
+                    shard.Slot,
+                    cancellationToken);
+            }
+            shards.Add(
+                new SigstoreCtLogShardHealthStatus(
+                    shard.ShardId,
+                    shard.Slot,
+                    shard.Status,
+                    shard.BaseUrl,
+                    shard.Origin,
+                    shard.ResourceName,
+                    shard.PublicKeySha256,
+                    shard.LogIdSha256,
+                    shard.StateId,
+                    checkpoint.TreeSize,
+                    checkpoint.Timestamp,
+                    checkpoint.RootHash,
+                    checkpoint.SignatureSha256,
+                    inTrustedRoot,
+                    computeRequired,
+                    computeHealthy,
+                    shard.AcceptedRootsSha256,
+                    shard.AcceptedRootCount,
+                    shard.AcceptedRootFingerprints,
+                    AcceptedRootsMatchRuntime(statePath, shard)));
+        }
+
+        var incomplete = SigstoreCtLogShard.ReadRotationJournals(statePath)
+            .Where(journal => journal.Status
+                != SigstoreCtLogShard.StatusCompleted)
+            .OrderByDescending(journal => journal.StartedAtUtc)
+            .FirstOrDefault();
+
+        return new SigstoreCtLogStatus(
+            catalog.ActiveShardId,
+            selection.Selector,
+            selection.Origin,
+            selection.CtLogPublicKeySha256,
+            selection.PromotionPending,
+            selection.StagedCtLogPublicKeySha256,
+            ctlogs.Count,
+            ctlogs,
+            shards,
+            incomplete?.OperationId,
+            incomplete?.Status);
+    }
+
+    /// <summary>
+    /// Binds one shard's recorded accepted-root identity to the bytes its
+    /// runtime projection enforces. The historical primary shard is frozen
+    /// at the cutover so it must render exactly what is recorded; the
+    /// secondary shard was created accepting that same complete bundle, so
+    /// its live bundle must still begin with it after later Fulcio CA
+    /// rotations extended it.
+    /// </summary>
+    private static bool AcceptedRootsMatchRuntime(
+        string statePath,
+        CtLogShardCatalogEntryStatus shard)
+    {
+        try
+        {
+            var frozen = SigstoreCtLogShard.ReadRuntimeAcceptedRoots(
+                statePath,
+                SigstoreCtLogShard.PrimarySlot);
+            if (shard.AcceptedRootsSha256 != frozen.BundleSha256
+                || shard.AcceptedRootCount != frozen.Fingerprints.Count
+                || !shard.AcceptedRootFingerprints.SequenceEqual(
+                    frozen.Fingerprints,
+                    StringComparer.Ordinal))
+            {
+                return false;
+            }
+            if (shard.Slot != SigstoreCtLogShard.SecondarySlot)
+            {
+                return true;
+            }
+            var live = SigstoreCtLogShard.ReadRuntimeAcceptedRoots(
+                statePath,
+                SigstoreCtLogShard.SecondarySlot);
+            return live.Bundle.Length >= frozen.Bundle.Length
+                && live.Bundle.AsSpan(0, frozen.Bundle.Length)
+                    .SequenceEqual(frozen.Bundle);
+        }
+        catch (Exception exception)
+            when (exception is IOException
+                or InvalidDataException
+                or System.Security.Cryptography.CryptographicException
+                or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task<bool> ProbeCtLogAsync(
+        SigstoreResource resource,
+        string slot,
+        CancellationToken cancellationToken)
+    {
+        var component = slot == "primary"
+            ? resource.Components.Tesseract
+            : resource.Components.TesseractSecondary;
+        var endpoint = await component
+            .GetEndpoint("http")
+            .GetValueAsync(cancellationToken)
+            ?? throw new SigstoreStatusException(
+                $"The {slot} certificate-transparency endpoint is not " +
+                "allocated.");
+        using var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(10)
+        };
+        using var response = await client.GetAsync(
+            new Uri(
+                EnsureTrailingSlash(new Uri(endpoint, UriKind.Absolute)),
+                "healthz"),
+            cancellationToken);
+        return response.IsSuccessStatusCode;
     }
 
     internal static async Task<SigstoreRekorStatus> ReadRekorStatusAsync(

@@ -41,7 +41,11 @@ public sealed record SigstoreFulcioStatus(
     string CtLogPublicKeySha256,
     string CtLogId,
     string CtLogStateId,
-    SigstoreCtCheckpoint Checkpoint);
+    SigstoreCtCheckpoint Checkpoint,
+    string CtLogShardSlot = "primary",
+    string CtLogOrigin = "tesseract-sigstore.dev.localhost",
+    bool CtLogPromotionPending = false,
+    string? StagedCtLogPublicKeySha256 = null);
 
 internal sealed record SigstoreFulcioIssuanceProof(
     string CertificateSha256,
@@ -88,7 +92,6 @@ internal static class SigstoreFulcio
             Path.Combine(activePath, "public", "fulcio", "root.pem"),
             Path.Combine(activePath, "private", "fulcio", "root.key"),
             Path.Combine(activePath, "private", "fulcio", "password"));
-        var runtimePath = Path.Combine(statePath, "runtime", "fulcio");
         var runtime =
             SigstoreStateBootstrapper.ReadFulcioRuntimeProjection(
                 statePath);
@@ -104,10 +107,17 @@ internal static class SigstoreFulcio
             cancellationToken);
 
         var trustedRoots = ReadTrustedRoots(statePath);
+        // The accepted-root bundle that governs issuance belongs to the
+        // certificate-transparency shard currently accepting submissions.
+        // Once the CT log has rotated that is the secondary shard: the
+        // historical primary shard is frozen with the bundle it had when it
+        // stopped accepting submissions.
         var acceptedRootsPath = Path.Combine(
             statePath,
             "runtime",
-            "tesseract",
+            SigstoreCtLogShard.HasRotatedCtLog(statePath)
+                ? "tesseract-secondary"
+                : "tesseract",
             "accepted-roots.pem");
         var acceptedBytes = File.ReadAllBytes(acceptedRootsPath);
         var acceptedCertificates = ReadCertificateBundle(acceptedBytes);
@@ -135,38 +145,69 @@ internal static class SigstoreFulcio
             }
         }
 
-        var ctPrivatePath = Path.Combine(
-            statePath,
-            "runtime",
-            "tesseract",
-            "privkey.pem");
-        var ctPublicPath = Path.Combine(
-            activePath,
-            "public",
-            "ctlog",
-            "pubkey.pem");
-        using var ctPrivateKey = LoadEcdsaPrivateKey(ctPrivatePath);
-        using var ctPublicKey = LoadEcdsaPublicKey(ctPublicPath);
-        EnsureKeysMatch(
-            "Tesseract runtime and active CT log keys",
-            ctPrivateKey,
-            ctPublicKey);
-        using var fulcioCtPublicKey = LoadEcdsaPublicKey(
-            Path.Combine(runtimePath, "ctlog.pub"));
-        EnsureKeysMatch(
-            "Fulcio runtime and active CT log keys",
-            fulcioCtPublicKey,
-            ctPublicKey);
-        var ctSpki = ctPublicKey.ExportSubjectPublicKeyInfo();
-        var checkpoint = ReadCheckpoint(
-            statePath,
-            ctPublicKey);
-        var ctStateId = File.ReadAllText(
+        // The certificate-transparency shard Fulcio is bound to is a
+        // durable runtime selection. Before a CT shard rotation it is the
+        // historical primary shard; afterwards, and only once the rotation
+        // promoted it, it is the bounded secondary shard. The historical
+        // primary shard's runtime signer is always the CT generation it
+        // was created with and is never re-projected.
+        var binding = SigstoreCtLogShard.ReadActiveGenerationBinding(
+            statePath);
+        var ctSelection =
+            SigstoreStateBootstrapper.ReadFulcioCtRuntimeProjection(
+                statePath);
+        var primaryGenerationPath = binding.CtLogPriorGenerationId is null
+            ? activePath
+            : Path.Combine(
+                statePath,
+                "generations",
+                binding.CtLogPriorGenerationId);
+        using var primaryCtPublicKey = LoadEcdsaPublicKey(
+            Path.Combine(
+                primaryGenerationPath,
+                "public",
+                "ctlog",
+                "pubkey.pem"));
+        using var primaryCtPrivateKey = LoadEcdsaPrivateKey(
             Path.Combine(
                 statePath,
-                "data",
+                "runtime",
+                "tesseract",
+                "privkey.pem"));
+        EnsureKeysMatch(
+            "Tesseract runtime and primary CT log shard keys",
+            primaryCtPrivateKey,
+            primaryCtPublicKey);
+
+        if (ctSelection.Selector == SigstoreCtLogShard.SecondarySlot
+            && binding.CtLogPriorGenerationId is null)
+        {
+            throw new InvalidDataException(
+                "Fulcio selects a secondary CT log shard that has not " +
+                "been published.");
+        }
+        var selected = ResolveSelectedCtShard(statePath);
+        using var ctPublicKey = LoadEcdsaPublicKey(
+            Path.Combine(
+                selected.MaterialPath,
+                "public",
                 "ctlog",
-                "bootstrap-state"));
+                "pubkey.pem"));
+        var ctSpki = ctPublicKey.ExportSubjectPublicKeyInfo();
+        if (ctSelection.CtLogPublicKeySha256 != Fingerprint(ctSpki)
+            || ctSelection.Origin != selected.Origin)
+        {
+            throw new InvalidDataException(
+                "The Fulcio certificate-transparency projection does not " +
+                "match the shard it selects.");
+        }
+        var checkpoint = SigstoreCtLogShard.ReadAndVerifyCheckpoint(
+            File.ReadAllBytes(
+                Path.Combine(selected.DataPath, "checkpoint")),
+            selected.Origin,
+            ctPublicKey);
+        var ctStateId = File.ReadAllText(
+            Path.Combine(selected.DataPath, "bootstrap-state"));
 
         foreach (var certificate in acceptedCertificates)
         {
@@ -191,7 +232,11 @@ internal static class SigstoreFulcio
             Fingerprint(ctSpki),
             Fingerprint(ctSpki),
             ctStateId,
-            checkpoint);
+            checkpoint,
+            ctSelection.Selector,
+            ctSelection.Origin,
+            ctSelection.PromotionPending,
+            ctSelection.StagedCtLogPublicKeySha256);
     }
 
     internal static IReadOnlyList<SigstoreFulcioTrustEntry>
@@ -388,13 +433,24 @@ internal static class SigstoreFulcio
 
     internal static SigstoreCtCheckpoint ReadCheckpoint(
         string statePath,
+        ECDsa ctPublicKey) =>
+        ReadCheckpoint(
+            ResolveSelectedCtShard(statePath),
+            ctPublicKey);
+
+    /// <summary>
+    /// Reads and verifies the signed checkpoint of one explicitly named
+    /// certificate-transparency shard. The shard is always explicit so a
+    /// checkpoint can never be verified against the wrong origin or signer
+    /// once more than one shard exists.
+    /// </summary>
+    internal static SigstoreCtCheckpoint ReadCheckpoint(
+        SelectedCtShard shard,
         ECDsa ctPublicKey)
     {
-        var path = Path.Combine(
-            statePath,
-            "data",
-            "ctlog",
-            "checkpoint");
+        ArgumentNullException.ThrowIfNull(shard);
+        ArgumentNullException.ThrowIfNull(ctPublicKey);
+        var path = Path.Combine(shard.DataPath, "checkpoint");
         var bytes = File.ReadAllBytes(path);
         if (bytes.Length is 0 or > MaximumPayloadBytes)
         {
@@ -406,7 +462,7 @@ internal static class SigstoreFulcio
             .Select(line => line.TrimEnd('\r'))
             .ToArray();
         if (lines.Length < 6
-            || lines[0] != CtOrigin
+            || lines[0] != shard.Origin
             || !ulong.TryParse(
                 lines[1],
                 System.Globalization.NumberStyles.None,
@@ -425,7 +481,7 @@ internal static class SigstoreFulcio
             throw new InvalidDataException(
                 "Tesseract checkpoint root hash is not SHA-256.");
         }
-        var signaturePrefix = $"\u2014 {CtOrigin} ";
+        var signaturePrefix = $"\u2014 {shard.Origin} ";
         if (!lines[4].StartsWith(
                 signaturePrefix,
                 StringComparison.Ordinal))
@@ -442,7 +498,7 @@ internal static class SigstoreFulcio
         }
         var spki = ctPublicKey.ExportSubjectPublicKeyInfo();
         var logId = SHA256.HashData(spki);
-        var origin = Encoding.UTF8.GetBytes(CtOrigin);
+        var origin = Encoding.UTF8.GetBytes(shard.Origin);
         var noteKeyHashInput = new byte[
             origin.Length + 2 + logId.Length];
         origin.CopyTo(noteKeyHashInput, 0);
@@ -483,7 +539,7 @@ internal static class SigstoreFulcio
         }
 
         return new SigstoreCtCheckpoint(
-            CtOrigin,
+            shard.Origin,
             treeSize,
             timestamp,
             Convert.ToHexString(rootHash).ToLowerInvariant(),
@@ -619,14 +675,61 @@ internal static class SigstoreFulcio
             $"Fulcio root {fingerprint} is not present in immutable history.");
     }
 
+    /// <summary>
+    /// Reads the certificate-transparency signer of the shard Fulcio is
+    /// currently bound to. Before a CT shard rotation that is the active
+    /// generation's key; afterwards it is whichever shard the promoted
+    /// runtime selection names, which is what SCTs must verify against.
+    /// </summary>
     internal static ECDsa ReadCtPublicKey(string statePath) =>
         LoadEcdsaPublicKey(
             Path.Combine(
-                statePath,
-                "active-generation",
+                ResolveSelectedCtShard(statePath).MaterialPath,
                 "public",
                 "ctlog",
                 "pubkey.pem"));
+
+    /// <summary>
+    /// Resolves the certificate-transparency shard Fulcio is bound to: the
+    /// generation directory that owns its signer, its origin, and the
+    /// storage directory that holds its checkpoint.
+    /// </summary>
+    internal static SelectedCtShard ResolveSelectedCtShard(
+        string statePath)
+    {
+        var selection =
+            SigstoreStateBootstrapper.ReadFulcioCtRuntimeProjection(
+                statePath);
+        var binding = SigstoreCtLogShard.ReadActiveGenerationBinding(
+            statePath);
+        if (selection.Selector == SigstoreCtLogShard.SecondarySlot)
+        {
+            return new SelectedCtShard(
+                Path.Combine(statePath, "active-generation"),
+                SigstoreCtLogShard.SecondaryOrigin,
+                Path.Combine(
+                    statePath,
+                    "data",
+                    "ctlog-shards",
+                    "secondary"),
+                SigstoreCtLogShard.SecondarySlot,
+                Path.Combine(
+                    statePath,
+                    "runtime",
+                    "tesseract-secondary"));
+        }
+        return new SelectedCtShard(
+            binding.CtLogPriorGenerationId is null
+                ? Path.Combine(statePath, "active-generation")
+                : Path.Combine(
+                    statePath,
+                    "generations",
+                    binding.CtLogPriorGenerationId),
+            CtOrigin,
+            Path.Combine(statePath, "data", "ctlog"),
+            SigstoreCtLogShard.PrimarySlot,
+            Path.Combine(statePath, "runtime", "tesseract"));
+    }
 
     internal static SigstoreEmbeddedSctProof
         ValidateCertificateForRoot(
@@ -1105,6 +1208,13 @@ internal static class SigstoreFulcio
         uri.AbsolutePath.EndsWith("/", StringComparison.Ordinal)
             ? uri
             : new Uri(uri.AbsoluteUri + "/", UriKind.Absolute);
+
+    internal sealed record SelectedCtShard(
+        string MaterialPath,
+        string Origin,
+        string DataPath,
+        string Slot,
+        string RuntimePath);
 
     private sealed record FulcioMaterial(
         string RootSha256,

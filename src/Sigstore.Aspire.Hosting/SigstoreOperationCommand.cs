@@ -24,6 +24,7 @@ internal static class SigstoreOperationCommand
         "rotate-timestamp-authority";
     public const string RotateFulcioCaCommand = "rotate-fulcio-ca";
     public const string RotateRekorShardCommand = "rotate-rekor-shard";
+    public const string RotateCtLogShardCommand = "rotate-ct-log-shard";
 
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
@@ -244,6 +245,19 @@ internal static class SigstoreOperationCommand
             && (presentation.Recovery is null
                 || presentation.Recovery.Command
                    == RotateRekorShardCommand)
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
+    internal static ResourceCommandState GetCtLogShardRotationCommandState(
+        SigstoreResource resource)
+    {
+        var presentation = resource.GetPresentation();
+        return presentation.Operation is null
+            && presentation.RuntimeHealth.State == "Healthy"
+            && (presentation.Recovery is null
+                || presentation.Recovery.Command
+                   == RotateCtLogShardCommand)
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
@@ -5537,6 +5551,43 @@ internal interface ISigstoreOperationRuntime
         CancellationToken cancellationToken) =>
         throw new NotSupportedException();
 
+    /// <summary>
+    /// Proves a real Fulcio issuance whose embedded SCT must verify
+    /// against the certificate-transparency signer of one specific shard,
+    /// identified by the generation or candidate material tree that owns
+    /// it. This is what makes an SCT source provable across a CT shard
+    /// rotation, where the active generation's CT key and the shard the
+    /// running Fulcio is bound to deliberately differ.
+    /// </summary>
+    Task<SigstoreFulcioIssuanceProof> ProveFulcioIssuanceForCtShardAsync(
+        string oidcToken,
+        string subject,
+        string expectedRootSha256,
+        string ctMaterialPath,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+
+    /// <summary>
+    /// Probes the certificate-transparency shard in one slot for liveness.
+    /// </summary>
+    Task ProbeCtLogShardHealthAsync(
+        string slot,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+
+    /// <summary>
+    /// Waits for a certificate-transparency shard to publish its first
+    /// signed checkpoint and verifies the note against the shard's own
+    /// origin and the signer in the supplied material tree, so trust is
+    /// only ever published for a log that has proven it can sign its own
+    /// tree head.
+    /// </summary>
+    Task<SigstoreCtCheckpoint> WaitForCtShardCheckpointAsync(
+        string slot,
+        string ctMaterialPath,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+
     Task<long> ReadArtifactHeadAsync(
         CancellationToken cancellationToken) =>
         throw new NotSupportedException();
@@ -5683,6 +5734,109 @@ internal sealed class AspireSigstoreOperationRuntime
             root,
             ctKey,
             cancellationToken);
+    }
+
+    public async Task<SigstoreFulcioIssuanceProof>
+        ProveFulcioIssuanceForCtShardAsync(
+            string oidcToken,
+            string subject,
+            string expectedRootSha256,
+            string ctMaterialPath,
+            CancellationToken cancellationToken)
+    {
+        var endpoint = await _resource.Components.Fulcio
+            .GetEndpoint("http")
+            .GetValueAsync(cancellationToken)
+            ?? throw new InvalidOperationException(
+                "The Fulcio endpoint is not allocated.");
+        using var root = SigstoreFulcio.ReadRootByFingerprint(
+            _resource.StatePath,
+            expectedRootSha256);
+        using var ctKey = SigstoreCtLogShard.ReadPublicKey(ctMaterialPath);
+        return await SigstoreFulcio.ProveIssuanceAsync(
+            new Uri(endpoint, UriKind.Absolute),
+            oidcToken,
+            subject,
+            root,
+            ctKey,
+            cancellationToken);
+    }
+
+    public async Task ProbeCtLogShardHealthAsync(
+        string slot,
+        CancellationToken cancellationToken)
+    {
+        var component = slot == SigstoreCtLogShard.SecondarySlot
+            ? _resource.Components.TesseractSecondary
+            : _resource.Components.Tesseract;
+        var endpoint = await component
+            .GetEndpoint("http")
+            .GetValueAsync(cancellationToken)
+            ?? throw new InvalidOperationException(
+                $"The {slot} CT log endpoint is not allocated.");
+        using var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(15)
+        };
+        using var response = await client.GetAsync(
+            new Uri(
+                new Uri(
+                    endpoint.EndsWith('/') ? endpoint : endpoint + "/",
+                    UriKind.Absolute),
+                "healthz"),
+            cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidDataException(
+                $"The {slot} CT log health route returned HTTP " +
+                $"{(int)response.StatusCode}.");
+        }
+    }
+
+    public async Task<SigstoreCtCheckpoint> WaitForCtShardCheckpointAsync(
+        string slot,
+        string ctMaterialPath,
+        CancellationToken cancellationToken)
+    {
+        var origin = slot == SigstoreCtLogShard.SecondarySlot
+            ? SigstoreCtLogShard.SecondaryOrigin
+            : SigstoreCtLogShard.PrimaryOrigin;
+        var checkpointPath = Path.Combine(
+            _resource.StatePath,
+            slot == SigstoreCtLogShard.SecondarySlot
+                ? Path.Combine("data", "ctlog-shards", "secondary")
+                : Path.Combine("data", "ctlog"),
+            "checkpoint");
+        using var key = SigstoreCtLogShard.ReadPublicKey(ctMaterialPath);
+        var deadline = DateTimeOffset.UtcNow.AddMinutes(3);
+        Exception? last = null;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (File.Exists(checkpointPath))
+            {
+                try
+                {
+                    return SigstoreCtLogShard.ReadAndVerifyCheckpoint(
+                        File.ReadAllBytes(checkpointPath),
+                        origin,
+                        key);
+                }
+                catch (Exception exception)
+                    when (exception is InvalidDataException
+                        or IOException
+                        or CryptographicException)
+                {
+                    last = exception;
+                }
+            }
+            await Task.Delay(
+                TimeSpan.FromSeconds(2),
+                cancellationToken);
+        }
+        throw new InvalidDataException(
+            $"Timed out waiting for a verifiable {slot} CT log " +
+            $"checkpoint: {last?.Message}");
     }
 
     public Task<SigstoreCtCheckpoint> ReadCtCheckpointAsync(
@@ -5858,6 +6012,40 @@ internal interface ISigstoreStateInspector
             operationId,
             priorFulcioRootSha256,
             newFulcioRootSha256);
+
+    CtLogShardMaterialInfo EnsureCtLogShardRotationCandidate(
+        string candidatePath) =>
+        SigstoreStateBootstrapper.EnsureCtLogShardRotationCandidate(
+            candidatePath);
+
+    CtLogShardRuntimeInfo StageCtLogShardRuntime(
+        string statePath,
+        string candidatePath) =>
+        SigstoreStateBootstrapper.StageCtLogShardRuntime(
+            statePath,
+            candidatePath);
+
+    FulcioCtRuntimeProjectionInfo StageFulcioCtRuntimeProjection(
+        string statePath,
+        string candidatePath) =>
+        SigstoreStateBootstrapper.StageFulcioCtRuntimeProjection(
+            statePath,
+            candidatePath);
+
+    /// <summary>
+    /// Atomically promotes the certificate-transparency selection manifest
+    /// so a restarted Fulcio binds to the bounded secondary shard.
+    /// </summary>
+    FulcioCtRuntimeProjectionInfo ActivateFulcioCtRuntimeProjection(
+        string statePath,
+        string operationId,
+        string priorCtLogPublicKeySha256,
+        string newCtLogPublicKeySha256) =>
+        SigstoreStateBootstrapper.ActivateFulcioCtRuntimeProjection(
+            statePath,
+            operationId,
+            priorCtLogPublicKeySha256,
+            newCtLogPublicKeySha256);
 }
 
 internal sealed class SigstoreFileStateInspector : ISigstoreStateInspector

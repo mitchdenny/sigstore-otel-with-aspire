@@ -32,11 +32,13 @@ internal static partial class SigstoreStateBootstrapper
     private const string TsaRotationOperation = "tsa-rotation";
     private const string FulcioRotationOperation = "fulcio-rotation";
     private const string RekorRotationOperation = "rekor-shard-rotation";
+    private const string CtLogRotationOperation = "ct-log-shard-rotation";
     private const string GenerationAdvanceOperation = "generation-advance";
     private const string OidcRotationDirectoryName = "oidc-rotation";
     private const string TsaRotationDirectoryName = "tsa-rotation";
     private const string FulcioRotationDirectoryName = "fulcio-rotation";
     private const string RekorRotationDirectoryName = "rekor-shard-rotation";
+    private const string CtLogRotationDirectoryName = "ct-log-shard-rotation";
     private const string OidcRotationCompletionFileName =
         "rotate-oidc-signing-key.completed";
     private const string TsaRotationCompletionFileName =
@@ -51,22 +53,64 @@ internal static partial class SigstoreStateBootstrapper
         "rotate-rekor-shard.completed";
     private const string RekorRotationRequestFileName =
         "rotate-rekor-shard.request";
+    private const string CtLogRotationCompletionFileName =
+        "rotate-ct-log-shard.completed";
+    private const string CtLogRotationRequestFileName =
+        "rotate-ct-log-shard.request";
     private const string RuntimeDirectoryName = "runtime";
     private const string RuntimeFulcioComponentName = "fulcio";
     private const string RuntimeFulcioStagedComponentName = "fulcio.next";
     private const string RuntimeTesseractComponentName = "tesseract";
+    private const string RuntimeTesseractSecondaryComponentName =
+        "tesseract-secondary";
+    private const string RuntimeFulcioCtComponentName = "fulcio-ct";
     private const string RuntimeRekorSecondaryComponentName =
         "rekor-secondary";
     private const string RuntimeFulcioRootCertificateFileName = "root.pem";
     private const string RuntimeFulcioRootKeyFileName = "root.key";
     private const string RuntimeFulcioPasswordFileName = "password";
-    private const string RuntimeFulcioCtLogPublicKeyFileName = "ctlog.pub";
     private const string RuntimeTesseractPrivateKeyFileName = "privkey.pem";
     private const string RuntimeAcceptedRootsFileName = "accepted-roots.pem";
 
+    // The certificate-transparency selection Fulcio boots from is exactly
+    // one atomically replaced manifest inside a stable, bind-mounted
+    // directory. The per-shard public keys beside it are immutable and
+    // additive — `primary.pub` is written once at bootstrap and
+    // `secondary.pub` is staged once by a rotation — so promotion can never
+    // observe a mixed selector/origin/key configuration: before the flip
+    // Fulcio is wholly primary, after it Fulcio is wholly secondary.
+    private const string RuntimeFulcioCtSelectionFileName = "selection";
+    private const string RuntimeFulcioCtPrimaryKeyFileName = "primary.pub";
+    private const string RuntimeFulcioCtSecondaryKeyFileName =
+        "secondary.pub";
+    private const string RuntimeFulcioCtSelectionHeader =
+        "sigstore-fulcio-ct-selection/1";
+    internal const string CtLogPrimarySlot = "primary";
+    internal const string CtLogSecondarySlot = "secondary";
+    internal const string CtLogPrimaryOrigin =
+        "tesseract-sigstore.dev.localhost";
+    internal const string CtLogSecondaryOrigin =
+        "tesseract-secondary-sigstore.dev.localhost";
+
+    private static readonly string[] RuntimeFulcioCtBaselineFileNames =
+    [
+        RuntimeFulcioCtPrimaryKeyFileName,
+        RuntimeFulcioCtSelectionFileName
+    ];
+
+    private static readonly string[] RuntimeFulcioCtStagedFileNames =
+    [
+        RuntimeFulcioCtPrimaryKeyFileName,
+        RuntimeFulcioCtSecondaryKeyFileName,
+        RuntimeFulcioCtSelectionFileName
+    ];
+
+    // The CT log public key deliberately lives in the separate
+    // `fulcio-ct` component: it identifies the certificate-transparency
+    // shard Fulcio is bound to, which is a promoted runtime selection
+    // rather than a property of the active generation's CA material.
     private static readonly string[] RuntimeFulcioFileNames =
     [
-        RuntimeFulcioCtLogPublicKeyFileName,
         RuntimeFulcioPasswordFileName,
         RuntimeFulcioRootKeyFileName,
         RuntimeFulcioRootCertificateFileName
@@ -108,6 +152,8 @@ internal static partial class SigstoreStateBootstrapper
         string RuntimeFulcio,
         string RuntimeFulcioStaged,
         string RuntimeTesseract,
+        string RuntimeTesseractSecondary,
+        string RuntimeFulcioCt,
         string RuntimeRekorSecondary);
 
     private static BootstrapResult EnsureTrustStateLocked(
@@ -691,6 +737,7 @@ internal static partial class SigstoreStateBootstrapper
             or TsaRotationOperation
             or FulcioRotationOperation
             or RekorRotationOperation
+            or CtLogRotationOperation
             or GenerationAdvanceOperation))
         {
             throw new InvalidDataException(
@@ -716,6 +763,7 @@ internal static partial class SigstoreStateBootstrapper
             or TsaRotationOperation
             or FulcioRotationOperation
             or RekorRotationOperation
+            or CtLogRotationOperation
             or GenerationAdvanceOperation)
         {
             if (journal.PriorGeneration is null)
@@ -1110,6 +1158,14 @@ internal static partial class SigstoreStateBootstrapper
             null,
             null,
             0,
+            null,
+            null,
+            null,
+            0,
+            null,
+            null,
+            null,
+            null,
             null,
             null,
             null,
@@ -1875,6 +1931,21 @@ internal static partial class SigstoreStateBootstrapper
         {
             allowed.Add(RekorRotationRequestFileName);
         }
+        if (Directory.Exists(
+                Path.Combine(layout.Root, CtLogRotationDirectoryName)))
+        {
+            allowed.Add(CtLogRotationDirectoryName);
+        }
+        if (File.Exists(
+                Path.Combine(layout.Root, CtLogRotationCompletionFileName)))
+        {
+            allowed.Add(CtLogRotationCompletionFileName);
+        }
+        if (File.Exists(
+                Path.Combine(layout.Root, CtLogRotationRequestFileName)))
+        {
+            allowed.Add(CtLogRotationRequestFileName);
+        }
         EnsureOnlyEntries(
             layout.Root,
             allowed);
@@ -1917,10 +1988,6 @@ internal static partial class SigstoreStateBootstrapper
             RuntimeFulcioPasswordFileName,
             Resolve(generationPath, FulcioPrivateKeyPasswordPath),
             true);
-        yield return (
-            RuntimeFulcioCtLogPublicKeyFileName,
-            Resolve(generationPath, CtLogPublicKeyPath),
-            false);
     }
 
     private static IEnumerable<(string Name, string Source, bool IsPrivate)>
@@ -2105,13 +2172,15 @@ internal static partial class SigstoreStateBootstrapper
             Path.Combine(
                 layout.RuntimeFulcio,
                 RuntimeFulcioRootCertificateFileName));
-        using var ctLogPublicKey = LoadEcdsaKey(
-            Path.Combine(
-                layout.RuntimeFulcio,
-                RuntimeFulcioCtLogPublicKeyFileName));
+        var ctSelection = CreateFulcioCtRuntimeProjectionInfo(layout);
 
+        // The accepted-root bundle Fulcio's issuance depends on belongs to
+        // the certificate-transparency shard that is currently accepting
+        // submissions, which after a CT shard rotation is the secondary.
         var acceptedRootsPath = Path.Combine(
-            layout.RuntimeTesseract,
+            generation.CtLogRotationOperationId is null
+                ? layout.RuntimeTesseract
+                : layout.RuntimeTesseractSecondary,
             RuntimeAcceptedRootsFileName);
         var acceptedRoots = ReadAcceptedRootsBundle(acceptedRootsPath);
         return new FulcioRuntimeProjectionInfo(
@@ -2120,7 +2189,7 @@ internal static partial class SigstoreStateBootstrapper
             serving.SubjectDistinguishedName,
             serving.NotBeforeUtc,
             serving.NotAfterUtc,
-            Fingerprint(ctLogPublicKey.ExportSubjectPublicKeyInfo()),
+            ctSelection.CtLogPublicKeySha256,
             PathExists(layout.RuntimeFulcioStaged)
                 ? generation.FulcioRootSha256
                 : null,
@@ -2192,7 +2261,6 @@ internal static partial class SigstoreStateBootstrapper
             RuntimeFulcioRootCertificateFileName => FulcioRootCertificatePath,
             RuntimeFulcioRootKeyFileName => FulcioPrivateKeyPath,
             RuntimeFulcioPasswordFileName => FulcioPrivateKeyPasswordPath,
-            RuntimeFulcioCtLogPublicKeyFileName => CtLogPublicKeyPath,
             _ => throw new InvalidOperationException(
                 $"Unknown Fulcio runtime projection file '{name}'.")
         };
@@ -2233,6 +2301,7 @@ internal static partial class SigstoreStateBootstrapper
         {
             layout.Runtime,
             layout.RuntimeFulcio,
+            layout.RuntimeFulcioCt,
             layout.RuntimeTesseract
         };
         if (includeStaged)
@@ -2287,7 +2356,7 @@ internal static partial class SigstoreStateBootstrapper
             }
         }
         foreach (var (name, source, isPrivate) in TesseractRuntimeSources(
-            generationPath))
+            ResolveCtServingGenerationPath(layout, generationPath, generation)))
         {
             WriteRuntimeFile(
                 Path.Combine(layout.RuntimeTesseract, name),
@@ -2309,11 +2378,124 @@ internal static partial class SigstoreStateBootstrapper
                 isPrivate: false);
         }
 
+        EnsureFulcioCtBaselineProjection(
+            layout,
+            generationPath,
+            generation);
+
         ValidateRuntimeProjection(
             layout,
             generationPath,
             generation);
     }
+
+    /// <summary>
+    /// Creates the certificate-transparency configuration
+    /// <c>runtime/fulcio-ct</c> that the running Fulcio is bound to when it
+    /// does not exist yet: the immutable primary shard key beside a
+    /// selection manifest that names the primary slot. This is the only
+    /// place the baseline selection is written; once a CT shard rotation
+    /// exists the selection is owned by the rotation command's atomic
+    /// promotion and is never rewritten here.
+    /// </summary>
+    private static void EnsureFulcioCtBaselineProjection(
+        TrustStateLayout layout,
+        string generationPath,
+        GenerationManifest generation)
+    {
+        if (Directory.EnumerateFileSystemEntries(layout.RuntimeFulcioCt)
+            .Any())
+        {
+            return;
+        }
+        if (generation.CtLogRotationOperationId is not null)
+        {
+            throw new InvalidDataException(
+                "The active rotated generation is missing the Fulcio " +
+                "certificate-transparency runtime projection.");
+        }
+        Directory.CreateDirectory(layout.RuntimeFulcioCt);
+        WriteFulcioCtShardKey(
+            layout.RuntimeFulcioCt,
+            RuntimeFulcioCtPrimaryKeyFileName,
+            File.ReadAllBytes(
+                Resolve(generationPath, CtLogPublicKeyPath)));
+        WriteFulcioCtSelection(
+            layout.RuntimeFulcioCt,
+            CtLogPrimarySlot);
+    }
+
+    /// <summary>
+    /// Writes one immutable, additive per-shard certificate-transparency
+    /// public key into the stable projection directory. The file is never
+    /// replaced: a mismatched existing key is a hard failure, so a promoted
+    /// selection can only ever resolve to the key it was staged against.
+    /// </summary>
+    private static void WriteFulcioCtShardKey(
+        string componentPath,
+        string name,
+        byte[] publicKey)
+    {
+        var path = Path.Combine(componentPath, name);
+        if (PathExists(path))
+        {
+            EnsureRegularFile(path, "runtime projection");
+            if (!File.ReadAllBytes(path).SequenceEqual(publicKey))
+            {
+                throw new InvalidDataException(
+                    $"Fulcio certificate-transparency key '{path}' is " +
+                    "immutable and does not match the shard it names.");
+            }
+            SetRuntimeFileMode(path, isPrivate: false);
+            return;
+        }
+        WriteRuntimeFile(path, publicKey, isPrivate: false);
+    }
+
+    /// <summary>
+    /// Atomically replaces the single certificate-transparency selection
+    /// manifest. Selector, origin and key file name travel together in one
+    /// rename, so a crash at any point leaves Fulcio wholly bound to one
+    /// shard: the manifest either still names the primary shard or already
+    /// names the secondary shard, never a mixture of the two.
+    /// </summary>
+    private static void WriteFulcioCtSelection(
+        string componentPath,
+        string selector)
+    {
+        WriteRuntimeFile(
+            Path.Combine(
+                componentPath,
+                RuntimeFulcioCtSelectionFileName),
+            Encoding.UTF8.GetBytes(
+                string.Join(
+                    '\n',
+                    RuntimeFulcioCtSelectionHeader,
+                    selector,
+                    CtSelectionOrigin(selector),
+                    CtSelectionKeyFileName(selector)) + "\n"),
+            isPrivate: false);
+    }
+
+    private static string CtSelectionOrigin(string selector) =>
+        selector switch
+        {
+            CtLogPrimarySlot => CtLogPrimaryOrigin,
+            CtLogSecondarySlot => CtLogSecondaryOrigin,
+            _ => throw new InvalidDataException(
+                $"Fulcio certificate-transparency selector '{selector}' " +
+                "is invalid.")
+        };
+
+    private static string CtSelectionKeyFileName(string selector) =>
+        selector switch
+        {
+            CtLogPrimarySlot => RuntimeFulcioCtPrimaryKeyFileName,
+            CtLogSecondarySlot => RuntimeFulcioCtSecondaryKeyFileName,
+            _ => throw new InvalidDataException(
+                $"Fulcio certificate-transparency selector '{selector}' " +
+                "is invalid.")
+        };
 
     private static bool IsFulcioPromotionPending(
         TrustStateLayout layout,
@@ -2375,8 +2557,44 @@ internal static partial class SigstoreStateBootstrapper
         var allowedRuntimeEntries = new List<string>
         {
             RuntimeFulcioComponentName,
+            RuntimeFulcioCtComponentName,
             RuntimeTesseractComponentName
         };
+        var ctServingGenerationPath = ResolveCtServingGenerationPath(
+            layout,
+            generationPath,
+            generation);
+        var secondaryCtRuntimeExists = PathExists(
+            layout.RuntimeTesseractSecondary);
+        if (secondaryCtRuntimeExists)
+        {
+            // The secondary shard signer is legitimately staged before the
+            // additive trust is committed, so its presence alone is not a
+            // rotation; it is only bound to a generation once one exists.
+            allowedRuntimeEntries.Add(
+                RuntimeTesseractSecondaryComponentName);
+            var runtimeCtLog = ValidateCtLogRuntimeSigner(
+                layout.RuntimeTesseractSecondary);
+            if (generation.CtLogRotationOperationId is not null
+                && runtimeCtLog.PublicKeySha256
+                    != generation.CtLogPublicKeySha256)
+            {
+                throw new InvalidDataException(
+                    "The secondary CT log runtime signer does not match the " +
+                    "active rotated generation.");
+            }
+        }
+        else if (generation.CtLogRotationOperationId is not null)
+        {
+            throw new InvalidDataException(
+                "The active rotated generation is missing the secondary " +
+                "CT log runtime signer.");
+        }
+        _ = ValidateFulcioCtRuntimeProjection(
+            layout,
+            generationPath,
+            ctServingGenerationPath,
+            generation);
         var secondaryRekorRuntimeExists = PathExists(
             layout.RuntimeRekorSecondary);
         if (secondaryRekorRuntimeExists)
@@ -2426,7 +2644,7 @@ internal static partial class SigstoreStateBootstrapper
             layout.RuntimeTesseract,
             RuntimeTesseractFileNames);
         foreach (var (name, source, _) in TesseractRuntimeSources(
-            generationPath))
+            ctServingGenerationPath))
         {
             var projectedPath = Path.Combine(layout.RuntimeTesseract, name);
             EnsureRegularFile(
@@ -2437,17 +2655,439 @@ internal static partial class SigstoreStateBootstrapper
             {
                 throw new InvalidDataException(
                     $"Runtime projection '{projectedPath}' does not match " +
-                    "the active generation.");
+                    "the certificate-transparency shard it serves.");
             }
         }
+        if (secondaryCtRuntimeExists
+            && generation.CtLogRotationOperationId is null
+            && !File.ReadAllBytes(
+                    Path.Combine(
+                        layout.RuntimeTesseractSecondary,
+                        RuntimeAcceptedRootsFileName))
+                .SequenceEqual(
+                    File.ReadAllBytes(
+                        Path.Combine(
+                            layout.RuntimeTesseract,
+                            RuntimeAcceptedRootsFileName))))
+        {
+            // Before the rotation is published the secondary shard is being
+            // created, so it must accept byte-for-byte exactly the complete
+            // Fulcio root bundle the primary shard already accepts.
+            throw new InvalidDataException(
+                "The secondary CT log shard does not accept exactly the " +
+                "Fulcio roots the historical primary shard accepts.");
+        }
 
+        // The accepted-root bundle is a property of the shard that is
+        // currently accepting submissions. Once the CT log has rotated, the
+        // historical primary shard is frozen: it keeps the bundle it had
+        // when it stopped accepting submissions, while later Fulcio CA
+        // rotations extend only the active secondary shard's bundle.
+        var activeCtRuntimePath =
+            generation.CtLogRotationOperationId is null
+                ? layout.RuntimeTesseract
+                : layout.RuntimeTesseractSecondary;
         ValidateAcceptedRootsBundle(
             Path.Combine(
-                layout.RuntimeTesseract,
+                activeCtRuntimePath,
                 RuntimeAcceptedRootsFileName),
             Resolve(generationPath, FulcioRootCertificatePath),
             Resolve(servingGenerationPath, FulcioRootCertificatePath));
+        if (generation.CtLogRotationOperationId is not null)
+        {
+            ValidateFrozenAcceptedRootsBundle(
+                Path.Combine(
+                    layout.RuntimeTesseract,
+                    RuntimeAcceptedRootsFileName),
+                Path.Combine(
+                    activeCtRuntimePath,
+                    RuntimeAcceptedRootsFileName));
+        }
     }
+
+    /// <summary>
+    /// Validates the historical primary CT shard's frozen accepted-root
+    /// bundle. The shard stopped accepting submissions at the cutover, so
+    /// its bundle must stay exactly the ordered prefix of the active
+    /// shard's bundle that existed at that moment: any additional, removed
+    /// or reordered root means the frozen bundle was tampered with.
+    /// </summary>
+    private static void ValidateFrozenAcceptedRootsBundle(
+        string frozenPath,
+        string activePath)
+    {
+        var frozen = File.ReadAllBytes(frozenPath);
+        var active = File.ReadAllBytes(activePath);
+        if (frozen.Length == 0
+            || frozen.Length > active.Length
+            || !active.AsSpan(0, frozen.Length).SequenceEqual(frozen))
+        {
+            throw new InvalidDataException(
+                $"The frozen accepted Fulcio roots '{frozenPath}' of the " +
+                "historical primary CT log shard are not the ordered " +
+                "prefix of the active shard's bundle.");
+        }
+    }
+
+    /// <summary>
+    /// Resolves the generation whose certificate-transparency signer the
+    /// historical primary Tesseract shard must keep serving. Before a CT
+    /// shard rotation that is simply the active generation; after one, the
+    /// primary shard is append-only and immutable, so it keeps the CT prior
+    /// generation's signer forever while the active generation carries the
+    /// new secondary shard's signer.
+    /// </summary>
+    private static string ResolveCtServingGenerationPath(
+        TrustStateLayout layout,
+        string generationPath,
+        GenerationManifest generation)
+    {
+        if (generation.CtLogRotationOperationId is null)
+        {
+            return generationPath;
+        }
+        var priorGenerationId = generation.CtLogPriorGenerationId
+            ?? throw new InvalidDataException(
+                "The rotated CT log generation omits its prior generation.");
+        var priorPath = Path.Combine(
+            layout.Generations,
+            priorGenerationId);
+        EnsureRealDirectory(
+            priorPath,
+            "prior CT log generation");
+        return priorPath;
+    }
+
+    /// <summary>
+    /// Validates the certificate-transparency configuration the running
+    /// Fulcio is bound to. The projection is one stable directory holding
+    /// immutable per-shard keys and exactly one selection manifest, so only
+    /// two states are recognized: the primary selection, where the manifest
+    /// names the historical primary shard and its <c>primary.pub</c>, and
+    /// the promoted secondary selection, where it names the rotated
+    /// generation's shard and its <c>secondary.pub</c>. A staged but
+    /// unpromoted rotation is exactly "the additive
+    /// <c>secondary.pub</c> exists while the manifest still names the
+    /// primary". Returns whether promotion is pending.
+    /// </summary>
+    private static bool ValidateFulcioCtRuntimeProjection(
+        TrustStateLayout layout,
+        string generationPath,
+        string ctServingGenerationPath,
+        GenerationManifest generation)
+    {
+        var rotated = generation.CtLogRotationOperationId is not null;
+        var component = ReadFulcioCtComponent(layout.RuntimeFulcioCt);
+        var primaryKey = File.ReadAllBytes(
+            Resolve(ctServingGenerationPath, CtLogPublicKeyPath));
+        var secondaryKey = rotated
+            ? File.ReadAllBytes(
+                Resolve(generationPath, CtLogPublicKeyPath))
+            : null;
+
+        if (!component.PrimaryPublicKey.SequenceEqual(primaryKey))
+        {
+            throw new InvalidDataException(
+                "The Fulcio certificate-transparency projection does not " +
+                "carry the historical primary CT log shard key.");
+        }
+        if (component.SecondaryPublicKey is null)
+        {
+            if (rotated)
+            {
+                throw new InvalidDataException(
+                    "The rotated Fulcio certificate-transparency " +
+                    "projection is missing its secondary CT log shard key.");
+            }
+            if (component.Selector != CtLogPrimarySlot)
+            {
+                throw new InvalidDataException(
+                    "The Fulcio certificate-transparency selection names a " +
+                    "secondary CT log shard that was never staged.");
+            }
+            return false;
+        }
+        if (component.SecondaryPublicKey.SequenceEqual(
+                component.PrimaryPublicKey))
+        {
+            throw new InvalidDataException(
+                "The staged Fulcio certificate-transparency selection is " +
+                "not a distinct secondary shard.");
+        }
+        if (rotated
+            && !component.SecondaryPublicKey.SequenceEqual(secondaryKey!))
+        {
+            throw new InvalidDataException(
+                "The staged Fulcio certificate-transparency selection does " +
+                "not match the rotated generation.");
+        }
+        return component.Selector == CtLogPrimarySlot;
+    }
+
+    /// <summary>
+    /// Reads and strictly parses the certificate-transparency projection:
+    /// the immutable per-shard keys plus the single selection manifest. The
+    /// manifest must be exactly the versioned header, a recognized
+    /// selector, and the origin and key file name that selector implies, so
+    /// no partially rewritten or hand-edited manifest can ever resolve.
+    /// </summary>
+    private static FulcioCtComponent ReadFulcioCtComponent(
+        string componentPath)
+    {
+        EnsureRealDirectory(
+            componentPath,
+            "Fulcio certificate-transparency projection");
+        var secondaryPath = Path.Combine(
+            componentPath,
+            RuntimeFulcioCtSecondaryKeyFileName);
+        var staged = PathExists(secondaryPath);
+        EnsureOnlyEntries(
+            componentPath,
+            staged
+                ? RuntimeFulcioCtStagedFileNames
+                : RuntimeFulcioCtBaselineFileNames);
+
+        var selector = ReadFulcioCtSelection(componentPath);
+        var primary = ReadFulcioCtShardKey(
+            componentPath,
+            RuntimeFulcioCtPrimaryKeyFileName);
+        var secondary = staged
+            ? ReadFulcioCtShardKey(
+                componentPath,
+                RuntimeFulcioCtSecondaryKeyFileName)
+            : ((byte[] PublicKey, string Sha256)?)null;
+        if (selector == CtLogSecondarySlot && secondary is null)
+        {
+            throw new InvalidDataException(
+                "The Fulcio certificate-transparency selection names a " +
+                "secondary CT log shard key that does not exist.");
+        }
+        return new FulcioCtComponent(
+            selector,
+            CtSelectionOrigin(selector),
+            primary.PublicKey,
+            primary.Sha256,
+            secondary?.PublicKey,
+            secondary?.Sha256);
+    }
+
+    private static string ReadFulcioCtSelection(string componentPath)
+    {
+        var path = Path.Combine(
+            componentPath,
+            RuntimeFulcioCtSelectionFileName);
+        EnsureRegularFile(path, "runtime projection");
+        var text = Encoding.UTF8.GetString(File.ReadAllBytes(path));
+        if (text.Length is 0 or > 4096
+            || !text.EndsWith('\n')
+            || text.Contains('\r', StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                $"Fulcio certificate-transparency selection '{path}' is " +
+                "not a newline-terminated manifest.");
+        }
+        var lines = text[..^1].Split('\n');
+        if (lines.Length != 4
+            || lines[0] != RuntimeFulcioCtSelectionHeader
+            || lines.Any(line => line.Trim() != line || line.Length == 0))
+        {
+            throw new InvalidDataException(
+                $"Fulcio certificate-transparency selection '{path}' does " +
+                "not have the expected four-line shape.");
+        }
+        var selector = lines[1];
+        if (lines[2] != CtSelectionOrigin(selector)
+            || lines[3] != CtSelectionKeyFileName(selector))
+        {
+            throw new InvalidDataException(
+                $"Fulcio certificate-transparency selection '{path}' names " +
+                $"an origin or key that does not belong to '{selector}'.");
+        }
+        return selector;
+    }
+
+    private static (byte[] PublicKey, string Sha256) ReadFulcioCtShardKey(
+        string componentPath,
+        string name)
+    {
+        var path = Path.Combine(componentPath, name);
+        EnsureRegularFile(path, "runtime projection");
+        using var parsed = LoadEcdsaKey(path);
+        if (parsed.KeySize != 256)
+        {
+            throw new InvalidDataException(
+                "The Fulcio certificate-transparency public key must use " +
+                "ECDSA P-256.");
+        }
+        return (
+            File.ReadAllBytes(path),
+            Fingerprint(parsed.ExportSubjectPublicKeyInfo()));
+    }
+
+    /// <summary>
+    /// Stages the replacement certificate-transparency shard key beside the
+    /// primary key in the same stable, bind-mounted projection directory.
+    /// Staging never changes what the running Fulcio is bound to: the
+    /// selection manifest is untouched, so the key is purely additive and
+    /// the later promotion is a single atomic manifest replacement. Replay
+    /// re-validates the existing immutable key instead of rewriting it.
+    /// </summary>
+    internal static FulcioCtRuntimeProjectionInfo
+        StageFulcioCtRuntimeProjection(
+            string statePath,
+            string candidatePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidatePath);
+        var layout = CreateTrustStateLayout(Path.GetFullPath(statePath));
+        var candidate = ValidateCtLogShardMaterial(
+            Path.GetFullPath(candidatePath));
+        var publicKey = File.ReadAllBytes(
+            Resolve(
+                Path.GetFullPath(candidatePath),
+                CtLogPublicKeyPath));
+        var component = ReadFulcioCtComponent(layout.RuntimeFulcioCt);
+        if (component.PrimaryCtLogPublicKeySha256
+            == candidate.PublicKeySha256)
+        {
+            throw new InvalidDataException(
+                "The Fulcio certificate-transparency projection already " +
+                "carries the rotation candidate as its primary shard.");
+        }
+        if (component.SecondaryCtLogPublicKeySha256 is not null
+            && component.SecondaryCtLogPublicKeySha256
+                != candidate.PublicKeySha256)
+        {
+            throw new InvalidDataException(
+                "The staged Fulcio certificate-transparency key belongs to " +
+                "another CT log rotation candidate.");
+        }
+        WriteFulcioCtShardKey(
+            layout.RuntimeFulcioCt,
+            RuntimeFulcioCtSecondaryKeyFileName,
+            publicKey);
+        return CreateFulcioCtRuntimeProjectionInfo(layout);
+    }
+
+    /// <summary>
+    /// Atomically promotes the certificate-transparency selection by
+    /// replacing exactly one file — the selection manifest — with a rename
+    /// inside the stable, bind-mounted projection directory. Selector,
+    /// origin and key file name move together, so the running Fulcio is
+    /// wholly primary before the rename and wholly secondary after it, and
+    /// no bind-mounted directory or mounted file is ever replaced. Hosting
+    /// must call this only after the secondary shard is healthy, the
+    /// additive TrustedRoot commit has converged everywhere, and the old
+    /// shard has been proven to still issue. The promotion is bound to the
+    /// operation and the active generation and is idempotent on replay.
+    /// </summary>
+    internal static FulcioCtRuntimeProjectionInfo
+        ActivateFulcioCtRuntimeProjection(
+            string statePath,
+            string operationId,
+            string expectedOldCtLogPublicKeySha256,
+            string expectedNewCtLogPublicKeySha256)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
+        if (!Guid.TryParseExact(operationId, "N", out _)
+            || operationId.Any(char.IsUpper))
+        {
+            throw new InvalidDataException(
+                $"CT log rotation operation ID '{operationId}' is invalid.");
+        }
+        ValidateSha256(
+            expectedOldCtLogPublicKeySha256,
+            "expected old CT log public key");
+        ValidateSha256(
+            expectedNewCtLogPublicKeySha256,
+            "expected new CT log public key");
+        if (expectedOldCtLogPublicKeySha256
+            == expectedNewCtLogPublicKeySha256)
+        {
+            throw new InvalidDataException(
+                "CT log runtime activation must change the log signer.");
+        }
+
+        var layout = CreateTrustStateLayout(Path.GetFullPath(statePath));
+        var generation = ReadActiveGenerationManifest(
+            layout,
+            out var generationPath);
+        if (generation.CtLogRotationOperationId != operationId
+            || generation.CtLogPriorPublicKeySha256
+                != expectedOldCtLogPublicKeySha256
+            || generation.CtLogPublicKeySha256
+                != expectedNewCtLogPublicKeySha256
+            || generation.CtLogPriorGenerationId is null)
+        {
+            throw new InvalidDataException(
+                "The active generation is not bound to this CT log shard " +
+                "rotation operation.");
+        }
+
+        var component = ReadFulcioCtComponent(layout.RuntimeFulcioCt);
+        if (component.PrimaryCtLogPublicKeySha256
+                != expectedOldCtLogPublicKeySha256
+            || component.SecondaryCtLogPublicKeySha256
+                != expectedNewCtLogPublicKeySha256)
+        {
+            throw new InvalidDataException(
+                "The Fulcio certificate-transparency projection does not " +
+                "carry exactly the historical primary and rotated " +
+                "secondary CT log shard keys.");
+        }
+        if (component.Selector != CtLogSecondarySlot)
+        {
+            WriteFulcioCtSelection(
+                layout.RuntimeFulcioCt,
+                CtLogSecondarySlot);
+        }
+
+        ValidateRuntimeProjection(
+            layout,
+            generationPath,
+            generation);
+        return CreateFulcioCtRuntimeProjectionInfo(layout);
+    }
+
+    /// <summary>
+    /// Reads and strictly validates the certificate-transparency
+    /// configuration the running Fulcio is bound to, together with the
+    /// additive staged shard key when a CT shard rotation is awaiting
+    /// promotion.
+    /// </summary>
+    internal static FulcioCtRuntimeProjectionInfo
+        ReadFulcioCtRuntimeProjection(string statePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
+        var layout = CreateTrustStateLayout(Path.GetFullPath(statePath));
+        return CreateFulcioCtRuntimeProjectionInfo(layout);
+    }
+
+    private static FulcioCtRuntimeProjectionInfo
+        CreateFulcioCtRuntimeProjectionInfo(TrustStateLayout layout)
+    {
+        var component = ReadFulcioCtComponent(layout.RuntimeFulcioCt);
+        var pending = component.Selector == CtLogPrimarySlot
+            && component.SecondaryCtLogPublicKeySha256 is not null;
+        return new FulcioCtRuntimeProjectionInfo(
+            component.Selector,
+            component.Origin,
+            component.Selector == CtLogSecondarySlot
+                ? component.SecondaryCtLogPublicKeySha256!
+                : component.PrimaryCtLogPublicKeySha256,
+            pending ? CtLogSecondarySlot : null,
+            pending ? CtLogSecondaryOrigin : null,
+            pending ? component.SecondaryCtLogPublicKeySha256 : null,
+            pending);
+    }
+
+    private sealed record FulcioCtComponent(
+        string Selector,
+        string Origin,
+        byte[] PrimaryPublicKey,
+        string PrimaryCtLogPublicKeySha256,
+        byte[]? SecondaryPublicKey,
+        string? SecondaryCtLogPublicKeySha256);
 
     /// <summary>
     /// Reports whether a projected component carries exactly a generation's
@@ -2727,6 +3367,8 @@ internal static partial class SigstoreStateBootstrapper
             Path.Combine(runtime, RuntimeFulcioComponentName),
             Path.Combine(runtime, RuntimeFulcioStagedComponentName),
             Path.Combine(runtime, RuntimeTesseractComponentName),
+            Path.Combine(runtime, RuntimeTesseractSecondaryComponentName),
+            Path.Combine(runtime, RuntimeFulcioCtComponentName),
             Path.Combine(runtime, RuntimeRekorSecondaryComponentName));
     }
 
