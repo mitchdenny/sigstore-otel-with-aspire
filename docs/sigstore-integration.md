@@ -1517,6 +1517,46 @@ affected.
   and contention rejection, tampered candidate/projection/completion state,
   secret bounds, and composition with the other bounded rotations.
 
+### Validation evidence
+
+The 2026-08-29 non-isolated fixed-port run completed operation
+`262eae98f56a4da58d599680d645e24b` with all 50 structured postconditions
+passing:
+
+- The primary retained log ID/public-key fingerprint
+  `685da1abd82f1aa5b2c2321142fdf3e39a7cdd4257b9d44a2f7a0235d3eb5ef4`,
+  state ID `fd7e938d-d27b-4052-b1f5-d6fdab956ceb`, its canonical origin and
+  URL, and container
+  `459da285160657b20086331e3ba58c88993aaaa98e0737d387a06830a7b3fcc9`.
+  Its tree advanced legitimately to 46 during the overlap proof and then
+  stayed at 46 while the secondary advanced from 159 to 169 during a
+  20-second observation.
+- The secondary used log ID/public-key fingerprint
+  `4dc0999ce9c3b87c2b23506f7ec5bca870d0ac27724e674a66ab435d1f123959`,
+  state ID `c4137125-e592-40c7-a67c-f8d4e90da430`, and container
+  `011bd24e93e0917182c17cff91cabb4b8b47765220e314e94df30990ddeb1caa`.
+  Its signed empty-tree checkpoint verified before additive trust publication.
+- TrustedRoot changed from one to two CT entries. SigningConfig stayed
+  byte-identical at
+  `122f209b630c472925dea330003470162392f8a42b76e1e27980321193c20a8c`;
+  the TUF root and bootstrap root remained version 1 and byte-identical.
+- Fulcio restarted exactly once, from container
+  `1493a0dd8e72eb10a4de81d9b6719f1ba0878403f08f05f0ac759edad4ffbab2`
+  to `b14634630f8e3f4ddcb596cec82569bd1ac0b1b5f7d9664e9044433c2a0620dc`,
+  while its CA fingerprint remained
+  `71e6e18157a69703ec58dbb557d7c90f9c68a9639ec2ac4d532723d8a82ba57b`.
+  The old and new issuance proofs carried cryptographically verified SCTs
+  from their respective log IDs.
+- Old artifact 20 and new artifact 39 each verified through targeted routes
+  in .NET, Go, Java, JavaScript, Python, and Rust. The known Python
+  omitted-index-zero issue was not encountered. The six clients all reported
+  generation 2, the parent and both shards were Healthy, protected service
+  container IDs were unchanged, and a repeated rotation was rejected before
+  mutation.
+- The uncached TUF/Go suite and `go vet`, 76 bootstrap tests, 85 hosting tests,
+  AppHost and .NET client builds, the Go, JavaScript, Java, Python-container,
+  and Rust client gates, shell syntax checks, and `git diff --check` passed.
+
 ## Step 14: Harden the complete lifecycle
 
 ### Scope

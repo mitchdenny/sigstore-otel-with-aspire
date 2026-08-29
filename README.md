@@ -862,3 +862,30 @@ Certificates issued before cutover keep their old-shard SCTs forever and are
 verified against the preserved historical `ctlogs` entry. Bundle serialization
 is unchanged. The AppHost reset boundary still discards the complete
 run-scoped trust and shard state.
+
+### Step 13 validation evidence
+
+The non-isolated fixed-port validation on 2026-08-29 completed operation
+`262eae98f56a4da58d599680d645e24b` with all 50 structured postconditions
+passing. The historical shard retained log ID
+`685da1abd82f1aa5b2c2321142fdf3e39a7cdd4257b9d44a2f7a0235d3eb5ef4`,
+state ID `fd7e938d-d27b-4052-b1f5-d6fdab956ceb`, origin and URL, and container
+`459da285160657b20086331e3ba58c88993aaaa98e0737d387a06830a7b3fcc9`.
+Its tree reached 46 during the pre-cutover overlap and then stayed at 46 while
+the secondary tree advanced from 159 to 169 during a 20-second observation.
+
+The secondary shard used log ID
+`4dc0999ce9c3b87c2b23506f7ec5bca870d0ac27724e674a66ab435d1f123959`,
+state ID `c4137125-e592-40c7-a67c-f8d4e90da430`, and container
+`011bd24e93e0917182c17cff91cabb4b8b47765220e314e94df30990ddeb1caa`.
+Its empty-tree checkpoint was verified before TUF publication. TrustedRoot
+grew from one to two CT entries, while SigningConfig remained
+`122f209b630c472925dea330003470162392f8a42b76e1e27980321193c20a8c`
+and the TUF root stayed at version 1. Fulcio changed exactly once from container
+`1493a0dd8e72eb10a4de81d9b6719f1ba0878403f08f05f0ac759edad4ffbab2`
+to `b14634630f8e3f4ddcb596cec82569bd1ac0b1b5f7d9664e9044433c2a0620dc`;
+its CA fingerprint stayed
+`71e6e18157a69703ec58dbb557d7c90f9c68a9639ec2ac4d532723d8a82ba57b`.
+Old artifact 20 and new artifact 39 both verified in .NET, Go, Java,
+JavaScript, Python, and Rust. The known Python omitted-index-zero issue was not
+encountered in this run. A repeated rotation was rejected before mutation.
