@@ -70,6 +70,14 @@ type generationManifest struct {
 	RekorPriorBaseURL           string            `json:"rekorPriorBaseUrl,omitempty"`
 	RekorShardID                string            `json:"rekorShardId,omitempty"`
 	RekorBaseURL                string            `json:"rekorBaseUrl,omitempty"`
+	CtLogRotationOperationID    string            `json:"ctLogRotationOperationId,omitempty"`
+	CtLogPriorGeneration        int               `json:"ctLogPriorGeneration,omitempty"`
+	CtLogPriorGenerationID      string            `json:"ctLogPriorGenerationId,omitempty"`
+	CtLogPriorPublicKeySHA256   string            `json:"ctLogPriorPublicKeySha256,omitempty"`
+	CtLogPriorShardID           string            `json:"ctLogPriorShardId,omitempty"`
+	CtLogPriorBaseURL           string            `json:"ctLogPriorBaseUrl,omitempty"`
+	CtLogShardID                string            `json:"ctLogShardId,omitempty"`
+	CtLogBaseURL                string            `json:"ctLogBaseUrl,omitempty"`
 	Files                       map[string]string `json:"files"`
 }
 
@@ -360,6 +368,9 @@ func validateGenerationState(
 	}
 	if err := validateRekorGenerationMaterial(generationPath, generation); err != nil {
 		return fmt.Errorf("validate Rekor generation material: %w", err)
+	}
+	if err := validateCtLogGenerationMaterial(generationPath, generation); err != nil {
+		return fmt.Errorf("validate CT log generation material: %w", err)
 	}
 	ctState, err := os.ReadFile(filepath.Join(statePath, "data", "ctlog", "bootstrap-state"))
 	if err != nil {

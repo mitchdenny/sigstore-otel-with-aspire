@@ -453,6 +453,14 @@ func rotateTsaGeneration(
 		RekorPriorBaseURL:         currentManifest.RekorPriorBaseURL,
 		RekorShardID:              currentManifest.RekorShardID,
 		RekorBaseURL:              currentManifest.RekorBaseURL,
+		CtLogRotationOperationID:  currentManifest.CtLogRotationOperationID,
+		CtLogPriorGeneration:      currentManifest.CtLogPriorGeneration,
+		CtLogPriorGenerationID:    currentManifest.CtLogPriorGenerationID,
+		CtLogPriorPublicKeySHA256: currentManifest.CtLogPriorPublicKeySHA256,
+		CtLogPriorShardID:         currentManifest.CtLogPriorShardID,
+		CtLogPriorBaseURL:         currentManifest.CtLogPriorBaseURL,
+		CtLogShardID:              currentManifest.CtLogShardID,
+		CtLogBaseURL:              currentManifest.CtLogBaseURL,
 
 		Files: newFiles,
 	}

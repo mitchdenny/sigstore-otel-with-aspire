@@ -860,6 +860,14 @@ func rotateRekorGeneration(
 		RekorPriorBaseURL:           request.PriorShardURL,
 		RekorShardID:                request.CandidateShardID,
 		RekorBaseURL:                request.CandidateShardURL,
+		CtLogRotationOperationID:    currentManifest.CtLogRotationOperationID,
+		CtLogPriorGeneration:        currentManifest.CtLogPriorGeneration,
+		CtLogPriorGenerationID:      currentManifest.CtLogPriorGenerationID,
+		CtLogPriorPublicKeySHA256:   currentManifest.CtLogPriorPublicKeySHA256,
+		CtLogPriorShardID:           currentManifest.CtLogPriorShardID,
+		CtLogPriorBaseURL:           currentManifest.CtLogPriorBaseURL,
+		CtLogShardID:                currentManifest.CtLogShardID,
+		CtLogBaseURL:                currentManifest.CtLogBaseURL,
 		Files:                       files,
 	}
 	manifestData, err := json.MarshalIndent(manifest, "", "  ")

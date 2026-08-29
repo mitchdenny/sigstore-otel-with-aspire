@@ -129,9 +129,13 @@ public sealed class SigstoreFulcioTests
             $"{Convert.ToBase64String(noteSignature)}\n",
             new UTF8Encoding(false));
 
-        var checkpoint = SigstoreFulcio.ReadCheckpoint(
-            state.Path,
-            key);
+        var shard = new SigstoreFulcio.SelectedCtShard(
+            System.IO.Path.Combine(state.Path, "active-generation"),
+            SigstoreFulcio.CtOrigin,
+            System.IO.Path.Combine(state.Path, "data", "ctlog"),
+            "primary",
+            System.IO.Path.Combine(state.Path, "runtime", "tesseract"));
+        var checkpoint = SigstoreFulcio.ReadCheckpoint(shard, key);
 
         Assert.Equal(SigstoreFulcio.CtOrigin, checkpoint.Origin);
         Assert.Equal(treeSize, checkpoint.TreeSize);
@@ -150,9 +154,7 @@ public sealed class SigstoreFulcioTests
                 $"\n{treeSize + 1}\n",
                 StringComparison.Ordinal));
         Assert.Throws<InvalidDataException>(
-            () => SigstoreFulcio.ReadCheckpoint(
-                state.Path,
-                key));
+            () => SigstoreFulcio.ReadCheckpoint(shard, key));
     }
 
     [Fact]

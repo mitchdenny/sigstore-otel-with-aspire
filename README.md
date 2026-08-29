@@ -21,10 +21,16 @@ do not need to be installed locally.
   issued by the local Fulcio service. It stores its append-only log under
   `.sigstore/data/ctlog` and is available at
   `http://tesseract-sigstore.dev.localhost:6962`.
+- `tesseract-secondary` is an explicit-start certificate-transparency shard for
+  the one bounded Step 13 rotation. It has its own signer, log ID, origin,
+  storage, and canonical URL `http://tesseract-secondary-sigstore.dev.localhost:6963`,
+  and is started and health-proven before any trust publication.
 - `fulcio` exchanges a valid test OIDC token for a short-lived code-signing
-  certificate, submits the certificate to Tesseract, and embeds the returned
-  SCT. Its HTTP API is available at
-  `http://fulcio-sigstore.dev.localhost:5555`.
+  certificate, submits the certificate to the certificate-transparency shard it
+  is currently bound to, and embeds the returned SCT. Its HTTP API is available
+  at `http://fulcio-sigstore.dev.localhost:5555`. The shard it uses is a durable
+  runtime selection under `.sigstore/runtime/fulcio-ct`, not a build-time
+  argument, so Step 13 can move it with exactly one restart.
 - `timestamp` issues RFC 3161 signed timestamps using a run-scoped local file
   signer at `http://timestamp-sigstore.dev.localhost:3004`.
 - `rekor-server` sequences artifact-signature entries into the initial
@@ -150,13 +156,24 @@ The trust-domain identity is separate from its active key generation:
 |       |-- hosting-state.json
 |       `-- command.json
 |-- rotate-rekor-shard.completed
+|-- ct-log-shard-rotation/
+|   `-- <operation-id>/
+|       |-- candidate/                  # isolated secondary CT signer
+|       `-- hosting-state.json
+|-- rotate-ct-log-shard.completed
 |-- runtime/
-|   |-- fulcio/                         # active CA + CT public key only
-|   |-- tesseract/                      # CT private key + accepted roots only
+|   |-- fulcio/                         # active CA material only
+|   |-- fulcio-ct/                      # primary.pub/secondary.pub + selection
+|   |-- tesseract/                      # primary CT key + accepted roots only
+|   |-- tesseract-secondary/            # secondary CT key + accepted roots
 |   `-- rekor-secondary/                # secondary Rekor signer only
 |-- migration/
 |   `-- bootstrap-manifest.schema-4.json  # migrated state only
 |-- data/
+|   |-- ctlog/                          # immutable primary CT shard data
+|   |-- ctlog-shards/
+|   |   |-- state.json                  # schema-1 CT shard catalog
+|   |   `-- secondary/                  # independent secondary CT log
 |   |-- rekor/                          # immutable primary shard identity/data
 |   `-- rekor-shards/
 |       |-- state.json                  # schema-1 shard catalog
@@ -365,26 +382,43 @@ explicitly as activation pending rather than Healthy.
 The `fulcio` payload validates the active root certificate/key pair, every
 ordered historical Fulcio CA in TrustedRoot, the component-scoped runtime
 projection, Tesseract's deterministic accepted-root bundle, the root reported
-by Fulcio's read-only API, the unchanged CT key/log ID, and a signed CT
+by Fulcio's read-only API, the certificate-transparency shard Fulcio is
+currently bound to (selector, origin and log ID) and that shard's signed
 checkpoint. The parent is not Healthy while disk, served TUF, clients,
 Tesseract roots, or the live Fulcio issuer disagree.
+
+The `ctLog` payload reports every logical certificate-transparency shard: its
+shard ID, slot, status, origin, canonical URL, log ID, storage identity, and a
+freshly verified checkpoint signature, tree size and root hash, the identity of
+the complete accepted Fulcio root bundle it enforces (bundle SHA-256, root
+count and ordered per-root fingerprints) together with whether that recorded
+identity still matches the bytes its runtime projection renders, plus whether
+that shard is published in TrustedRoot and whether its compute is required and
+healthy. It also reports the shard Fulcio selects, whether a promotion is
+staged but not yet applied, the TrustedRoot `ctlogs` count, and any incomplete
+rotation operation and phase. A staged-but-unpromoted selection is reported
+explicitly as a pending cutover rather than Healthy.
 
 The parent state is event-driven and initially aggregates 14 required
 long-running resources: the seven active Sigstore services,
 `shady-blob-store`, and six clients. The explicit-start secondary Rekor writer
-is conditional: it does not degrade initial health while no rotation has
-activated it, then becomes required after cutover. At that same boundary the
+and the explicit-start secondary certificate-transparency shard are
+conditional: they do not degrade initial health while no rotation has
+activated them, then become required after cutover. At that same boundary the
 primary writer becomes historical and no longer participates in parent health;
 this bounded implementation leaves it running, but immutable primary checkpoint
-and tile reads through nginx are the retention contract if it is stopped. The
-parent shows **Healthy** only when
+and tile reads through nginx are the retention contract if it is stopped.
+The historical primary certificate-transparency shard is deliberately
+different: it has no separate static route, so its compute stays running and
+health-required after a CT shard rotation and stopping it degrades the parent.
+The parent shows **Healthy** only when
 every active required resource is running and healthy, **Starting** while
 initial readiness is pending, and **Degraded** with the first definitive
 reason when an active required resource stops or becomes unhealthy.
 
 ## Dashboard operations
 
-The parent also exposes eight confirmed, progress-reporting operations in the
+The parent also exposes nine confirmed, progress-reporting operations in the
 dashboard and through the Aspire CLI:
 
 ```bash
@@ -396,6 +430,7 @@ aspire resource sigstore rotate-oidc-signing-key | jq
 aspire resource sigstore rotate-timestamp-authority | jq
 aspire resource sigstore rotate-fulcio-ca | jq
 aspire resource sigstore rotate-rekor-shard | jq
+aspire resource sigstore rotate-ct-log-shard | jq
 ```
 
 `refresh-tuf` starts a new instance of the existing `tuf-bootstrap` one-shot
@@ -692,3 +727,165 @@ The known Python omitted-index-zero bundle parser issue remains out of scope.
 The operation does not seed an entry, hide artifact zero, or change bundle
 serialization; when encountered, it is reported and selected old/new bundles
 are proven through the existing generation-pinned targeted verifier.
+
+## Certificate-Transparency Log Shard Rotation (Step 13)
+
+`rotate-ct-log-shard` creates a second logical certificate-transparency log
+instead of replacing the signer of the initial log:
+
+```bash
+aspire resource sigstore rotate-ct-log-shard
+```
+
+### Topology
+
+The historical primary shard (`tesseract`) keeps its generation-1 CT signer,
+log ID, origin `tesseract-sigstore.dev.localhost`, canonical URL
+`http://tesseract-sigstore.dev.localhost:6962`, storage under
+`.sigstore/data/ctlog`, and its signed checkpoint history. It is never
+restarted or mutated by this command, before or after cutover.
+
+The command creates a distinct ECDSA P-256 signer in immutable generation N+1
+and stages only that private signer plus the complete accepted-Fulcio-root
+bundle in `.sigstore/runtime/tesseract-secondary`. The secondary shard
+(`tesseract-secondary`) sees only that mount and its own storage under
+`.sigstore/data/ctlog-shards/secondary`, which carries its own state identity
+and operation-bound `shard.json`. Its origin is
+`tesseract-secondary-sigstore.dev.localhost` and its stable canonical URL is
+`http://tesseract-secondary-sigstore.dev.localhost:6963`. The durable shard
+catalog lives at `.sigstore/data/ctlog-shards/state.json` and is owned by the
+Go TUF worker.
+
+Fulcio's certificate-transparency binding is a durable runtime selection in the
+stable read-only mount `.sigstore/runtime/fulcio-ct`. That directory holds
+immutable, additive per-shard public keys (`primary.pub`, and `secondary.pub`
+once a rotation stages it) beside exactly one `selection` manifest:
+
+```text
+sigstore-fulcio-ct-selection/1
+secondary
+tesseract-secondary-sigstore.dev.localhost
+secondary.pub
+```
+
+Staging only adds `secondary.pub`; promotion replaces the single `selection`
+file with one atomic rename inside the same mounted directory. Selector, origin
+and key file name therefore always travel together, so a crash can never leave
+a mixed configuration: before the flip Fulcio is wholly bound to the primary
+shard and after it wholly to the secondary shard, and recovery is forward-only.
+The Fulcio entrypoint strictly validates the manifest — versioned header,
+recognized selector, and the origin and key file name that selector implies —
+and refuses to start otherwise. The shard Fulcio uses only ever changes through
+that explicit, journaled promotion followed by exactly one restart, which is
+gated on the journaled Fulcio container identity rather than on any
+disk-derived field.
+
+Each shard entry in the catalog also records the identity of the complete
+accepted Fulcio root bundle that shard enforces — the bundle SHA-256, the root
+count, and the ordered per-root fingerprints. The secondary shard is created
+accepting byte-for-byte exactly the roots the primary already accepts,
+including every root added by prior Fulcio CA rotations.
+
+After the cutover the historical primary shard's accepted-root bundle is
+frozen: a later Fulcio CA rotation extends and restarts only the shard that is
+currently accepting submissions (the secondary), and the primary keeps serving
+its append-only tiles without being restarted or mutated. A Fulcio CA rotation
+is refused before any mutation while a CT log shard rotation is in flight.
+
+### Ordering
+
+1. Generate the operation-bound candidate signer and stage the secondary
+   shard's storage, runtime signer, accepted roots, and staged Fulcio
+   selection.
+2. Start the explicit secondary shard and prove it healthy, then prove its
+   signed checkpoint verifies against its own log ID and origin. No trust is
+   published and no route changes before this proof.
+3. Run the dedicated TUF worker: generation N+1 replaces only the CT signer and
+   preserves every Fulcio root, TSA certificate, Rekor shard signer and
+   routing record, OIDC key, and TUF material byte-for-byte. `TrustedRoot`
+   gains a second `ctlogs` `TransparencyLogInstance` additively while every
+   existing entry is preserved. `SigningConfig` is republished byte-for-byte
+   unchanged, and the TUF root role and bootstrap root are untouched.
+4. Restart all six clients in deterministic resource-name order and require
+   each to converge on the new generation.
+5. Prove the still-running old Fulcio issues a certificate with a valid
+   old-shard SCT under the new additive trust.
+6. Promote the Fulcio certificate-transparency runtime selection.
+7. Restart Fulcio exactly once.
+8. Prove the same Fulcio CA identity now issues a certificate whose SCT comes
+   from the secondary shard.
+9. Verify the retained old-shard artifact and a new secondary-shard artifact in
+   all six languages.
+
+No other service is restarted: OIDC, the timestamp authority, both Rekor
+writers, the Rekor gateway, the TUF nginx server, the artifact store, and the
+historical primary Tesseract shard all keep their container identity, which is
+checked before and after cutover.
+
+### Recovery
+
+The schema-1 hosting journal under
+`.sigstore/ct-log-shard-rotation/<operationId>/hosting-state.json` records a
+deterministic checkpoint for candidate generation, secondary preparation,
+secondary start and container identity, checkpoint proof, TUF preparation,
+commit and generation switch, every client convergence, the old-shard issuance
+proof, the Fulcio promotion and its single restart, the new-shard issuance
+proof, both artifact verifications, and completion.
+
+Before the Fulcio promotion, a failure leaves the old route intact and
+everything already published is additive, so the stack stays fully usable. From
+the promotion onward recovery is forward-only: replay re-validates every stored
+identity and hash and resumes from the last durable checkpoint. Ambiguous or
+tampered state — multiple incomplete operations, a surviving request bound to
+another candidate, a mismatched worker completion, a secondary shard that
+reuses the primary's storage identity, a staged selection that is not the
+candidate — is rejected without mutation. A repeated invocation after a
+completed rotation is rejected without mutation, and a second independent
+rotation in the same AppHost run is rejected by both the hosting command and
+the TUF worker.
+
+### Lifecycle policy
+
+The historical primary shard's compute stays running and required for the
+parent's aggregate health, and this is deliberate: unlike the Rekor gateway,
+Tesseract serves its append-only tiles and signed checkpoint from its own
+process, so certificates that were logged there are only auditable while it
+keeps running. Stopping it degrades the Sigstore parent. The secondary shard is
+a conditional resource that becomes required once it is activated.
+
+### Limitations
+
+The rotation is bounded to exactly one secondary shard per AppHost run.
+`SigningConfig` deliberately does not change, because certificate transparency
+has no `SigningConfig` selector; the shard Fulcio uses is a runtime binding.
+Certificates issued before cutover keep their old-shard SCTs forever and are
+verified against the preserved historical `ctlogs` entry. Bundle serialization
+is unchanged. The AppHost reset boundary still discards the complete
+run-scoped trust and shard state.
+
+### Step 13 validation evidence
+
+The non-isolated fixed-port validation on 2026-08-29 completed operation
+`262eae98f56a4da58d599680d645e24b` with all 50 structured postconditions
+passing. The historical shard retained log ID
+`685da1abd82f1aa5b2c2321142fdf3e39a7cdd4257b9d44a2f7a0235d3eb5ef4`,
+state ID `fd7e938d-d27b-4052-b1f5-d6fdab956ceb`, origin and URL, and container
+`459da285160657b20086331e3ba58c88993aaaa98e0737d387a06830a7b3fcc9`.
+Its tree reached 46 during the pre-cutover overlap and then stayed at 46 while
+the secondary tree advanced from 159 to 169 during a 20-second observation.
+
+The secondary shard used log ID
+`4dc0999ce9c3b87c2b23506f7ec5bca870d0ac27724e674a66ab435d1f123959`,
+state ID `c4137125-e592-40c7-a67c-f8d4e90da430`, and container
+`011bd24e93e0917182c17cff91cabb4b8b47765220e314e94df30990ddeb1caa`.
+Its empty-tree checkpoint was verified before TUF publication. TrustedRoot
+grew from one to two CT entries, while SigningConfig remained
+`122f209b630c472925dea330003470162392f8a42b76e1e27980321193c20a8c`
+and the TUF root stayed at version 1. Fulcio changed exactly once from container
+`1493a0dd8e72eb10a4de81d9b6719f1ba0878403f08f05f0ac759edad4ffbab2`
+to `b14634630f8e3f4ddcb596cec82569bd1ac0b1b5f7d9664e9044433c2a0620dc`;
+its CA fingerprint stayed
+`71e6e18157a69703ec58dbb557d7c90f9c68a9639ec2ac4d532723d8a82ba57b`.
+Old artifact 20 and new artifact 39 both verified in .NET, Go, Java,
+JavaScript, Python, and Rust. The known Python omitted-index-zero issue was not
+encountered in this run. A repeated rotation was rejected before mutation.

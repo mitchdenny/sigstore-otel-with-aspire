@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Text.Json;
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
@@ -39,7 +40,8 @@ public sealed class SigstoreOperationTests
                 SigstoreOperationCommand.RotateOidcSigningKeyCommand,
                 SigstoreOperationCommand.RotateTimestampAuthorityCommand,
                 SigstoreOperationCommand.RotateFulcioCaCommand,
-                SigstoreOperationCommand.RotateRekorShardCommand
+                SigstoreOperationCommand.RotateRekorShardCommand,
+                SigstoreOperationCommand.RotateCtLogShardCommand
             ],
             annotations.Keys);
 
@@ -52,7 +54,8 @@ public sealed class SigstoreOperationTests
             SigstoreOperationCommand.RotateOidcSigningKeyCommand,
             SigstoreOperationCommand.RotateTimestampAuthorityCommand,
             SigstoreOperationCommand.RotateFulcioCaCommand,
-            SigstoreOperationCommand.RotateRekorShardCommand
+            SigstoreOperationCommand.RotateRekorShardCommand,
+            SigstoreOperationCommand.RotateCtLogShardCommand
         })
         {
             var annotation = annotations[name];
@@ -914,13 +917,31 @@ public sealed class SigstoreOperationTests
         }
     }
 
-    [Fact]
-    public async Task FulcioRotationOrdersTrustClientsTesseractAndIssuer()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FulcioRotationOrdersTrustClientsTesseractAndIssuer(
+        bool afterCtLogShardRotation)
     {
         using var model = new OperationModelFixture();
         var statePath = model.Parent.Resource.StatePath;
         var bootstrap = SigstoreStateBootstrapper.EnsureInitialized(
             statePath);
+        // A Fulcio CA rotation always extends and restarts the
+        // certificate-transparency shard that is currently accepting
+        // submissions. After a CT log shard rotation that is the bounded
+        // secondary shard, and the historical primary shard must stay
+        // frozen, running and never restarted.
+        var ctShardName = afterCtLogShardRotation
+            ? "tesseract-secondary"
+            : "tesseract";
+        var ctShardResource = afterCtLogShardRotation
+            ? model.Parent.Resource.Components.TesseractSecondary.Resource
+            : model.Parent.Resource.Components.Tesseract.Resource;
+        if (afterCtLogShardRotation)
+        {
+            MarkCtLogShardRotated(statePath, bootstrap);
+        }
         var oldRoot = bootstrap.Generation.FulcioRootSha256;
         var newRoot = Hash('f');
         var acceptedHash = Hash('d');
@@ -1058,17 +1079,17 @@ public sealed class SigstoreOperationTests
             fulcioBefore);
         runtime.WaitResults["fulcio"] = fulcioAfter;
         var tesseractBefore = Running(
-            "tesseract",
-            "tesseract-before");
+            ctShardName,
+            $"{ctShardName}-before");
         var tesseractAfter = Running(
-            "tesseract",
-            "tesseract-after",
+            ctShardName,
+            $"{ctShardName}-after",
             offsetSeconds: 30);
         runtime.SetSnapshotSequence(
-            model.Parent.Resource.Components.Tesseract.Resource,
+            ctShardResource,
             tesseractBefore,
             tesseractBefore);
-        runtime.WaitResults["tesseract"] = tesseractAfter;
+        runtime.WaitResults[ctShardName] = tesseractAfter;
 
         var clientRegistrations = model.Parent.Resource
             .GetRegistrations()
@@ -1113,7 +1134,7 @@ public sealed class SigstoreOperationTests
         var excluded = clientRegistrations
             .Select(client => client.Resource.Name)
             .Append("fulcio")
-            .Append("tesseract")
+            .Append(ctShardName)
             .ToHashSet(StringComparer.Ordinal);
         foreach (var protectedResource in model.Parent.Resource
             .GetRegistrations()
@@ -1174,7 +1195,13 @@ public sealed class SigstoreOperationTests
                         generation = 2,
                         generationId = newGenerationId,
                         fulcioRootSha256 = newRoot,
-                        fulcioRotationOperationId = operationId
+                        fulcioRotationOperationId = operationId,
+                        ctLogRotationOperationId = afterCtLogShardRotation
+                            ? "00000000000000000000000000000013"
+                            : null,
+                        ctLogPriorGenerationId = afterCtLogShardRotation
+                            ? bootstrap.Generation.GenerationId
+                            : null
                     }));
             Directory.Delete(
                 System.IO.Path.Combine(
@@ -1249,7 +1276,7 @@ public sealed class SigstoreOperationTests
         Assert.Equal(
             1,
             runtime.ExecutedCommands.Count(
-                item => item.Resource == "tesseract"));
+                item => item.Resource == ctShardName));
         Assert.Equal(
             1,
             runtime.ExecutedCommands.Count(
@@ -1259,6 +1286,14 @@ public sealed class SigstoreOperationTests
             item => item.Resource is
                 "oidc" or "timestamp" or "rekor-server" or "rekor"
                 or "tuf" or "shady-blob-store");
+        if (afterCtLogShardRotation)
+        {
+            // The historical primary CT shard's compute is never restarted
+            // and its frozen accepted-root bundle is never rewritten.
+            Assert.DoesNotContain(
+                runtime.ExecutedCommands,
+                item => item.Resource == "tesseract");
+        }
 
         var orderedEvents = events.ToArray();
         var lastClientRestart = Array.FindLastIndex(
@@ -1271,7 +1306,7 @@ public sealed class SigstoreOperationTests
                     StringComparison.Ordinal));
         var tesseractRestart = Array.IndexOf(
             orderedEvents,
-            "execute:tesseract:restart");
+            $"execute:{ctShardName}:restart");
         var oldProof = Array.IndexOf(
             orderedEvents,
             $"fulcio-proof:{oldRoot}");
@@ -1289,6 +1324,631 @@ public sealed class SigstoreOperationTests
         Assert.True(oldProof < runtimeActivation);
         Assert.True(runtimeActivation < fulcioRestart);
         Assert.True(fulcioRestart < newProof);
+    }
+
+    [Fact]
+    public async Task CtLogShardRotationContentionIsRejectedByGate()
+    {
+        using var model = new OperationModelFixture();
+        Assert.True(
+            model.Parent.Resource.TryBeginOperation(
+                SigstoreOperationCommand.RotateCtLogShardCommand,
+                "Rotating CT Log Shard",
+                out var lease,
+                out _));
+        try
+        {
+            var events = new ConcurrentQueue<string>();
+            var inspector = new FakeStateInspector(events);
+            var result = await NewExecutor(
+                    model,
+                    NewRuntime(model, events, inspector),
+                    inspector)
+                .ExecuteRotateCtLogShardAsync(CancellationToken.None);
+            var output = ReadResult(result);
+
+            Assert.False(result.Success);
+            Assert.Equal("contention", output.Phase);
+            Assert.Contains(
+                "rotate-ct-log-shard is already active",
+                output.Message,
+                StringComparison.Ordinal);
+            Assert.Empty(events);
+        }
+        finally
+        {
+            lease!.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Drives the whole bounded CT log shard rotation through the executor
+    /// against durable state and asserts the exact user-required ordering:
+    /// prove the secondary shard, publish additive trust, converge all six
+    /// clients, prove the still-running old Fulcio issues an old-shard SCT,
+    /// promote the CT selection, restart Fulcio exactly once, prove the new
+    /// shard issues, and verify both artifacts in all six clients.
+    /// </summary>
+    /// <remarks>
+    /// The restart branch is the important regression: the promoted
+    /// selection is durable state that flips the instant the manifest is
+    /// replaced, so a live status field can never prove the running Fulcio
+    /// moved. Gating on it made the restart unreachable; this test fails if
+    /// that regression returns, because Fulcio would never be restarted.
+    /// </remarks>
+    [Fact]
+    public async Task CtLogShardRotationOrdersProofsClientsAndOneRestart()
+    {
+        using var model = new OperationModelFixture();
+        var statePath = model.Parent.Resource.StatePath;
+        var bootstrap = SigstoreStateBootstrapper.EnsureInitialized(
+            statePath);
+        var fulcioRoot = bootstrap.Generation.FulcioRootSha256;
+        var primaryCtKey = bootstrap.Generation.CtLogPublicKeySha256;
+        using var secondaryKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var secondaryCtKey = HashBytes(
+            secondaryKey.ExportSubjectPublicKeyInfo());
+        var primaryPublicKey = ECDsa.Create();
+        primaryPublicKey.ImportFromPem(
+            File.ReadAllText(
+                System.IO.Path.Combine(
+                    statePath,
+                    "active-generation",
+                    "public",
+                    "ctlog",
+                    "pubkey.pem")));
+        using var primaryDisposable = primaryPublicKey;
+
+        // The secondary shard's least-privilege runtime accepts exactly the
+        // complete Fulcio root bundle the primary shard already enforces.
+        var primaryRuntime = System.IO.Path.Combine(
+            statePath,
+            "runtime",
+            "tesseract");
+        var secondaryRuntime = System.IO.Path.Combine(
+            statePath,
+            "runtime",
+            "tesseract-secondary");
+        Directory.CreateDirectory(secondaryRuntime);
+        var acceptedRoots = File.ReadAllBytes(
+            System.IO.Path.Combine(primaryRuntime, "accepted-roots.pem"));
+        File.WriteAllBytes(
+            System.IO.Path.Combine(
+                secondaryRuntime,
+                "accepted-roots.pem"),
+            acceptedRoots);
+        var acceptedRootsSha256 = HashBytes(acceptedRoots);
+        var acceptedFingerprints = ReadRootFingerprints(acceptedRoots);
+        WriteTrustedRoot(
+            statePath,
+            (SigstoreCtLogShard.PrimaryUrl, primaryPublicKey));
+
+        var generationsPath = System.IO.Path.Combine(
+            statePath,
+            "generations");
+        var priorManifestSha256 = HashBytes(
+            File.ReadAllBytes(
+                System.IO.Path.Combine(
+                    generationsPath,
+                    bootstrap.Generation.GenerationId,
+                    "manifest.json")));
+        const string newGenerationId = "generation-00000002";
+        var newManifest = JsonSerializer.Serialize(
+            new
+            {
+                generation = 2,
+                generationId = newGenerationId,
+                fulcioRootSha256 = fulcioRoot,
+                ctLogPublicKeySha256 = secondaryCtKey,
+                ctLogRotationOperationId = "pending"
+            });
+        var newManifestSha256 = HashBytes(
+            Encoding.UTF8.GetBytes(newManifest));
+
+        var before = NewTufState();
+        before = before with
+        {
+            Trust = before.Trust with
+            {
+                GenerationManifestSha256 = priorManifestSha256
+            }
+        };
+        var after = NewTsaRotationTufState(before);
+        after = after with
+        {
+            Trust = after.Trust with
+            {
+                GenerationManifestSha256 = newManifestSha256
+            }
+        };
+
+        var primaryCheckpoint = new SigstoreCtCheckpoint(
+            SigstoreCtLogShard.PrimaryOrigin,
+            10,
+            1_000,
+            Hash('1'),
+            Hash('2'),
+            primaryCtKey);
+        var secondaryCheckpoint = new SigstoreCtCheckpoint(
+            SigstoreCtLogShard.SecondaryOrigin,
+            1,
+            2_000,
+            Hash('3'),
+            Hash('4'),
+            secondaryCtKey);
+        var oldArtifact = NewArtifact(100, fulcioRoot, primaryCtKey, 'a');
+        var newArtifact = NewArtifact(120, fulcioRoot, secondaryCtKey, 'b');
+
+        var primaryStatus = NewFulcioStatus(
+            fulcioRoot,
+            fulcioRoot,
+            [fulcioRoot],
+            acceptedRootsSha256,
+            primaryCtKey,
+            primaryCheckpoint,
+            runtimeMatches: true);
+        var promotedStatus = primaryStatus with
+        {
+            CtLogId = secondaryCtKey,
+            CtLogPublicKeySha256 = secondaryCtKey,
+            CtLogShardSlot = SigstoreCtLogShard.SecondarySlot,
+            CtLogOrigin = SigstoreCtLogShard.SecondaryOrigin,
+            CtLogPromotionPending = false,
+            StagedCtLogPublicKeySha256 = null,
+            Checkpoint = secondaryCheckpoint
+        };
+
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events)
+        {
+            CtLogCandidate = new CtLogShardMaterialInfo(
+                secondaryCtKey,
+                secondaryCtKey,
+                $"sha256-{secondaryCtKey}"),
+            CtLogRuntime = new CtLogShardRuntimeInfo(
+                secondaryCtKey,
+                secondaryCtKey,
+                $"sha256-{secondaryCtKey}",
+                acceptedRootsSha256,
+                acceptedFingerprints),
+            CtSelection = new FulcioCtRuntimeProjectionInfo(
+                SigstoreCtLogShard.PrimarySlot,
+                SigstoreCtLogShard.PrimaryOrigin,
+                primaryCtKey,
+                SigstoreCtLogShard.SecondarySlot,
+                SigstoreCtLogShard.SecondaryOrigin,
+                secondaryCtKey,
+                true),
+            PromotedCtSelection = new FulcioCtRuntimeProjectionInfo(
+                SigstoreCtLogShard.SecondarySlot,
+                SigstoreCtLogShard.SecondaryOrigin,
+                secondaryCtKey,
+                null,
+                null,
+                null,
+                false)
+        };
+        inspector.TufStates.Enqueue(before);
+        inspector.TufStates.Enqueue(after);
+        inspector.TrustFingerprints.Enqueue(Hash('5'));
+        inspector.TrustFingerprints.Enqueue(Hash('6'));
+        inspector.MaterialFingerprints.Enqueue(Hash('7'));
+        inspector.MaterialFingerprints.Enqueue(Hash('8'));
+
+        var runtime = NewRuntime(model, events, inspector);
+        runtime.ServedStates.Enqueue(NewServed(before));
+        runtime.ServedStates.Enqueue(NewServed(after));
+        // Creation, the pre-cutover overlap proof, and the post-restart
+        // check all read the live Fulcio; only the last one is promoted.
+        runtime.FulcioStatuses.Enqueue(primaryStatus);
+        runtime.FulcioStatuses.Enqueue(primaryStatus);
+        runtime.FulcioStatuses.Enqueue(promotedStatus);
+        runtime.FulcioStatuses.Enqueue(promotedStatus);
+        runtime.ShardCheckpoints.Enqueue(secondaryCheckpoint);
+        runtime.Artifacts.Enqueue(oldArtifact);
+        runtime.Artifacts.Enqueue(newArtifact);
+        runtime.OidcTokens.Enqueue(
+            (CreateOidcJwt(new string('a', 43)), null));
+        runtime.OidcTokens.Enqueue(
+            (CreateOidcJwt(new string('a', 43)), null));
+        runtime.CtShardProofs.Enqueue(
+            NewFulcioProof(fulcioRoot, primaryCtKey, 2_000, 'c'));
+        runtime.CtShardProofs.Enqueue(
+            NewFulcioProof(fulcioRoot, secondaryCtKey, 3_000, 'd'));
+        runtime.Statuses.Enqueue(NewAggregate(model, before));
+        runtime.Statuses.Enqueue(
+            NewAggregate(model, after) with
+            {
+                CtLog = new SigstoreCtLogStatus(
+                    $"sha256-{secondaryCtKey}",
+                    SigstoreCtLogShard.SecondarySlot,
+                    SigstoreCtLogShard.SecondaryOrigin,
+                    secondaryCtKey,
+                    false,
+                    null,
+                    2,
+                    [],
+                    [
+                        NewShardHealth(
+                            SigstoreCtLogShard.PrimarySlot,
+                            primaryCtKey,
+                            "historical",
+                            primaryCheckpoint,
+                            acceptedRootsSha256,
+                            acceptedFingerprints),
+                        NewShardHealth(
+                            SigstoreCtLogShard.SecondarySlot,
+                            secondaryCtKey,
+                            "active",
+                            secondaryCheckpoint,
+                            acceptedRootsSha256,
+                            acceptedFingerprints)
+                    ],
+                    null,
+                    null)
+            });
+
+        var workerBefore = Exited("tuf-bootstrap", "worker-before", 0);
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.TufBootstrap.Resource,
+            workerBefore);
+        runtime.WaitResults["tuf-bootstrap"] = Exited(
+            "tuf-bootstrap",
+            "worker-after",
+            0,
+            offsetSeconds: 10);
+
+        var fulcioBefore = Running("fulcio", "fulcio-before");
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Fulcio.Resource,
+            fulcioBefore,
+            fulcioBefore);
+        runtime.WaitResults["fulcio"] = Running(
+            "fulcio",
+            "fulcio-after",
+            offsetSeconds: 60);
+        var secondaryBefore = Exited(
+            "tesseract-secondary",
+            "secondary-before",
+            0);
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.TesseractSecondary.Resource,
+            secondaryBefore);
+        runtime.WaitResults["tesseract-secondary"] = Running(
+            "tesseract-secondary",
+            "secondary-after",
+            offsetSeconds: 5);
+
+        var clientRegistrations = model.Parent.Resource
+            .GetRegistrations()
+            .Clients
+            .OrderBy(
+                client => client.Resource.Name,
+                StringComparer.Ordinal)
+            .ToArray();
+        foreach (var client in clientRegistrations)
+        {
+            var clientBefore = Running(
+                client.Resource.Name,
+                $"{client.Resource.Name}-before");
+            runtime.SetSnapshotSequence(client.Resource, clientBefore);
+            runtime.WaitResults[client.Resource.Name] = Running(
+                client.Resource.Name,
+                $"{client.Resource.Name}-after",
+                offsetSeconds: 20);
+            runtime.ClientStatusSequences[client.Resource.Name] =
+                new Queue<SigstoreClientTrustStatus>(
+                    [
+                        NewClientStatus(client, before.Trust),
+                        NewClientStatus(client, after.Trust)
+                    ]);
+            runtime.ArtifactVerifications[client.Resource.Name] =
+                new Queue<SigstoreClientArtifactVerification>(
+                    [
+                        NewArtifactVerification(
+                            client,
+                            oldArtifact,
+                            after.Trust),
+                        NewArtifactVerification(
+                            client,
+                            newArtifact,
+                            after.Trust)
+                    ]);
+        }
+
+        var excluded = clientRegistrations
+            .Select(client => client.Resource.Name)
+            .Append("fulcio")
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var protectedResource in model.Parent.Resource
+            .GetRegistrations()
+            .RequiredResources
+            .Where(item => !excluded.Contains(item.Name)))
+        {
+            var snapshot = Running(
+                protectedResource.Name,
+                $"{protectedResource.Name}-stable");
+            runtime.SetSnapshotSequence(
+                protectedResource,
+                snapshot,
+                snapshot,
+                snapshot,
+                snapshot,
+                snapshot,
+                snapshot,
+                snapshot,
+                snapshot);
+        }
+
+        runtime.OnExecuteCommand = (target, command) =>
+        {
+            if (target.Name != "tuf-bootstrap"
+                || command != KnownResourceCommands.StartCommand)
+            {
+                return;
+            }
+            using var request = JsonDocument.Parse(
+                File.ReadAllBytes(
+                    System.IO.Path.Combine(
+                        statePath,
+                        "rotate-ct-log-shard.request")));
+            var operationId = request.RootElement
+                .GetProperty("operationId")
+                .GetString()!;
+            var candidateStateId = request.RootElement
+                .GetProperty("candidateStateId")
+                .GetString()!;
+            var createdAtUtc = request.RootElement
+                .GetProperty("candidateCreatedAtUtc")
+                .GetDateTimeOffset();
+
+            var newGenerationPath = System.IO.Path.Combine(
+                generationsPath,
+                newGenerationId);
+            Directory.CreateDirectory(newGenerationPath);
+            File.WriteAllText(
+                System.IO.Path.Combine(
+                    newGenerationPath,
+                    "manifest.json"),
+                newManifest);
+            WriteTrustedRoot(
+                statePath,
+                (SigstoreCtLogShard.PrimaryUrl, primaryPublicKey),
+                (SigstoreCtLogShard.SecondaryUrl, secondaryKey));
+            WriteCtShardCatalog(
+                statePath,
+                before.Trust.TrustDomainId,
+                primaryCtKey,
+                secondaryCtKey,
+                candidateStateId,
+                createdAtUtc,
+                acceptedRootsSha256,
+                acceptedFingerprints);
+            File.WriteAllText(
+                System.IO.Path.Combine(
+                    statePath,
+                    "rotate-ct-log-shard.completed"),
+                JsonSerializer.Serialize(
+                    new
+                    {
+                        schemaVersion = 1,
+                        operationId,
+                        trustDomainId = before.Trust.TrustDomainId,
+                        completedAtUtc = DateTimeOffset.UtcNow,
+                        priorGeneration = 1,
+                        priorGenerationId =
+                            bootstrap.Generation.GenerationId,
+                        priorGenerationManifestSha256 = priorManifestSha256,
+                        priorPublicKeySha256 = primaryCtKey,
+                        priorShardId = $"sha256-{primaryCtKey}",
+                        priorBaseUrl = SigstoreCtLogShard.PrimaryUrl,
+                        priorOrigin = SigstoreCtLogShard.PrimaryOrigin,
+                        priorStateId = "ct-state",
+                        newGeneration = 2,
+                        newGenerationId,
+                        generationManifestSha256 = newManifestSha256,
+                        newPublicKeySha256 = secondaryCtKey,
+                        newShardId = $"sha256-{secondaryCtKey}",
+                        newBaseUrl = SigstoreCtLogShard.SecondaryUrl,
+                        newOrigin = SigstoreCtLogShard.SecondaryOrigin,
+                        newStateId = candidateStateId,
+                        publicationId = after.Trust.PublicationId,
+                        publicationManifestSha256 =
+                            after.Trust.PublicationManifestSha256,
+                        trustedRootSha256 = after.Trust.TrustedRootSha256,
+                        signingConfigSha256 =
+                            after.Trust.SigningConfigSha256,
+                        priorTrustedRootCtlogCount = 1,
+                        newTrustedRootCtlogCount = 2,
+                        action = "published"
+                    }));
+            File.Delete(
+                System.IO.Path.Combine(
+                    statePath,
+                    "rotate-ct-log-shard.request"));
+        };
+
+        var result = await NewExecutor(model, runtime, inspector)
+            .ExecuteRotateCtLogShardAsync(CancellationToken.None);
+        var output = ReadCtLogShardResult(result);
+
+        Assert.True(
+            result.Success,
+            output.Message + ": " + string.Join(
+                "; ",
+                output.Errors.Select(error => error.Message)));
+
+        // Exactly one Fulcio restart, and the historical primary CT shard
+        // is never restarted or otherwise touched.
+        Assert.Equal(
+            1,
+            runtime.ExecutedCommands.Count(
+                item => item.Resource == "fulcio"
+                    && item.Command
+                        == KnownResourceCommands.RestartCommand));
+        Assert.DoesNotContain(
+            runtime.ExecutedCommands,
+            item => item.Resource == "tesseract");
+        Assert.Equal(
+            1,
+            runtime.ExecutedCommands.Count(
+                item => item.Resource == "tesseract-secondary"));
+
+        var ordered = events.ToArray();
+        var secondaryStart = Array.IndexOf(
+            ordered,
+            "execute:tesseract-secondary:start");
+        var secondaryProof = Array.IndexOf(
+            ordered,
+            $"ct-shard-checkpoint:{SigstoreCtLogShard.SecondarySlot}");
+        var workerStart = Array.IndexOf(
+            ordered,
+            "execute:tuf-bootstrap:start");
+        var lastClientRestart = Array.FindLastIndex(
+            ordered,
+            item => item.StartsWith("execute:", StringComparison.Ordinal)
+                && item.Contains(
+                    "-client:restart",
+                    StringComparison.Ordinal));
+        var oldShardProof = Array.IndexOf(
+            ordered,
+            $"ct-shard-proof:{primaryCtKey}");
+        var promotion = Array.IndexOf(ordered, "ct-runtime-activate");
+        var fulcioRestart = Array.IndexOf(
+            ordered,
+            "execute:fulcio:restart");
+        var newShardProof = Array.IndexOf(
+            ordered,
+            $"ct-shard-proof:{secondaryCtKey}");
+        var lastNewArtifactVerification = Array.FindLastIndex(
+            ordered,
+            item => item.StartsWith(
+                $"verify-artifact:",
+                StringComparison.Ordinal)
+                && item.EndsWith(
+                    $":{newArtifact.ArtifactId}",
+                    StringComparison.Ordinal));
+
+        Assert.True(secondaryStart >= 0);
+        Assert.True(secondaryStart < secondaryProof);
+        Assert.True(secondaryProof < workerStart);
+        Assert.True(workerStart < lastClientRestart);
+        Assert.True(lastClientRestart < oldShardProof);
+        Assert.True(oldShardProof < promotion);
+        Assert.True(promotion < fulcioRestart);
+        Assert.True(fulcioRestart < newShardProof);
+        Assert.True(newShardProof < lastNewArtifactVerification);
+
+        Assert.NotNull(output.CtLogShardRotation);
+        Assert.Equal(
+            $"sha256-{primaryCtKey}",
+            output.CtLogShardRotation.PriorShardId);
+        Assert.Equal(
+            $"sha256-{secondaryCtKey}",
+            output.CtLogShardRotation.NewShardId);
+        Assert.Equal(6, output.CtLogShardRotation.Clients.Count);
+        Assert.Equal(
+            6,
+            output.CtLogShardRotation.OldArtifactValidations.Count);
+        Assert.Equal(
+            6,
+            output.CtLogShardRotation.NewArtifactValidations.Count);
+    }
+
+    [Fact]
+    public async Task
+        CtLogShardRotationIsRejectedWithoutMutationOnceCompleted()
+    {
+        using var model = new OperationModelFixture();
+        var statePath = model.Parent.Resource.StatePath;
+        var catalogPath = SigstoreCtLogShard.ShardCatalogPath(statePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(catalogPath)!);
+        var primary = Hash('c');
+        var secondary = Hash('d');
+        var catalog = $$"""
+            {
+              "schemaVersion": 1,
+              "trustDomainId": "sha256-{{new string('a', 64)}}",
+              "activeShardId": "sha256-{{secondary}}",
+              "updatedAtUtc": "2026-01-01T00:00:00Z",
+              "shards": [
+                {
+                  "shardId": "sha256-{{primary}}",
+                  "slot": "primary",
+                  "baseUrl": "http://tesseract-sigstore.dev.localhost:6962",
+                  "origin": "tesseract-sigstore.dev.localhost",
+                  "publicKeySha256": "{{primary}}",
+                  "logIdSha256": "{{primary}}",
+                  "stateId": "primary-state",
+                  "dataPath": "data/ctlog",
+                  "resourceName": "tesseract",
+                  "createdAtUtc": "2026-01-01T00:00:00Z",
+                  "activatedAtUtc": "2026-01-01T00:00:00Z",
+                  "status": "historical",
+                  "acceptedRootsSha256": "{{Hash('e')}}",
+                  "acceptedRootCount": 1,
+                  "acceptedRootFingerprints": ["{{Hash('f')}}"]
+                },
+                {
+                  "shardId": "sha256-{{secondary}}",
+                  "slot": "secondary",
+                  "baseUrl":
+                    "http://tesseract-secondary-sigstore.dev.localhost:6963",
+                  "origin": "tesseract-secondary-sigstore.dev.localhost",
+                  "publicKeySha256": "{{secondary}}",
+                  "logIdSha256": "{{secondary}}",
+                  "stateId": "secondary-state",
+                  "dataPath": "data/ctlog-shards/secondary",
+                  "resourceName": "tesseract-secondary",
+                  "createdAtUtc": "2026-01-01T00:00:00Z",
+                  "activatedAtUtc": "2026-01-01T00:00:00Z",
+                  "status": "active",
+                  "acceptedRootsSha256": "{{Hash('e')}}",
+                  "acceptedRootCount": 1,
+                  "acceptedRootFingerprints": ["{{Hash('f')}}"]
+                }
+              ]
+            }
+            """;
+        File.WriteAllText(catalogPath, catalog);
+
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events);
+        var runtime = NewRuntime(model, events, inspector);
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.TufBootstrap.Resource,
+            Exited("tuf-bootstrap", "worker-before", 0));
+        foreach (var component in new[]
+        {
+            model.Parent.Resource.Components.Tesseract.Resource,
+            model.Parent.Resource.Components.Fulcio.Resource,
+            model.Parent.Resource.Components.TesseractSecondary.Resource
+        })
+        {
+            runtime.SetSnapshotSequence(
+                component,
+                Running(component.Name, $"{component.Name}-before"));
+        }
+
+        var result = await NewExecutor(model, runtime, inspector)
+            .ExecuteRotateCtLogShardAsync(CancellationToken.None);
+        var output = ReadResult(result);
+
+        Assert.False(result.Success);
+        Assert.Equal("preflight", output.Phase);
+        Assert.Contains(
+            output.Errors,
+            error => error.Message.Contains(
+                "already completed",
+                StringComparison.Ordinal));
+        Assert.Empty(runtime.ExecutedCommands);
+        Assert.Equal(catalog, File.ReadAllText(catalogPath));
+        Assert.False(
+            Directory.Exists(
+                Path.Combine(statePath, "ct-log-shard-rotation")));
+        Assert.False(
+            File.Exists(
+                Path.Combine(statePath, "rotate-ct-log-shard.request")));
     }
 
     [Fact]
@@ -1908,6 +2568,16 @@ public sealed class SigstoreOperationTests
         ?? throw new InvalidOperationException(
             "Command result JSON was empty.");
 
+    private static CtLogShardRotationOperationResult ReadCtLogShardResult(
+        ExecuteCommandResult result) =>
+        JsonSerializer.Deserialize<CtLogShardRotationOperationResult>(
+            result.Data?.Value
+                ?? throw new InvalidOperationException(
+                    "Command result omitted JSON data."),
+            JsonOptions)
+        ?? throw new InvalidOperationException(
+            "Command result JSON was empty.");
+
     private static UpdateCommandStateContext NewUpdateContext() =>
         new()
         {
@@ -1934,7 +2604,7 @@ public sealed class SigstoreOperationTests
         var root = rotation
             ? new SigstoreTufMetadataRoleStatus(
                 prior!.Metadata.Root.Version + 1,
-                Hash('r'),
+                Hash('e'),
                 prior.Metadata.Root.ExpiresAtUtc.AddDays(1))
             : prior?.Metadata.Root
                 ?? new SigstoreTufMetadataRoleStatus(
@@ -2426,6 +3096,260 @@ public sealed class SigstoreOperationTests
             ResourceBaseTime.AddSeconds(offsetSeconds + 1),
             containerId);
 
+    /// <summary>
+    /// Rewrites durable state into the shape it has after a completed CT
+    /// log shard rotation: the active generation is bound to the rotation,
+    /// the secondary shard has its own least-privilege runtime, and the
+    /// Fulcio selection manifest names the secondary shard.
+    /// </summary>
+    private static void MarkCtLogShardRotated(
+        string statePath,
+        BootstrapResult bootstrap)
+    {
+        var runtimePath = System.IO.Path.Combine(statePath, "runtime");
+        var secondaryRuntime = System.IO.Path.Combine(
+            runtimePath,
+            "tesseract-secondary");
+        Directory.CreateDirectory(secondaryRuntime);
+        foreach (var name in new[] { "privkey.pem", "accepted-roots.pem" })
+        {
+            File.Copy(
+                System.IO.Path.Combine(runtimePath, "tesseract", name),
+                System.IO.Path.Combine(secondaryRuntime, name),
+                overwrite: true);
+        }
+        using var secondaryKey = ECDsa.Create(
+            ECCurve.NamedCurves.nistP256);
+        var selectionPath = System.IO.Path.Combine(
+            runtimePath,
+            "fulcio-ct",
+            "selection");
+        WriteWritable(
+            System.IO.Path.Combine(
+                runtimePath,
+                "fulcio-ct",
+                "secondary.pub"),
+            Encoding.UTF8.GetBytes(secondaryKey.ExportSubjectPublicKeyInfoPem() + "\n"));
+        WriteWritable(
+            selectionPath,
+            Encoding.UTF8.GetBytes(
+                "sigstore-fulcio-ct-selection/1\nsecondary\n"
+                + "tesseract-secondary-sigstore.dev.localhost\n"
+                + "secondary.pub\n"));
+
+        var manifestPath = System.IO.Path.Combine(
+            statePath,
+            "generations",
+            bootstrap.Generation.GenerationId,
+            "manifest.json");
+        using var manifest = JsonDocument.Parse(
+            File.ReadAllBytes(manifestPath));
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            foreach (var property in manifest.RootElement
+                .EnumerateObject())
+            {
+                property.WriteTo(writer);
+            }
+            writer.WriteString(
+                "ctLogRotationOperationId",
+                "00000000000000000000000000000013");
+            writer.WriteString(
+                "ctLogPriorGenerationId",
+                bootstrap.Generation.GenerationId);
+            writer.WriteEndObject();
+        }
+        WriteWritable(manifestPath, stream.ToArray());
+    }
+
+    private static void WriteWritable(string path, byte[] contents)
+    {
+        if (File.Exists(path) && !OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                path,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        File.WriteAllBytes(path, contents);
+    }
+
+    private static SigstoreCtLogShardHealthStatus NewShardHealth(
+        string slot,
+        string publicKeySha256,
+        string status,
+        SigstoreCtCheckpoint checkpoint,
+        string acceptedRootsSha256,
+        IReadOnlyList<string> acceptedRootFingerprints) =>
+        new(
+            $"sha256-{publicKeySha256}",
+            slot,
+            status,
+            slot == SigstoreCtLogShard.PrimarySlot
+                ? SigstoreCtLogShard.PrimaryUrl
+                : SigstoreCtLogShard.SecondaryUrl,
+            slot == SigstoreCtLogShard.PrimarySlot
+                ? SigstoreCtLogShard.PrimaryOrigin
+                : SigstoreCtLogShard.SecondaryOrigin,
+            slot == SigstoreCtLogShard.PrimarySlot
+                ? SigstoreCtLogShard.PrimaryResourceName
+                : SigstoreCtLogShard.SecondaryResourceName,
+            publicKeySha256,
+            publicKeySha256,
+            $"{slot}-state",
+            checkpoint.TreeSize,
+            checkpoint.Timestamp,
+            checkpoint.RootHash,
+            checkpoint.SignatureSha256,
+            true,
+            true,
+            true,
+            acceptedRootsSha256,
+            acceptedRootFingerprints.Count,
+            acceptedRootFingerprints,
+            true);
+
+    private static string[] ReadRootFingerprints(byte[] bundle)
+    {
+        var certificates = new X509Certificate2Collection();
+        certificates.ImportFromPem(Encoding.UTF8.GetString(bundle));
+        try
+        {
+            return certificates
+                .Select(certificate => HashBytes(certificate.RawData))
+                .ToArray();
+        }
+        finally
+        {
+            foreach (var certificate in certificates)
+            {
+                certificate.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes a TrustedRoot whose <c>ctlogs</c> array carries one entry per
+    /// certificate-transparency shard, with each log ID derived from that
+    /// shard's own key exactly as the Go worker publishes it.
+    /// </summary>
+    private static void WriteTrustedRoot(
+        string statePath,
+        params (string BaseUrl, ECDsa Key)[] shards)
+    {
+        var targets = System.IO.Path.Combine(
+            statePath,
+            "tuf",
+            "active",
+            "targets");
+        Directory.CreateDirectory(targets);
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            writer.WriteStartArray("ctlogs");
+            foreach (var (baseUrl, key) in shards)
+            {
+                var spki = key.ExportSubjectPublicKeyInfo();
+                writer.WriteStartObject();
+                writer.WriteString("baseUrl", baseUrl);
+                writer.WriteString("hashAlgorithm", "SHA2_256");
+                writer.WriteStartObject("publicKey");
+                writer.WriteString(
+                    "rawBytes",
+                    Convert.ToBase64String(spki));
+                writer.WriteString(
+                    "keyDetails",
+                    "PKIX_ECDSA_P256_SHA_256");
+                writer.WriteEndObject();
+                writer.WriteStartObject("logId");
+                writer.WriteString(
+                    "keyId",
+                    Convert.ToBase64String(SHA256.HashData(spki)));
+                writer.WriteEndObject();
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+        }
+        File.WriteAllBytes(
+            System.IO.Path.Combine(targets, "trusted_root.json"),
+            stream.ToArray());
+    }
+
+    /// <summary>
+    /// Writes the two-shard CT catalog the Go worker commits, including the
+    /// accepted Fulcio root bundle identity both shards were created with.
+    /// </summary>
+    private static void WriteCtShardCatalog(
+        string statePath,
+        string trustDomainId,
+        string primaryCtKey,
+        string secondaryCtKey,
+        string secondaryStateId,
+        DateTimeOffset createdAtUtc,
+        string acceptedRootsSha256,
+        IReadOnlyList<string> acceptedRootFingerprints)
+    {
+        var path = SigstoreCtLogShard.ShardCatalogPath(statePath);
+        Directory.CreateDirectory(
+            System.IO.Path.GetDirectoryName(path)!);
+        var fingerprints = string.Join(
+            ", ",
+            acceptedRootFingerprints.Select(item => $"\"{item}\""));
+        File.WriteAllText(
+            path,
+            $$"""
+            {
+              "schemaVersion": 1,
+              "trustDomainId": "{{trustDomainId}}",
+              "activeShardId": "sha256-{{secondaryCtKey}}",
+              "updatedAtUtc": "{{createdAtUtc:O}}",
+              "shards": [
+                {
+                  "shardId": "sha256-{{primaryCtKey}}",
+                  "slot": "primary",
+                  "baseUrl": "{{SigstoreCtLogShard.PrimaryUrl}}",
+                  "origin": "{{SigstoreCtLogShard.PrimaryOrigin}}",
+                  "publicKeySha256": "{{primaryCtKey}}",
+                  "logIdSha256": "{{primaryCtKey}}",
+                  "stateId": "ct-state",
+                  "dataPath":
+                    "{{SigstoreCtLogShard.PrimaryDataRelativePath}}",
+                  "resourceName":
+                    "{{SigstoreCtLogShard.PrimaryResourceName}}",
+                  "createdAtUtc": "{{createdAtUtc:O}}",
+                  "activatedAtUtc": "{{createdAtUtc:O}}",
+                  "status": "historical",
+                  "acceptedRootsSha256": "{{acceptedRootsSha256}}",
+                  "acceptedRootCount": {{acceptedRootFingerprints.Count}},
+                  "acceptedRootFingerprints": [{{fingerprints}}]
+                },
+                {
+                  "shardId": "sha256-{{secondaryCtKey}}",
+                  "slot": "secondary",
+                  "baseUrl": "{{SigstoreCtLogShard.SecondaryUrl}}",
+                  "origin": "{{SigstoreCtLogShard.SecondaryOrigin}}",
+                  "publicKeySha256": "{{secondaryCtKey}}",
+                  "logIdSha256": "{{secondaryCtKey}}",
+                  "stateId": "{{secondaryStateId}}",
+                  "dataPath":
+                    "{{SigstoreCtLogShard.SecondaryDataRelativePath}}",
+                  "resourceName":
+                    "{{SigstoreCtLogShard.SecondaryResourceName}}",
+                  "createdAtUtc": "{{createdAtUtc:O}}",
+                  "activatedAtUtc": "{{createdAtUtc:O}}",
+                  "status": "active",
+                  "acceptedRootsSha256": "{{acceptedRootsSha256}}",
+                  "acceptedRootCount": {{acceptedRootFingerprints.Count}},
+                  "acceptedRootFingerprints": [{{fingerprints}}]
+                }
+              ]
+            }
+            """);
+    }
+
     private static string Hash(char value) =>
         new(value, 64);
 
@@ -2616,6 +3540,62 @@ public sealed class SigstoreOperationTests
         {
             events.Enqueue("fulcio-runtime-activate");
             return FulcioProjection;
+        }
+
+        public CtLogShardMaterialInfo? CtLogCandidate { get; set; }
+
+        public CtLogShardRuntimeInfo? CtLogRuntime { get; set; }
+
+        public FulcioCtRuntimeProjectionInfo? CtSelection { get; set; }
+
+        public FulcioCtRuntimeProjectionInfo? PromotedCtSelection
+        {
+            get;
+            set;
+        }
+
+        public CtLogShardMaterialInfo EnsureCtLogShardRotationCandidate(
+            string candidatePath)
+        {
+            events.Enqueue("ct-candidate");
+            Directory.CreateDirectory(candidatePath);
+            return CtLogCandidate
+                ?? throw new InvalidOperationException(
+                    "No fake CT log candidate is configured.");
+        }
+
+        public CtLogShardRuntimeInfo StageCtLogShardRuntime(
+            string statePath,
+            string candidatePath)
+        {
+            events.Enqueue("ct-runtime-stage");
+            return CtLogRuntime
+                ?? throw new InvalidOperationException(
+                    "No fake CT log runtime is configured.");
+        }
+
+        public FulcioCtRuntimeProjectionInfo
+            StageFulcioCtRuntimeProjection(
+                string statePath,
+                string candidatePath)
+        {
+            events.Enqueue("ct-selection-stage");
+            return CtSelection
+                ?? throw new InvalidOperationException(
+                    "No fake CT selection is configured.");
+        }
+
+        public FulcioCtRuntimeProjectionInfo
+            ActivateFulcioCtRuntimeProjection(
+                string statePath,
+                string operationId,
+                string priorCtLogPublicKeySha256,
+                string newCtLogPublicKeySha256)
+        {
+            events.Enqueue("ct-runtime-activate");
+            return PromotedCtSelection
+                ?? throw new InvalidOperationException(
+                    "No promoted fake CT selection is configured.");
         }
     }
 
@@ -2861,6 +3841,41 @@ public sealed class SigstoreOperationTests
         {
             events.Enqueue("ct-checkpoint");
             return Task.FromResult(CtCheckpoints.Dequeue());
+        }
+
+        public Queue<SigstoreCtCheckpoint> ShardCheckpoints { get; } = [];
+
+        public Queue<SigstoreFulcioIssuanceProof> CtShardProofs { get; } =
+            [];
+
+        public Task ProbeCtLogShardHealthAsync(
+            string slot,
+            CancellationToken cancellationToken)
+        {
+            events.Enqueue($"ct-health:{slot}");
+            return Task.CompletedTask;
+        }
+
+        public Task<SigstoreCtCheckpoint> WaitForCtShardCheckpointAsync(
+            string slot,
+            string ctMaterialPath,
+            CancellationToken cancellationToken)
+        {
+            events.Enqueue($"ct-shard-checkpoint:{slot}");
+            return Task.FromResult(ShardCheckpoints.Dequeue());
+        }
+
+        public Task<SigstoreFulcioIssuanceProof>
+            ProveFulcioIssuanceForCtShardAsync(
+                string oidcToken,
+                string subject,
+                string expectedRootSha256,
+                string ctMaterialPath,
+                CancellationToken cancellationToken)
+        {
+            var proof = CtShardProofs.Dequeue();
+            events.Enqueue($"ct-shard-proof:{proof.CtLogId}");
+            return Task.FromResult(proof);
         }
 
         public Task<long> ReadArtifactHeadAsync(

@@ -8,6 +8,7 @@ public sealed record SigstoreComponents(
     IResourceBuilder<ContainerResource> StateReady,
     IResourceBuilder<ContainerResource> Oidc,
     IResourceBuilder<ContainerResource> Tesseract,
+    IResourceBuilder<ContainerResource> TesseractSecondary,
     IResourceBuilder<ContainerResource> Fulcio,
     IResourceBuilder<ContainerResource> Timestamp,
     IResourceBuilder<ContainerResource> RekorServer,
