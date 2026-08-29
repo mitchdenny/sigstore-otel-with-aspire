@@ -152,7 +152,7 @@ record_operation() {
         | to_entries[]
         | select(.key | test("artifactId$"; "i"))
         | .value
-        | strings
+        | select(type == "string" or type == "number")
       ] | unique,
       proofHashes: [
         ..
