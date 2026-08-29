@@ -72,6 +72,11 @@ internal sealed partial class SigstoreOperationExecutor
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.RotateCtLogShardCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RotateCtLogShardCommand,
                 "Rotating CT Log Shard",
@@ -1205,7 +1210,7 @@ internal sealed partial class SigstoreOperationExecutor
             cancellationToken);
         execution.Check(
             "aggregate-status-ready",
-            aggregate.Ready
+            IsReadyForActiveOperation(aggregate)
                 && aggregate.Clients.Count == clients.Length
                 && aggregate.CtLog is
                 {
@@ -2053,6 +2058,7 @@ internal sealed partial class SigstoreOperationExecutor
         var result = new CtLogShardRotationOperationResult(
             1,
             SigstoreOperationCommand.RotateCtLogShardCommand,
+            execution.OperationId.ToString("N"),
             success,
             execution.Phase,
             message,
@@ -2314,6 +2320,7 @@ internal sealed record CtLogShardRotationEvidence(
 internal sealed record CtLogShardRotationOperationResult(
     int SchemaVersion,
     string Command,
+    string OperationId,
     bool Success,
     string Phase,
     string Message,

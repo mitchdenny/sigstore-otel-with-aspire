@@ -1276,6 +1276,7 @@ internal static partial class SigstoreStateBootstrapper
         ValidateTsaRotationMetadata(generation);
         ValidateFulcioRotationMetadata(generation);
         ValidateRekorRotationMetadata(generation);
+        ValidateCtLogRotationMetadata(generation);
     }
 
     private static void ValidateGenerationCryptography(
@@ -1690,152 +1691,205 @@ internal static partial class SigstoreStateBootstrapper
         }
     }
 
+    private static void ValidateCtLogRotationMetadata(
+        GenerationManifest generation)
+    {
+        if (generation.CtLogRotationOperationId is null)
+        {
+            if (generation.CtLogPriorGeneration != 0
+                || generation.CtLogPriorGenerationId is not null
+                || generation.CtLogPriorPublicKeySha256 is not null
+                || generation.CtLogPriorShardId is not null
+                || generation.CtLogPriorBaseUrl is not null
+                || generation.CtLogShardId is not null
+                || generation.CtLogBaseUrl is not null)
+            {
+                throw new InvalidDataException(
+                    "Generation contains partial CT log shard rotation metadata.");
+            }
+            return;
+        }
+
+        if (!Guid.TryParseExact(
+                generation.CtLogRotationOperationId,
+                "N",
+                out _)
+            || generation.CtLogRotationOperationId.Any(char.IsUpper)
+            || generation.CtLogPriorGeneration < InitialGeneration
+            || generation.CtLogPriorGeneration >= generation.Generation
+            || generation.CtLogPriorGenerationId
+                != GenerationId(generation.CtLogPriorGeneration))
+        {
+            throw new InvalidDataException(
+                "Generation contains invalid CT log shard rotation identity " +
+                "metadata.");
+        }
+        ValidateSha256(
+            generation.CtLogPriorPublicKeySha256,
+            "prior CT log public key");
+        if (generation.CtLogPriorShardId
+                != $"sha256-{generation.CtLogPriorPublicKeySha256}"
+            || generation.CtLogPriorBaseUrl
+                != "http://tesseract-sigstore.dev.localhost:6962"
+            || generation.CtLogPriorPublicKeySha256
+                == generation.CtLogPublicKeySha256
+            || generation.CtLogShardId
+                != $"sha256-{generation.CtLogPublicKeySha256}"
+            || generation.CtLogBaseUrl
+                != "http://tesseract-secondary-sigstore.dev.localhost:6963")
+        {
+            throw new InvalidDataException(
+                "CT log shard rotation did not bind distinct old and new log " +
+                "identities.");
+        }
+    }
+
     private static void ValidateOidcRotationMetadata(
             GenerationManifest generation)
+    {
+        if (generation.OidcRotationOperationId is null)
         {
-            if (generation.OidcRotationOperationId is null)
-            {
-                if (generation.OidcPriorGeneration != 0
-                    || generation.OidcPriorGenerationId is not null
-                    || generation.OidcPriorKeyId is not null
-                    || generation.OidcOverlapExpiresAtUtc is not null)
-                {
-                    throw new InvalidDataException(
-                        "Generation contains partial OIDC rotation metadata.");
-                }
-                return;
-            }
-
-            if (!Guid.TryParseExact(
-                    generation.OidcRotationOperationId,
-                    "N",
-                    out _)
-                || generation.OidcRotationOperationId.Any(char.IsUpper)
-                || generation.OidcPriorGeneration != generation.Generation - 1
-                || generation.OidcPriorGenerationId
-                    != GenerationId(generation.OidcPriorGeneration)
-                || !IsOidcKeyId(generation.OidcPriorKeyId)
-                || generation.OidcOverlapExpiresAtUtc is null)
+            if (generation.OidcPriorGeneration != 0
+                || generation.OidcPriorGenerationId is not null
+                || generation.OidcPriorKeyId is not null
+                || generation.OidcOverlapExpiresAtUtc is not null)
             {
                 throw new InvalidDataException(
-                    "Generation contains invalid OIDC rotation metadata.");
+                    "Generation contains partial OIDC rotation metadata.");
             }
+            return;
         }
 
-        private static void ValidateOidcRetainedKeys(
-            string generationPath,
-            GenerationManifest generation)
+        if (!Guid.TryParseExact(
+                generation.OidcRotationOperationId,
+                "N",
+                out _)
+            || generation.OidcRotationOperationId.Any(char.IsUpper)
+            || generation.OidcPriorGeneration != generation.Generation - 1
+            || generation.OidcPriorGenerationId
+                != GenerationId(generation.OidcPriorGeneration)
+            || !IsOidcKeyId(generation.OidcPriorKeyId)
+            || generation.OidcOverlapExpiresAtUtc is null)
         {
-            using var document = JsonDocument.Parse(
-                File.ReadAllText(Resolve(generationPath, OidcJwksPath)));
-            var keys = document.RootElement.GetProperty("keys")
-                .EnumerateArray()
-                .ToArray();
-            var expectedPaths = new List<string>();
-            var seen = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var key in keys)
-            {
-                var kid = key.GetProperty("kid").GetString();
-                if (!IsOidcKeyId(kid) || !seen.Add(kid!))
-                {
-                    throw new InvalidDataException(
-                        "OIDC JWKS key IDs must be unique valid SHA-256 IDs.");
-                }
-                EnsureEqual("OIDC key type", "RSA", key.GetProperty("kty").GetString());
-                EnsureEqual("OIDC key use", "sig", key.GetProperty("use").GetString());
-                EnsureEqual("OIDC algorithm", "RS256", key.GetProperty("alg").GetString());
+            throw new InvalidDataException(
+                "Generation contains invalid OIDC rotation metadata.");
+        }
+    }
 
-                var parameters = new RSAParameters
-                {
-                    Modulus = DecodeBase64Url(key.GetProperty("n").GetString()),
-                    Exponent = DecodeBase64Url(key.GetProperty("e").GetString())
-                };
-                using var publicKey = RSA.Create();
-                try
-                {
-                    publicKey.ImportParameters(parameters);
-                }
-                catch (CryptographicException exception)
-                {
-                    throw new InvalidDataException(
-                        $"OIDC JWK '{kid}' is not a valid RSA key.",
-                        exception);
-                }
-                EnsureEqual(
-                    "OIDC key ID",
-                    kid!,
-                    Base64UrlEncode(
-                        SHA256.HashData(publicKey.ExportSubjectPublicKeyInfo())));
-
-                if (kid == generation.OidcKeyId)
-                {
-                    continue;
-                }
-                var relativePath =
-                    $"private/oidc/retained/signer-{kid}.key";
-                expectedPaths.Add(relativePath);
-                using var retained = LoadRsaKey(
-                    Resolve(generationPath, relativePath));
-                EnsureKeyBytesEqual(
-                    $"retained OIDC key '{kid}'",
-                    publicKey.ExportSubjectPublicKeyInfo(),
-                    retained.ExportSubjectPublicKeyInfo());
-            }
-
-            expectedPaths.Sort(StringComparer.Ordinal);
-            var actualPaths = (generation.OidcRetainedPrivateKeyPaths ?? [])
-                .Order(StringComparer.Ordinal)
-                .ToArray();
-            if (!expectedPaths.SequenceEqual(actualPaths, StringComparer.Ordinal))
+    private static void ValidateOidcRetainedKeys(
+        string generationPath,
+        GenerationManifest generation)
+    {
+        using var document = JsonDocument.Parse(
+            File.ReadAllText(Resolve(generationPath, OidcJwksPath)));
+        var keys = document.RootElement.GetProperty("keys")
+            .EnumerateArray()
+            .ToArray();
+        var expectedPaths = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var key in keys)
+        {
+            var kid = key.GetProperty("kid").GetString();
+            if (!IsOidcKeyId(kid) || !seen.Add(kid!))
             {
                 throw new InvalidDataException(
-                    "OIDC retained private-key paths do not exactly match JWKS history.");
+                    "OIDC JWKS key IDs must be unique valid SHA-256 IDs.");
             }
-        }
+            EnsureEqual("OIDC key type", "RSA", key.GetProperty("kty").GetString());
+            EnsureEqual("OIDC key use", "sig", key.GetProperty("use").GetString());
+            EnsureEqual("OIDC algorithm", "RS256", key.GetProperty("alg").GetString());
 
-        private static bool IsRetainedOidcKeyPath(string path)
-        {
-            const string prefix = "private/oidc/retained/signer-";
-            const string suffix = ".key";
-            return path.StartsWith(prefix, StringComparison.Ordinal)
-                && path.EndsWith(suffix, StringComparison.Ordinal)
-                && IsOidcKeyId(
-                    path[prefix.Length..^suffix.Length]);
-        }
-
-        private static bool IsOidcKeyId(string? keyId) =>
-            keyId is { Length: 43 }
-            && keyId.All(character =>
-                char.IsAsciiLetterOrDigit(character)
-                || character is '-' or '_');
-
-        private static byte[] DecodeBase64Url(string? value)
-        {
-            if (string.IsNullOrWhiteSpace(value))
+            var parameters = new RSAParameters
             {
-                throw new InvalidDataException(
-                    "OIDC JWK contains an empty key parameter.");
-            }
-            var padded = value.Replace('-', '+').Replace('_', '/');
-            padded += (padded.Length % 4) switch
-            {
-                0 => string.Empty,
-                2 => "==",
-                3 => "=",
-                _ => throw new InvalidDataException(
-                    "OIDC JWK contains invalid base64url data.")
+                Modulus = DecodeBase64Url(key.GetProperty("n").GetString()),
+                Exponent = DecodeBase64Url(key.GetProperty("e").GetString())
             };
+            using var publicKey = RSA.Create();
             try
             {
-                return Convert.FromBase64String(padded);
+                publicKey.ImportParameters(parameters);
             }
-            catch (FormatException exception)
+            catch (CryptographicException exception)
             {
                 throw new InvalidDataException(
-                    "OIDC JWK contains invalid base64url data.",
+                    $"OIDC JWK '{kid}' is not a valid RSA key.",
                     exception);
             }
+            EnsureEqual(
+                "OIDC key ID",
+                kid!,
+                Base64UrlEncode(
+                    SHA256.HashData(publicKey.ExportSubjectPublicKeyInfo())));
+
+            if (kid == generation.OidcKeyId)
+            {
+                continue;
+            }
+            var relativePath =
+                $"private/oidc/retained/signer-{kid}.key";
+            expectedPaths.Add(relativePath);
+            using var retained = LoadRsaKey(
+                Resolve(generationPath, relativePath));
+            EnsureKeyBytesEqual(
+                $"retained OIDC key '{kid}'",
+                publicKey.ExportSubjectPublicKeyInfo(),
+                retained.ExportSubjectPublicKeyInfo());
         }
+
+        expectedPaths.Sort(StringComparer.Ordinal);
+        var actualPaths = (generation.OidcRetainedPrivateKeyPaths ?? [])
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (!expectedPaths.SequenceEqual(actualPaths, StringComparer.Ordinal))
+        {
+            throw new InvalidDataException(
+                "OIDC retained private-key paths do not exactly match JWKS history.");
+        }
+    }
+
+    private static bool IsRetainedOidcKeyPath(string path)
+    {
+        const string prefix = "private/oidc/retained/signer-";
+        const string suffix = ".key";
+        return path.StartsWith(prefix, StringComparison.Ordinal)
+            && path.EndsWith(suffix, StringComparison.Ordinal)
+            && IsOidcKeyId(
+                path[prefix.Length..^suffix.Length]);
+    }
+
+    private static bool IsOidcKeyId(string? keyId) =>
+        keyId is { Length: 43 }
+        && keyId.All(character =>
+            char.IsAsciiLetterOrDigit(character)
+            || character is '-' or '_');
+
+    private static byte[] DecodeBase64Url(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new InvalidDataException(
+                "OIDC JWK contains an empty key parameter.");
+        }
+        var padded = value.Replace('-', '+').Replace('_', '/');
+        padded += (padded.Length % 4) switch
+        {
+            0 => string.Empty,
+            2 => "==",
+            3 => "=",
+            _ => throw new InvalidDataException(
+                "OIDC JWK contains invalid base64url data.")
+        };
+        try
+        {
+            return Convert.FromBase64String(padded);
+        }
+        catch (FormatException exception)
+        {
+            throw new InvalidDataException(
+                "OIDC JWK contains invalid base64url data.",
+                exception);
+        }
+    }
     private static bool FileMapsEqual(
         SortedDictionary<string, string> expected,
         SortedDictionary<string, string> actual)
@@ -3609,6 +3663,29 @@ internal static partial class SigstoreStateBootstrapper
             && OrdinalEquals(
                 expected.RekorBaseUrl,
                 actual.RekorBaseUrl)
+            && OrdinalEquals(
+                expected.CtLogRotationOperationId,
+                actual.CtLogRotationOperationId)
+            && expected.CtLogPriorGeneration
+                == actual.CtLogPriorGeneration
+            && OrdinalEquals(
+                expected.CtLogPriorGenerationId,
+                actual.CtLogPriorGenerationId)
+            && OrdinalEquals(
+                expected.CtLogPriorPublicKeySha256,
+                actual.CtLogPriorPublicKeySha256)
+            && OrdinalEquals(
+                expected.CtLogPriorShardId,
+                actual.CtLogPriorShardId)
+            && OrdinalEquals(
+                expected.CtLogPriorBaseUrl,
+                actual.CtLogPriorBaseUrl)
+            && OrdinalEquals(
+                expected.CtLogShardId,
+                actual.CtLogShardId)
+            && OrdinalEquals(
+                expected.CtLogBaseUrl,
+                actual.CtLogBaseUrl)
             && FileMapsEqual(expected.Files, actual.Files);
 
     private static bool OrdinalEquals(string? expected, string? actual)

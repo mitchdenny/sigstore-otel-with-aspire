@@ -248,6 +248,83 @@ public sealed class TrustStateTests
     }
 
     [Fact]
+    public void TransitionRejectsMismatchedCtRotationMetadata()
+    {
+        using var state = new TemporaryDirectory();
+        _ = SigstoreStateBootstrapper.EnsureInitialized(state.Path);
+        var journal = ReadJournal(state.Path);
+        var path = System.IO.Path.Combine(
+            state.Path,
+            "transition",
+            "state.json");
+
+        File.WriteAllText(
+            path,
+            JsonSerializer.Serialize(
+                journal with
+                {
+                    CandidateManifest = journal.CandidateManifest with
+                    {
+                        CtLogBaseUrl =
+                            "http://tesseract-secondary-sigstore.dev.localhost:6963"
+                    }
+                },
+                JsonOptions));
+
+        Assert.Throws<InvalidDataException>(
+            () => SigstoreStateBootstrapper.EnsureInitialized(state.Path));
+    }
+
+    [Fact]
+    public void ActiveGenerationRejectsPartialCtRotationMetadata()
+    {
+        using var state = new TemporaryDirectory();
+        var initial = SigstoreStateBootstrapper.EnsureInitialized(state.Path);
+        var manifestPath = System.IO.Path.Combine(
+            state.Path,
+            "generations",
+            initial.Generation.GenerationId,
+            "manifest.json");
+        var generation = initial.Generation with
+        {
+            CtLogBaseUrl =
+                "http://tesseract-secondary-sigstore.dev.localhost:6963"
+        };
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                manifestPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        var manifestBytes = JsonSerializer.SerializeToUtf8Bytes(
+            generation,
+            JsonOptions);
+        File.WriteAllBytes(manifestPath, manifestBytes);
+        var journal = ReadJournal(state.Path);
+        var journalPath = System.IO.Path.Combine(
+            state.Path,
+            "transition",
+            "state.json");
+        File.WriteAllText(
+            journalPath,
+            JsonSerializer.Serialize(
+                journal with
+                {
+                    Candidate = journal.Candidate with
+                    {
+                        ManifestSha256 = Convert.ToHexString(
+                                SHA256.HashData(manifestBytes))
+                            .ToLowerInvariant()
+                    },
+                    CandidateManifest = generation
+                },
+                JsonOptions));
+
+        Assert.Throws<InvalidDataException>(
+            () => SigstoreStateBootstrapper.EnsureInitialized(state.Path));
+    }
+
+    [Fact]
     public void LockContentionIsExplicitAndReleasedOwnersDoNotBlock()
     {
         using var state = new TemporaryDirectory();

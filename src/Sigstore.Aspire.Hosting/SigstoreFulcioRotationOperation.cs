@@ -32,6 +32,11 @@ internal sealed partial class SigstoreOperationExecutor
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.RotateFulcioCaCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RotateFulcioCaCommand,
                 "Rotating Fulcio CA",
@@ -916,7 +921,7 @@ internal sealed partial class SigstoreOperationExecutor
             cancellationToken);
         execution.Check(
             "aggregate-status-ready",
-            aggregate.Ready
+            IsReadyForActiveOperation(aggregate)
                 && aggregate.Clients.Count == clients.Length
                 && aggregate.Fulcio is
                 {

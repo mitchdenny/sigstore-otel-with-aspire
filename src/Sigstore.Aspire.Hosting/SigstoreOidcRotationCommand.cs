@@ -28,7 +28,7 @@ internal static class SigstoreOidcRotationCommand
                 "keys via JWKS refresh). Proceed?",
             IsHighlighted = true,
             UpdateState = _ =>
-                SigstoreOperationCommand.GetMutationCommandState(resource),
+                SigstoreOperationCommand.GetOidcRotationCommandState(resource),
             Progress = new CommandProgressOptions
             {
                 Title = "Rotate OIDC signing key",

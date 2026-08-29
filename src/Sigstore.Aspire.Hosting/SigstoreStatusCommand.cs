@@ -571,27 +571,7 @@ internal static class SigstoreStatusCommand
                 ctLog = await ReadCtLogStatusAsync(
                     resource,
                     cancellationToken);
-                foreach (var shard in ctLog.Shards)
-                {
-                    if (!shard.InTrustedRoot)
-                    {
-                        errors.Add(
-                            new(
-                                "ctlog",
-                                $"the {shard.Slot} certificate-transparency " +
-                                "shard is not published in TrustedRoot."));
-                    }
-                }
-                if (ctLog.FulcioCtPromotionPending)
-                {
-                    errors.Add(
-                        new(
-                            "ctlog",
-                            "certificate-transparency cutover is pending: " +
-                            "Fulcio is still bound to the " +
-                            $"{ctLog.SelectedFulcioShardSlot} shard while " +
-                            "a replacement selection is staged."));
-                }
+                AppendCtLogStatusErrors(ctLog, errors);
             }
             catch (Exception exception)
                 when (IsExpectedStatusFailure(exception))
@@ -608,9 +588,18 @@ internal static class SigstoreStatusCommand
                     runtime.Reason
                         ?? $"Parent resource state is {runtime.State}."));
         }
+        SigstoreOperationExecutor.RefreshDurableRecoveryState(resource);
         var presentation = resource.GetPresentation();
-        if (presentation.Operation is null
-            && presentation.Recovery is not null)
+        if (presentation.Operation is not null)
+        {
+            errors.Add(
+                new(
+                    "operation",
+                    $"{presentation.Operation.Command} is active in phase " +
+                    $"{presentation.Operation.Phase}: " +
+                    presentation.Operation.Message));
+        }
+        else if (presentation.Recovery is not null)
         {
             errors.Add(
                 new(
@@ -683,6 +672,68 @@ internal static class SigstoreStatusCommand
             fulcio,
             rekor,
             ctLog);
+    }
+
+    internal static void AppendCtLogStatusErrors(
+        SigstoreCtLogStatus ctLog,
+        ICollection<SigstoreStatusError> errors)
+    {
+        ArgumentNullException.ThrowIfNull(ctLog);
+        ArgumentNullException.ThrowIfNull(errors);
+
+        foreach (var shard in ctLog.Shards)
+        {
+            if (!shard.InTrustedRoot)
+            {
+                errors.Add(
+                    new(
+                        "ctlog",
+                        $"the {shard.Slot} certificate-transparency shard is " +
+                        "not published in TrustedRoot."));
+            }
+            if (shard.ComputeRequired && shard.ComputeHealthy != true)
+            {
+                errors.Add(
+                    new(
+                        "ctlog",
+                        $"the required {shard.Slot} certificate-transparency " +
+                        "compute resource is not healthy."));
+            }
+            if (!shard.AcceptedRootsMatchRuntime)
+            {
+                errors.Add(
+                    new(
+                        "ctlog",
+                        $"the {shard.Slot} certificate-transparency shard's " +
+                        "accepted-root projection does not match its catalog."));
+            }
+        }
+        if (ctLog.TrustedRootCtlogCount != ctLog.Shards.Count)
+        {
+            errors.Add(
+                new(
+                    "ctlog",
+                    "TrustedRoot certificate-transparency entry count does " +
+                    "not match the shard catalog."));
+        }
+        if (ctLog.FulcioCtPromotionPending)
+        {
+            errors.Add(
+                new(
+                    "ctlog",
+                    "certificate-transparency cutover is pending: Fulcio is " +
+                    $"still bound to the {ctLog.SelectedFulcioShardSlot} shard " +
+                    "while a replacement selection is staged."));
+        }
+        if (ctLog.IncompleteRotationOperationId is not null)
+        {
+            errors.Add(
+                new(
+                    "ctlog",
+                    "certificate-transparency recovery is pending for operation " +
+                    $"{ctLog.IncompleteRotationOperationId} in phase " +
+                    $"{ctLog.IncompleteRotationStatus ?? "unknown"}."));
+        }
     }
 
     /// <summary>
@@ -1260,6 +1311,7 @@ internal static class SigstoreStatusCommand
         ValidateFulcioRotationMetadata(generationManifest);
         ValidateTimestampRotationMetadata(generationManifest);
         ValidateRekorRotationMetadata(generationManifest);
+        ValidateCtLogRotationMetadata(generationManifest);
         var generationManifestHash = Hash(generationManifestBytes);
 
         var transition = DeserializeRequired<TransitionJournalStatus>(
@@ -2238,6 +2290,22 @@ internal static class SigstoreStatusCommand
             == second.RekorShardId
         && first.RekorBaseUrl
             == second.RekorBaseUrl
+        && first.CtLogRotationOperationId
+            == second.CtLogRotationOperationId
+        && first.CtLogPriorGeneration
+            == second.CtLogPriorGeneration
+        && first.CtLogPriorGenerationId
+            == second.CtLogPriorGenerationId
+        && first.CtLogPriorPublicKeySha256
+            == second.CtLogPriorPublicKeySha256
+        && first.CtLogPriorShardId
+            == second.CtLogPriorShardId
+        && first.CtLogPriorBaseUrl
+            == second.CtLogPriorBaseUrl
+        && first.CtLogShardId
+            == second.CtLogShardId
+        && first.CtLogBaseUrl
+            == second.CtLogBaseUrl
         && DictionariesEqual(first.Files, second.Files);
 
     private static void ValidateFulcioRotationMetadata(
@@ -2355,6 +2423,54 @@ internal static class SigstoreStatusCommand
         {
             throw new SigstoreStatusException(
                 "The active generation has invalid Rekor shard rotation metadata.");
+        }
+    }
+
+    private static void ValidateCtLogRotationMetadata(
+        GenerationManifestStatus generation)
+    {
+        if (generation.CtLogRotationOperationId is null)
+        {
+            if (generation.CtLogPriorGeneration != 0
+                || generation.CtLogPriorGenerationId is not null
+                || generation.CtLogPriorPublicKeySha256 is not null
+                || generation.CtLogPriorShardId is not null
+                || generation.CtLogPriorBaseUrl is not null
+                || generation.CtLogShardId is not null
+                || generation.CtLogBaseUrl is not null)
+            {
+                throw new SigstoreStatusException(
+                    "The active generation has partial CT log shard rotation " +
+                    "metadata.");
+            }
+            return;
+        }
+
+        if (!Guid.TryParseExact(
+                generation.CtLogRotationOperationId,
+                "N",
+                out _)
+            || generation.CtLogRotationOperationId.Any(char.IsUpper)
+            || generation.CtLogPriorGeneration
+                != generation.Generation - 1
+            || generation.CtLogPriorGenerationId
+                != $"generation-{generation.CtLogPriorGeneration:D8}"
+            || !IsLowerHexSha256(
+                generation.CtLogPriorPublicKeySha256 ?? "")
+            || generation.CtLogPriorPublicKeySha256
+                == generation.CtLogPublicKeySha256
+            || generation.CtLogPriorShardId
+                != $"sha256-{generation.CtLogPriorPublicKeySha256}"
+            || generation.CtLogPriorBaseUrl
+                != "http://tesseract-sigstore.dev.localhost:6962"
+            || generation.CtLogShardId
+                != $"sha256-{generation.CtLogPublicKeySha256}"
+            || generation.CtLogBaseUrl
+                != "http://tesseract-secondary-sigstore.dev.localhost:6963")
+        {
+            throw new SigstoreStatusException(
+                "The active generation has invalid CT log shard rotation " +
+                "metadata.");
         }
     }
 

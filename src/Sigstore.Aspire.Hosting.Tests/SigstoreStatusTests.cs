@@ -309,6 +309,68 @@ public sealed class SigstoreStatusTests
             result.Data?.Value);
     }
 
+    [Fact]
+    public void CtStatusErrorsCoverComputeProjectionCountAndRecovery()
+    {
+        var shard = new SigstoreCtLogShardHealthStatus(
+            "sha256-" + new string('1', 64),
+            "primary",
+            "active",
+            SigstoreCtLogShard.PrimaryUrl,
+            SigstoreCtLogShard.PrimaryOrigin,
+            SigstoreCtLogShard.PrimaryResourceName,
+            new string('1', 64),
+            new string('1', 64),
+            "state-id",
+            1,
+            1,
+            new string('2', 64),
+            new string('3', 64),
+            true,
+            true,
+            false,
+            new string('4', 64),
+            1,
+            [new string('5', 64)],
+            false);
+        var status = new SigstoreCtLogStatus(
+            shard.ShardId,
+            "primary",
+            SigstoreCtLogShard.PrimaryOrigin,
+            shard.PublicKeySha256,
+            false,
+            null,
+            2,
+            [],
+            [shard],
+            Guid.NewGuid().ToString("N"),
+            SigstoreCtLogShard.StatusWorkerCommitted);
+        var errors = new List<SigstoreStatusError>();
+
+        SigstoreStatusCommand.AppendCtLogStatusErrors(status, errors);
+
+        Assert.Contains(
+            errors,
+            error => error.Message.Contains(
+                "compute resource is not healthy",
+                StringComparison.Ordinal));
+        Assert.Contains(
+            errors,
+            error => error.Message.Contains(
+                "accepted-root projection",
+                StringComparison.Ordinal));
+        Assert.Contains(
+            errors,
+            error => error.Message.Contains(
+                "entry count",
+                StringComparison.Ordinal));
+        Assert.Contains(
+            errors,
+            error => error.Message.Contains(
+                "recovery is pending",
+                StringComparison.Ordinal));
+    }
+
     private static SigstoreClientTrustStatus NewClientStatus(
         string resource,
         string language) =>

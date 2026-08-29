@@ -6,6 +6,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
@@ -68,7 +69,7 @@ internal static class SigstoreOperationCommand
                 "content, and trust generation remain unchanged.",
             IconName = "KeyMultiple",
             IconVariant = IconVariant.Regular,
-            UpdateState = _ => GetMutationCommandState(resource),
+            UpdateState = _ => GetTufRootRotationCommandState(resource),
             Progress = new CommandProgressOptions
             {
                 Title = "Rotate TUF root key",
@@ -170,7 +171,7 @@ internal static class SigstoreOperationCommand
                 "material is preserved.",
             IconName = "ShieldCheckmark",
             IconVariant = IconVariant.Regular,
-            UpdateState = _ => GetMutationCommandState(resource),
+            UpdateState = _ => GetTrustedRootPublicationCommandState(resource),
             Progress = new CommandProgressOptions
             {
                 Title = "Publish trusted root",
@@ -202,7 +203,7 @@ internal static class SigstoreOperationCommand
     internal static ResourceCommandState GetMutationCommandState(
         SigstoreResource resource)
     {
-        var presentation = resource.GetPresentation();
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.Recovery is null
             && presentation.RuntimeHealth.State == "Healthy"
@@ -211,10 +212,50 @@ internal static class SigstoreOperationCommand
     }
 
     internal static ResourceCommandState
+        GetTufRootRotationCommandState(
+            SigstoreResource resource)
+    {
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
+        return presentation.Operation is null
+            && presentation.RuntimeHealth.State == "Healthy"
+            && (presentation.Recovery is null
+                || presentation.Recovery.Command == RotateTufRootCommand)
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
+    internal static ResourceCommandState
+        GetOidcRotationCommandState(
+            SigstoreResource resource)
+    {
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
+        return presentation.Operation is null
+            && presentation.RuntimeHealth.State == "Healthy"
+            && (presentation.Recovery is null
+                || presentation.Recovery.Command
+                    == RotateOidcSigningKeyCommand)
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
+    internal static ResourceCommandState
+        GetTrustedRootPublicationCommandState(
+            SigstoreResource resource)
+    {
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
+        return presentation.Operation is null
+            && presentation.RuntimeHealth.State == "Healthy"
+            && (presentation.Recovery is null
+                || presentation.Recovery.Command == PublishTrustedRootCommand)
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
+    internal static ResourceCommandState
         GetTimestampAuthorityRotationCommandState(
             SigstoreResource resource)
     {
-        var presentation = resource.GetPresentation();
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
             && (presentation.Recovery is null
@@ -227,7 +268,7 @@ internal static class SigstoreOperationCommand
     internal static ResourceCommandState GetFulcioRotationCommandState(
         SigstoreResource resource)
     {
-        var presentation = resource.GetPresentation();
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
             && (presentation.Recovery is null
@@ -239,7 +280,7 @@ internal static class SigstoreOperationCommand
     internal static ResourceCommandState GetRekorShardRotationCommandState(
         SigstoreResource resource)
     {
-        var presentation = resource.GetPresentation();
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
             && (presentation.Recovery is null
@@ -252,7 +293,7 @@ internal static class SigstoreOperationCommand
     internal static ResourceCommandState GetCtLogShardRotationCommandState(
         SigstoreResource resource)
     {
-        var presentation = resource.GetPresentation();
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
             && (presentation.Recovery is null
@@ -260,6 +301,13 @@ internal static class SigstoreOperationCommand
                    == RotateCtLogShardCommand)
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
+    }
+
+    private static SigstoreParentPresentationSnapshot
+        RefreshRecoveryAndGetPresentation(SigstoreResource resource)
+    {
+        SigstoreOperationExecutor.RefreshDurableRecoveryState(resource);
+        return resource.GetPresentation();
     }
 
     internal static ExecuteCommandResult CreateResult(
@@ -303,9 +351,17 @@ internal sealed partial class SigstoreOperationExecutor(
     private const string TsaRotationStatusTimestampRestarted =
         "timestamp-restarted";
     private const string TsaRotationStatusCompleted = "completed";
+    private const string TrustedRootStatusRequested = "requested";
+    private const string TrustedRootStatusWorkerCommitted = "worker-committed";
+    private const string TrustedRootStatusClientsConverging =
+        "clients-converging";
+    private const string TrustedRootStatusClientsConverged =
+        "clients-converged";
+    private const string TrustedRootStatusCompleted = "completed";
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
         {
+            UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
             WriteIndented = true
         };
     private static readonly TimeSpan WorkerTimeout =
@@ -315,10 +371,178 @@ internal sealed partial class SigstoreOperationExecutor(
     private static readonly TimeSpan AggregateTimeout =
         TimeSpan.FromMinutes(2);
 
+    internal static void RefreshDurableRecoveryState(
+        SigstoreResource resource)
+    {
+        const string lifecycleRecoveryCommand = "lifecycle-recovery";
+        try
+        {
+            var pending = new List<(string Command, string Phase)>();
+            Add(
+                pending,
+                SigstoreOperationCommand.RotateTufRootCommand,
+                LoadIncompleteTufRootRotation(resource.StatePath)?.Status);
+            Add(
+                pending,
+                SigstoreOperationCommand.PublishTrustedRootCommand,
+                LoadIncompleteTrustedRootPublication(resource.StatePath)?.Status);
+            Add(
+                pending,
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+                LoadIncompleteOidcRotation(resource.StatePath)?.Status);
+            Add(
+                pending,
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand,
+                DetectIncompleteTimestampAuthorityRotation(
+                    resource.StatePath));
+            Add(
+                pending,
+                SigstoreOperationCommand.RotateFulcioCaCommand,
+                LoadIncompleteFulcioRotation(resource.StatePath)?.Status);
+            Add(
+                pending,
+                SigstoreOperationCommand.RotateRekorShardCommand,
+                LoadIncompleteRekorShardRotation(resource.StatePath)?.Status);
+            Add(
+                pending,
+                SigstoreOperationCommand.RotateCtLogShardCommand,
+                LoadIncompleteCtLogShardRotation(resource.StatePath)?.Status);
+            var requestFiles =
+                new (string Command, string FileName)[]
+                {
+                    (
+                        SigstoreOperationCommand.RotateTufRootCommand,
+                        "rotate-root.request"),
+                    (
+                        SigstoreOperationCommand.PublishTrustedRootCommand,
+                        "publish-trusted-root.request"),
+                    (
+                        SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+                        "rotate-oidc-signing-key.request"),
+                    (
+                        SigstoreOperationCommand
+                            .RotateTimestampAuthorityCommand,
+                        "rotate-timestamp-authority.request"),
+                    (
+                        SigstoreOperationCommand.RotateFulcioCaCommand,
+                        "rotate-fulcio-ca.request"),
+                    (
+                        SigstoreOperationCommand.RotateRekorShardCommand,
+                        "rotate-rekor-shard.request"),
+                    (
+                        SigstoreOperationCommand.RotateCtLogShardCommand,
+                        "rotate-ct-log-shard.request")
+                };
+            foreach (var request in requestFiles)
+            {
+                if (File.Exists(
+                        Path.Combine(resource.StatePath, request.FileName))
+                    && pending.All(item =>
+                        item.Command != request.Command))
+                {
+                    throw new InvalidDataException(
+                        $"Orphaned lifecycle request '{request.FileName}' " +
+                        "has no incomplete command journal.");
+                }
+            }
+
+            resource.ClearOperationRecovery(lifecycleRecoveryCommand);
+            if (pending.Count == 0)
+            {
+                return;
+            }
+            if (pending.Count > 1)
+            {
+                throw new InvalidDataException(
+                    "Multiple incomplete lifecycle operations exist: " +
+                    string.Join(
+                        ", ",
+                        pending.Select(item =>
+                            $"{item.Command}/{item.Phase}")) +
+                    ".");
+            }
+
+            var recovery = pending[0];
+            resource.SetOperationRecovery(
+                recovery.Command,
+                recovery.Phase,
+                "Lifecycle Recovery Pending",
+                $"{recovery.Command} must replay its durable journal before " +
+                "another mutation.");
+        }
+        catch (Exception exception)
+            when (exception is IOException
+                or UnauthorizedAccessException
+                or JsonException
+                or InvalidDataException
+                or CryptographicException)
+        {
+            resource.SetOperationRecovery(
+                lifecycleRecoveryCommand,
+                "invalid-or-ambiguous-journal",
+                "Lifecycle Recovery Failed Closed",
+                exception.Message);
+        }
+
+        static void Add(
+            List<(string Command, string Phase)> pending,
+            string command,
+            string? phase)
+        {
+            if (phase is not null)
+            {
+                pending.Add((command, phase));
+            }
+        }
+    }
+
+    private static string? DetectIncompleteTimestampAuthorityRotation(
+        string statePath)
+    {
+        var root = Path.Combine(statePath, "tsa-rotation");
+        if (!Directory.Exists(root))
+        {
+            return null;
+        }
+        var hasUnjournaledEvidence = Directory
+            .EnumerateDirectories(root)
+            .Any(directory =>
+            {
+                if (File.Exists(Path.Combine(directory, "command.json")))
+                {
+                    return false;
+                }
+                var operationId = Path.GetFileName(directory);
+                var entries = Directory.EnumerateFileSystemEntries(directory)
+                    .Select(Path.GetFileName)
+                    .ToHashSet(StringComparer.Ordinal);
+                if (!Guid.TryParseExact(operationId, "N", out _)
+                    || operationId.Any(char.IsUpper)
+                    || !entries.IsSubsetOf(
+                        new HashSet<string>(
+                            ["old-request.tsq", "old-response.tsr"],
+                            StringComparer.Ordinal)))
+                {
+                    throw new InvalidDataException(
+                        $"Unjournaled TSA operation directory '{directory}' " +
+                        "contains ambiguous state.");
+                }
+                return true;
+            });
+        return hasUnjournaledEvidence
+            ? "pre-activation-cleanup"
+            : LoadIncompleteTimestampAuthorityRotation(statePath)?.Status;
+    }
+
     public async Task<ExecuteCommandResult> ExecuteRefreshTufAsync(
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.RefreshTufCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RefreshTufCommand,
                 "Refreshing TUF",
@@ -365,6 +589,11 @@ internal sealed partial class SigstoreOperationExecutor(
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.RotateTufRootCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RotateTufRootCommand,
                 "Rotating TUF Root",
@@ -402,6 +631,7 @@ internal sealed partial class SigstoreOperationExecutor(
         }
         finally
         {
+            RefreshTufRootRotationRecoveryState();
             lease!.Dispose();
             await runtime.PublishParentStateAsync(resource);
         }
@@ -411,6 +641,11 @@ internal sealed partial class SigstoreOperationExecutor(
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.RestartClientsCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RestartClientsCommand,
                 "Restarting Clients",
@@ -457,6 +692,11 @@ internal sealed partial class SigstoreOperationExecutor(
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.PublishTrustedRootCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.PublishTrustedRootCommand,
                 "Publishing Trusted Root",
@@ -494,6 +734,7 @@ internal sealed partial class SigstoreOperationExecutor(
         }
         finally
         {
+            RefreshTrustedRootPublicationRecoveryState();
             lease!.Dispose();
             await runtime.PublishParentStateAsync(resource);
         }
@@ -503,6 +744,11 @@ internal sealed partial class SigstoreOperationExecutor(
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RotateOidcSigningKeyCommand,
                 "Rotating OIDC signing key",
@@ -550,6 +796,12 @@ internal sealed partial class SigstoreOperationExecutor(
             CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand
+                    .RotateTimestampAuthorityCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RotateTimestampAuthorityCommand,
                 "Rotating Timestamp Authority",
@@ -1298,7 +1550,7 @@ internal sealed partial class SigstoreOperationExecutor(
             clientCritical.Token);
         execution.Check(
             "aggregate-status-ready",
-            aggregate.Ready
+            IsReadyForActiveOperation(aggregate)
                 && aggregate.Clients.Count == clients.Length,
             $"ready=true and {clients.Length} converged clients",
             aggregate.Reason
@@ -2300,6 +2552,12 @@ internal sealed partial class SigstoreOperationExecutor(
                     requestCancellationToken);
             before = operation.StartingSnapshot;
             execution.Before = before;
+            resource.SetOperationRecovery(
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+                operation.Status,
+                "OIDC Recovery Pending",
+                "The durable OIDC rotation must finish issuer and client " +
+                "convergence before another trust mutation.");
             execution.OidcRotation = CreateOidcRotationResult(
                 operation,
                 recovered: operation.Status != OidcRotationStatusRequested);
@@ -2415,6 +2673,11 @@ internal sealed partial class SigstoreOperationExecutor(
                 WorkerCompletion = ReadOidcWorkerCompletion(resource.StatePath)
             };
             WriteOidcRotationJournal(resource.StatePath, operation);
+            resource.SetOperationRecovery(
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+                operation.Status,
+                "OIDC Recovery Pending",
+                "Trust committed; the OIDC issuer and clients must converge.");
         }
         var completionResult = operation.WorkerCompletion;
         execution.Check("generation-advanced",
@@ -2526,6 +2789,11 @@ internal sealed partial class SigstoreOperationExecutor(
             OidcAfterStartTimeUtc = oidcAfter.StartTimeUtc
         };
         WriteOidcRotationJournal(resource.StatePath, operation);
+        resource.SetOperationRecovery(
+            SigstoreOperationCommand.RotateOidcSigningKeyCommand,
+            operation.Status,
+            "OIDC Recovery Pending",
+            "OIDC restarted; token continuity and client convergence remain.");
 
         await execution.ReportAsync("verify-new-token", 7,
             "Validating the post-switch JWT claims and rotated kid.");
@@ -2634,7 +2902,7 @@ internal sealed partial class SigstoreOperationExecutor(
             AggregateTimeout, clientCritical.Token);
         var aggregate = await runtime.CollectStatusAsync(clientCritical.Token);
         execution.Check("aggregate-ready",
-            aggregate.Ready
+            IsReadyForActiveOperation(aggregate)
                 && aggregate.Clients.Count == clients.Length
                 && aggregate.Clients.All(client =>
                     MatchesDisk(after.Tuf.Trust, client)),
@@ -2667,6 +2935,8 @@ internal sealed partial class SigstoreOperationExecutor(
             CompletedAtUtc = DateTimeOffset.UtcNow
         };
         WriteOidcRotationJournal(resource.StatePath, operation);
+        resource.ClearOperationRecovery(
+            SigstoreOperationCommand.RotateOidcSigningKeyCommand);
         execution.OidcRotation = CreateOidcRotationResult(
             operation,
             recovered: operation.StartedAtUtc < execution.Progress[0].ObservedAtUtc);
@@ -2743,6 +3013,7 @@ internal sealed partial class SigstoreOperationExecutor(
                         $"OIDC command journal '{path}' is empty.");
                 if (journal.SchemaVersion != 1
                     || !Guid.TryParseExact(journal.OperationId, "N", out _)
+                    || journal.OperationId.Any(char.IsUpper)
                     || Path.GetFileName(Path.GetDirectoryName(path))
                         != journal.OperationId)
                 {
@@ -2792,6 +3063,12 @@ internal sealed partial class SigstoreOperationExecutor(
                 {
                     throw new InvalidDataException(
                         $"OIDC command journal '{path}' has invalid worker state.");
+                }
+                if (journal.Status != OidcRotationStatusRequested)
+                {
+                    ValidateOidcWorkerCompletion(
+                        journal.WorkerCompletion!,
+                        journal);
                 }
                 if (journal.Status == OidcRotationStatusOidcRestarted
                     && (string.IsNullOrWhiteSpace(journal.OidcAfterContainerId)
@@ -2860,19 +3137,58 @@ internal sealed partial class SigstoreOperationExecutor(
                 "The OIDC worker completion is empty.");
         if (completion.SchemaVersion != 2
             || !Guid.TryParseExact(completion.OperationId, "N", out _)
+            || completion.OperationId.Any(char.IsUpper)
+            || string.IsNullOrWhiteSpace(completion.TrustDomainId)
+            || completion.PriorGeneration < 1
             || completion.NewGeneration != completion.PriorGeneration + 1
             || completion.NewGenerationId
                 != $"generation-{completion.NewGeneration:D8}"
             || completion.PriorGenerationId
                 != $"generation-{completion.PriorGeneration:D8}"
+            || string.IsNullOrWhiteSpace(completion.PriorOidcKeyId)
+            || string.IsNullOrWhiteSpace(completion.NewOidcKeyId)
+            || completion.PriorOidcKeyId == completion.NewOidcKeyId
             || completion.JwksKeyIds.Count < 2
-            || string.IsNullOrWhiteSpace(completion.JwksSha256)
-            || string.IsNullOrWhiteSpace(completion.PublicationId))
+            || completion.JwksKeyIds.Distinct(StringComparer.Ordinal).Count()
+                != completion.JwksKeyIds.Count
+            || !IsLowerHexSha256(completion.ManifestSha256)
+            || !IsLowerHexSha256(completion.JwksSha256)
+            || string.IsNullOrWhiteSpace(completion.PublicationId)
+            || !DateTimeOffset.TryParse(
+                completion.OverlapExpiresAtUtc,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal,
+                out _))
         {
             throw new InvalidDataException(
                 "The OIDC worker completion is invalid.");
         }
         return completion;
+    }
+
+    private static void ValidateOidcWorkerCompletion(
+        OidcRotationWorkerCompletion completion,
+        OidcRotationCommandJournal operation)
+    {
+        if (completion.OperationId != operation.OperationId
+            || completion.TrustDomainId != operation.TrustDomainId
+            || completion.PriorGeneration != operation.StartingGeneration
+            || completion.PriorGenerationId != operation.StartingGenerationId
+            || completion.PriorOidcKeyId != operation.StartingOidcKeyId
+            || completion.NewGeneration != operation.NewGeneration
+            || completion.NewGenerationId != operation.NewGenerationId
+            || completion.NewOidcKeyId != operation.NewOidcKeyId
+            || completion.JwksKeyIds.Contains(
+                operation.StartingOidcKeyId,
+                StringComparer.Ordinal) is false
+            || completion.JwksKeyIds.Contains(
+                operation.NewOidcKeyId!,
+                StringComparer.Ordinal) is false)
+        {
+            throw new InvalidDataException(
+                "OIDC worker completion does not match the durable command " +
+                "journal.");
+        }
     }
 
     private static void WriteOidcRotationJournal(
@@ -3228,6 +3544,22 @@ internal sealed partial class SigstoreOperationExecutor(
         OperationExecution execution,
         CancellationToken requestCancellationToken)
     {
+        TrustedRootPublicationCommandJournal? incomplete;
+        using (stateInspector.AcquireLock(
+            resource.StatePath,
+            "dashboard-publish-trusted-root-recovery-scan"))
+        {
+            incomplete = LoadIncompleteTrustedRootPublication(
+                resource.StatePath);
+        }
+        if (incomplete is not null)
+        {
+            return await RecoverTrustedRootPublicationAsync(
+                execution,
+                incomplete,
+                requestCancellationToken);
+        }
+
         await execution.ReportAsync(
             "preflight",
             0,
@@ -3236,6 +3568,7 @@ internal sealed partial class SigstoreOperationExecutor(
         SigstoreOperationSnapshot before;
         SigstoreResourceInstanceSnapshot workerBefore;
         ExecuteCommandResult workerStart;
+        TrustedRootPublicationCommandJournal operation;
         using (stateInspector.AcquireLock(
             resource.StatePath,
             "dashboard-publish-trusted-root-preflight"))
@@ -3290,29 +3623,34 @@ internal sealed partial class SigstoreOperationExecutor(
                 1,
                 "Writing publish-trusted-root.request signal file for the TUF worker.");
 
-            var operationId = Guid.NewGuid().ToString("N");
+            var operationId = execution.OperationId.ToString("N");
             var signalPath = Path.Combine(
                 resource.StatePath,
                 "publish-trusted-root.request");
-
-            // Use FileMode.CreateNew to atomically reject if a surviving request
-            // file exists — never overwrite replay correlation.
-            var requestContent = System.Text.Json.JsonSerializer.Serialize(new
-            {
-                schemaVersion = 1,
-                operationId = operationId,
-                trustDomainId = before.Tuf.Trust.TrustDomainId
-            });
+            operation = new TrustedRootPublicationCommandJournal(
+                1,
+                operationId,
+                TrustedRootStatusRequested,
+                DateTimeOffset.UtcNow,
+                before,
+                workerBefore,
+                null,
+                null,
+                []);
+            WriteTrustedRootPublicationJournal(
+                resource.StatePath,
+                operation);
             try
             {
-                await using var fs = new FileStream(
+                WriteCreateNewJson(
                     signalPath,
-                    FileMode.CreateNew,
-                    FileAccess.Write,
-                    FileShare.None);
-                var bytes = System.Text.Encoding.UTF8.GetBytes(requestContent);
-                await fs.WriteAsync(bytes, requestCancellationToken);
-                await fs.FlushAsync(requestCancellationToken);
+                    new
+                    {
+                        schemaVersion = 1,
+                        operationId,
+                        trustDomainId =
+                            before.Tuf.Trust.TrustDomainId
+                    });
             }
             catch (IOException ex) when (ex.HResult == unchecked((int)0x80070050) /* ERROR_FILE_EXISTS */
                 || File.Exists(signalPath))
@@ -3419,6 +3757,25 @@ internal sealed partial class SigstoreOperationExecutor(
             after = await CaptureAsync(postconditionToken.Token);
             execution.After = after;
             ValidatePublishPostconditions(execution, before, after, workerBefore, workerAfter);
+            if (!execution.HasFailures)
+            {
+                operation = operation with
+                {
+                    Status = TrustedRootStatusWorkerCommitted,
+                    UpdatedAtUtc = DateTimeOffset.UtcNow,
+                    CommittedSnapshot = after,
+                    WorkerAfter = workerAfter
+                };
+                WriteTrustedRootPublicationJournal(
+                    resource.StatePath,
+                    operation);
+                resource.SetOperationRecovery(
+                    SigstoreOperationCommand.PublishTrustedRootCommand,
+                    TrustedRootStatusWorkerCommitted,
+                    "Trusted-root Recovery Pending",
+                    "The additive trust publication committed; all clients " +
+                    "must converge before another trust mutation.");
+            }
         }
 
         if (execution.HasFailures)
@@ -3533,8 +3890,33 @@ internal sealed partial class SigstoreOperationExecutor(
                     clientBefore,
                     clientAfter,
                     trustStatus));
+            operation = operation with
+            {
+                Status = TrustedRootStatusClientsConverging,
+                UpdatedAtUtc = DateTimeOffset.UtcNow,
+                Clients =
+                [
+                    .. operation.Clients,
+                    new TrustedRootClientConvergence(
+                        client.Resource.Name,
+                        clientAfter.ResourceId,
+                        clientAfter.ContainerId!,
+                        clientAfter.StartTimeUtc,
+                        trustStatus)
+                ]
+            };
+            WriteTrustedRootPublicationJournal(
+                resource.StatePath,
+                operation);
             completed++;
         }
+
+        operation = operation with
+        {
+            Status = TrustedRootStatusClientsConverged,
+            UpdatedAtUtc = DateTimeOffset.UtcNow
+        };
+        WriteTrustedRootPublicationJournal(resource.StatePath, operation);
 
         await execution.ReportAsync(
             "aggregate-status",
@@ -3546,7 +3928,7 @@ internal sealed partial class SigstoreOperationExecutor(
         var aggregate = await runtime.CollectStatusAsync(clientCritical.Token);
         execution.Check(
             "aggregate-status-ready",
-            aggregate.Ready
+            IsReadyForActiveOperation(aggregate)
                 && aggregate.Clients.Count == clients.Length,
             $"ready=true and {clients.Length} clients",
             aggregate.Reason
@@ -3580,8 +3962,534 @@ internal sealed partial class SigstoreOperationExecutor(
             "complete",
             12,
             "Trusted-root published, all clients converged on new trust material.");
+        operation = operation with
+        {
+            Status = TrustedRootStatusCompleted,
+            UpdatedAtUtc = DateTimeOffset.UtcNow
+        };
+        WriteTrustedRootPublicationJournal(resource.StatePath, operation);
+        resource.ClearOperationRecovery(
+            SigstoreOperationCommand.PublishTrustedRootCommand);
         return execution.Success(
             "Additive trusted-root update published and verified across all clients.");
+    }
+
+    private async Task<ExecuteCommandResult> RecoverTrustedRootPublicationAsync(
+        OperationExecution execution,
+        TrustedRootPublicationCommandJournal operation,
+        CancellationToken cancellationToken)
+    {
+        resource.SetOperationRecovery(
+            SigstoreOperationCommand.PublishTrustedRootCommand,
+            operation.Status,
+            "Trusted-root Recovery Pending",
+            "Resuming the durable additive trust publication before another " +
+            "trust mutation is allowed.");
+        execution.Before = operation.StartingSnapshot;
+        await execution.ReportAsync(
+            "recovery",
+            0,
+            $"Resuming trusted-root publication {operation.OperationId} from " +
+                $"{operation.Status}.");
+
+        var workerAfter = operation.WorkerAfter;
+        var committed = operation.CommittedSnapshot;
+        if (committed is null)
+        {
+            var requestPath = Path.Combine(
+                resource.StatePath,
+                "publish-trusted-root.request");
+            if (File.Exists(requestPath))
+            {
+                await execution.ReportAsync(
+                    "start-worker",
+                    2,
+                    "Restarting the TUF one-shot to consume the durable request.");
+                ExecuteCommandResult start;
+                using (stateInspector.AcquireLock(
+                    resource.StatePath,
+                    "dashboard-publish-trusted-root-recovery"))
+                {
+                    using var workerToken =
+                        new CancellationTokenSource(WorkerTimeout);
+                    start = await runtime.ExecuteCommandAsync(
+                        resource.Components.TufBootstrap.Resource,
+                        KnownResourceCommands.StartCommand,
+                        workerToken.Token);
+                }
+                if (!start.Success)
+                {
+                    execution.AddError(
+                        "start-worker",
+                        resource.Components.TufBootstrap.Resource.Name,
+                        null,
+                        start.Message
+                            ?? "Aspire rejected the recovery worker start.");
+                    return execution.Failure(
+                        "Trusted-root recovery worker could not be started.");
+                }
+                using var waitToken =
+                    new CancellationTokenSource(WorkerTimeout);
+                workerAfter = await runtime.WaitForSnapshotAsync(
+                    resource.Components.TufBootstrap.Resource,
+                    snapshot => IsNewInstance(operation.WorkerBefore, snapshot)
+                        && IsTerminal(snapshot),
+                    WorkerTimeout,
+                    waitToken.Token);
+            }
+            else
+            {
+                workerAfter = runtime.GetRequiredSnapshot(
+                    resource.Components.TufBootstrap.Resource);
+            }
+            if (!IsSuccessfulTerminal(workerAfter)
+                || !IsNewInstance(operation.WorkerBefore, workerAfter))
+            {
+                execution.AddError(
+                    "recovery",
+                    resource.Components.TufBootstrap.Resource.Name,
+                    null,
+                    "The durable request was consumed, but the completed " +
+                    "worker identity is missing or unsuccessful.");
+                return execution.Failure(
+                    "Trusted-root recovery cannot bind the committed worker.");
+            }
+
+            var completion = ReadTrustedRootWorkerCompletion(
+                resource.StatePath);
+            if (completion.OperationId != operation.OperationId
+                || completion.TrustDomainId
+                    != operation.StartingSnapshot.Tuf.Trust.TrustDomainId
+                || completion.Generation
+                    != operation.StartingSnapshot.Tuf.Trust.Generation + 1)
+            {
+                execution.AddError(
+                    "recovery",
+                    resource.Components.TufBootstrap.Resource.Name,
+                    null,
+                    "The worker completion does not match the durable command " +
+                    "journal.");
+                return execution.Failure(
+                    "Trusted-root recovery rejected an ambiguous completion.");
+            }
+
+            using (stateInspector.AcquireLock(
+                resource.StatePath,
+                "dashboard-publish-trusted-root-recovery-postconditions"))
+            {
+                committed = await CaptureAsync(cancellationToken);
+                execution.After = committed;
+                ValidatePublishPostconditions(
+                    execution,
+                    operation.StartingSnapshot,
+                    committed,
+                    operation.WorkerBefore,
+                    workerAfter);
+            }
+            if (execution.HasFailures)
+            {
+                return execution.Failure(
+                    "Trusted-root recovery rejected committed postconditions.");
+            }
+            operation = operation with
+            {
+                Status = TrustedRootStatusWorkerCommitted,
+                UpdatedAtUtc = DateTimeOffset.UtcNow,
+                CommittedSnapshot = committed,
+                WorkerAfter = workerAfter
+            };
+            WriteTrustedRootPublicationJournal(resource.StatePath, operation);
+        }
+        else
+        {
+            using (stateInspector.AcquireLock(
+                resource.StatePath,
+                "dashboard-publish-trusted-root-recovery-state"))
+            {
+                var current = await CaptureAsync(cancellationToken);
+                execution.After = current;
+                if (!SameCommittedTrust(committed, current))
+                {
+                    execution.AddError(
+                        "recovery",
+                        resource.Name,
+                        null,
+                        "Current trust state no longer matches the committed " +
+                        "trusted-root recovery journal.");
+                    return execution.Failure(
+                        "Trusted-root recovery failed closed on changed state.");
+                }
+                committed = current;
+            }
+        }
+
+        var clients = resource.GetRegistrations().Clients
+            .OrderBy(client => client.Resource.Name, StringComparer.Ordinal)
+            .ToArray();
+        if (clients.Length != 6)
+        {
+            execution.AddError(
+                "recovery",
+                resource.Name,
+                "six-clients-registered",
+                $"Expected 6 clients but found {clients.Length}.");
+            return execution.Failure(
+                "Trusted-root recovery requires exactly six clients.");
+        }
+
+        var completed = 6;
+        using var clientToken = new CancellationTokenSource(
+            TimeSpan.FromMinutes(20));
+        foreach (var client in clients)
+        {
+            var recorded = operation.Clients.SingleOrDefault(
+                item => item.Resource == client.Resource.Name);
+            var current = runtime.GetRequiredSnapshot(client.Resource);
+            if (recorded is not null
+                && IsRunningHealthy(current)
+                && current.ResourceId == recorded.ResourceId
+                && current.ContainerId == recorded.ContainerId
+                && current.StartTimeUtc == recorded.StartTimeUtc)
+            {
+                var currentTrust = await runtime.ReadClientStatusAsync(
+                    client,
+                    clientToken.Token);
+                if (MatchesDisk(committed.Tuf.Trust, currentTrust)
+                    && currentTrust == recorded.TrustStatus)
+                {
+                    execution.Check(
+                        $"{client.Resource.Name}-replay-identity",
+                        true,
+                        "recorded converged client identity and trust",
+                        recorded.ContainerId,
+                        "restart-client",
+                        client.Resource.Name);
+                    completed++;
+                    continue;
+                }
+            }
+
+            if (!IsRunningHealthy(current) || !HasContainerIdentity(current))
+            {
+                execution.AddError(
+                    "restart-client",
+                    client.Resource.Name,
+                    null,
+                    $"Client is not restartable: {Describe(current)}.");
+                return execution.Failure(
+                    $"{client.Resource.Name} is not ready for recovery.");
+            }
+            await execution.ReportAsync(
+                "restart-client",
+                completed,
+                $"Restarting {client.Resource.Name} for recovery convergence.");
+            var restart = await runtime.ExecuteCommandAsync(
+                client.Resource,
+                KnownResourceCommands.RestartCommand,
+                clientToken.Token);
+            if (!restart.Success)
+            {
+                execution.AddError(
+                    "restart-client",
+                    client.Resource.Name,
+                    null,
+                    restart.Message ?? "Aspire rejected the client restart.");
+                return execution.Failure(
+                    $"{client.Resource.Name} recovery restart failed.");
+            }
+            var restarted = await runtime.WaitForSnapshotAsync(
+                client.Resource,
+                snapshot => IsNewInstance(current, snapshot)
+                    && IsRunningHealthy(snapshot),
+                ClientTimeout,
+                clientToken.Token);
+            var trustStatus = await runtime.ReadClientStatusAsync(
+                client,
+                clientToken.Token);
+            if (!MatchesDisk(committed.Tuf.Trust, trustStatus))
+            {
+                execution.AddError(
+                    "wait-client",
+                    client.Resource.Name,
+                    null,
+                    "Client trust does not match the committed publication.");
+                return execution.Failure(
+                    $"{client.Resource.Name} remained stale during recovery.");
+            }
+            execution.Resources.Add(
+                CreateLifecycleResult(
+                    client.Resource.Name,
+                    KnownResourceCommands.RestartCommand,
+                    current,
+                    restarted,
+                    trustStatus));
+            operation = operation with
+            {
+                Status = TrustedRootStatusClientsConverging,
+                UpdatedAtUtc = DateTimeOffset.UtcNow,
+                Clients =
+                [
+                    .. operation.Clients.Where(
+                        item => item.Resource != client.Resource.Name),
+                    new TrustedRootClientConvergence(
+                        client.Resource.Name,
+                        restarted.ResourceId,
+                        restarted.ContainerId!,
+                        restarted.StartTimeUtc,
+                        trustStatus)
+                ]
+            };
+            WriteTrustedRootPublicationJournal(resource.StatePath, operation);
+            completed++;
+        }
+
+        operation = operation with
+        {
+            Status = TrustedRootStatusClientsConverged,
+            UpdatedAtUtc = DateTimeOffset.UtcNow
+        };
+        WriteTrustedRootPublicationJournal(resource.StatePath, operation);
+        await execution.ReportAsync(
+            "aggregate-status",
+            10,
+            "Verifying aggregate health after recovery convergence.");
+        await runtime.WaitForAggregateHealthyAsync(
+            AggregateTimeout,
+            clientToken.Token);
+        var aggregate = await runtime.CollectStatusAsync(clientToken.Token);
+        execution.Check(
+            "aggregate-status-ready",
+            IsReadyForActiveOperation(aggregate)
+                && aggregate.Clients.Count == clients.Length,
+            $"operationally ready with {clients.Length} clients",
+            aggregate.Reason
+                ?? $"ready={aggregate.Ready}, clients={aggregate.Clients.Count}",
+            "aggregate-status",
+            resource.Name);
+        if (execution.HasFailures)
+        {
+            return execution.Failure(
+                "Trusted-root recovery convergence checks failed.");
+        }
+
+        operation = operation with
+        {
+            Status = TrustedRootStatusCompleted,
+            UpdatedAtUtc = DateTimeOffset.UtcNow
+        };
+        WriteTrustedRootPublicationJournal(resource.StatePath, operation);
+        resource.ClearOperationRecovery(
+            SigstoreOperationCommand.PublishTrustedRootCommand);
+        await execution.ReportAsync(
+            "complete",
+            12,
+            "Trusted-root recovery completed; all clients are current.");
+        return execution.Success(
+            "Interrupted trusted-root publication recovered and verified.");
+    }
+
+    private static bool SameCommittedTrust(
+        SigstoreOperationSnapshot expected,
+        SigstoreOperationSnapshot actual) =>
+        expected.Tuf.Trust == actual.Tuf.Trust
+        && expected.Tuf.Metadata == actual.Tuf.Metadata
+        && expected.Tuf.BootstrapRootSha256 == actual.Tuf.BootstrapRootSha256
+        && expected.TrustStateSha256 == actual.TrustStateSha256
+        && expected.TrustMaterialSha256 == actual.TrustMaterialSha256
+        && SameInstance(expected.TufServer, actual.TufServer);
+
+    private void RefreshTrustedRootPublicationRecoveryState()
+    {
+        try
+        {
+            var operation = LoadIncompleteTrustedRootPublication(
+                resource.StatePath);
+            if (operation is null)
+            {
+                resource.ClearOperationRecovery(
+                    SigstoreOperationCommand.PublishTrustedRootCommand);
+                return;
+            }
+            resource.SetOperationRecovery(
+                SigstoreOperationCommand.PublishTrustedRootCommand,
+                operation.Status,
+                "Trusted-root Recovery Pending",
+                "The durable trusted-root publication must converge all six " +
+                "clients before another mutation.");
+        }
+        catch (Exception exception)
+            when (exception is IOException
+                or UnauthorizedAccessException
+                or JsonException
+                or InvalidDataException)
+        {
+            resource.SetOperationRecovery(
+                SigstoreOperationCommand.PublishTrustedRootCommand,
+                "invalid-journal",
+                "Trusted-root Recovery Failed Closed",
+                exception.Message);
+        }
+    }
+
+    private static TrustedRootPublicationCommandJournal?
+        LoadIncompleteTrustedRootPublication(string statePath)
+    {
+        var root = Path.Combine(statePath, "trusted-root-publication");
+        if (!Directory.Exists(root))
+        {
+            return null;
+        }
+        var journals = Directory
+            .EnumerateFiles(root, "command.json", SearchOption.AllDirectories)
+            .Select(path =>
+            {
+                var operation = JsonSerializer.Deserialize<
+                    TrustedRootPublicationCommandJournal>(
+                        File.ReadAllText(path),
+                        JsonOptions)
+                    ?? throw new InvalidDataException(
+                        $"Trusted-root journal '{path}' is empty.");
+                if (operation.SchemaVersion != 1
+                    || !Guid.TryParseExact(operation.OperationId, "N", out _)
+                    || operation.OperationId.Any(char.IsUpper)
+                    || Path.GetFileName(Path.GetDirectoryName(path))
+                        != operation.OperationId
+                    || operation.Status is not (
+                        TrustedRootStatusRequested
+                        or TrustedRootStatusWorkerCommitted
+                        or TrustedRootStatusClientsConverging
+                        or TrustedRootStatusClientsConverged
+                        or TrustedRootStatusCompleted)
+                    || operation.StartingSnapshot.Tuf.Trust.Generation < 1
+                    || operation.StartingSnapshot.Tuf.Trust.GenerationId
+                        != $"generation-{operation.StartingSnapshot.Tuf.Trust.Generation:D8}"
+                    || operation.WorkerBefore.Resource
+                        != "tuf-bootstrap"
+                    || !HasContainerIdentity(operation.WorkerBefore)
+                    || operation.Clients
+                        .Select(client => client.Resource)
+                        .Distinct(StringComparer.Ordinal)
+                        .Count() != operation.Clients.Count)
+                {
+                    throw new InvalidDataException(
+                        $"Trusted-root journal '{path}' has invalid state.");
+                }
+                if (operation.Status != TrustedRootStatusRequested
+                    && (operation.CommittedSnapshot is null
+                        || operation.WorkerAfter is null
+                        || operation.CommittedSnapshot.Tuf.Trust.Generation
+                            != operation.StartingSnapshot.Tuf.Trust.Generation + 1
+                        || operation.CommittedSnapshot.Tuf.Trust.TrustDomainId
+                            != operation.StartingSnapshot.Tuf.Trust.TrustDomainId
+                        || !IsNewInstance(
+                            operation.WorkerBefore,
+                            operation.WorkerAfter)
+                        || !IsSuccessfulTerminal(operation.WorkerAfter)
+                        || operation.Clients.Any(client =>
+                            string.IsNullOrWhiteSpace(client.Resource)
+                            || string.IsNullOrWhiteSpace(client.ResourceId)
+                            || string.IsNullOrWhiteSpace(client.ContainerId)
+                            || client.StartTimeUtc is null
+                            ||
+                            !MatchesDisk(
+                                operation.CommittedSnapshot.Tuf.Trust,
+                                client.TrustStatus))))
+                {
+                    throw new InvalidDataException(
+                        $"Trusted-root journal '{path}' has invalid committed state.");
+                }
+                if (operation.Status is TrustedRootStatusClientsConverged
+                        or TrustedRootStatusCompleted
+                    && operation.Clients.Count != 6)
+                {
+                    throw new InvalidDataException(
+                        $"Trusted-root journal '{path}' has incomplete client state.");
+                }
+                if (operation.Status != TrustedRootStatusRequested
+                    && operation.Status != TrustedRootStatusCompleted)
+                {
+                    ValidateTrustedRootWorkerCompletion(
+                        ReadTrustedRootWorkerCompletion(statePath),
+                        operation);
+                }
+                return operation;
+            })
+            .Where(operation => operation.Status != TrustedRootStatusCompleted)
+            .ToArray();
+        return journals.Length switch
+        {
+            0 => null,
+            1 => journals[0],
+            _ => throw new InvalidDataException(
+                "Multiple incomplete trusted-root publication journals exist.")
+        };
+    }
+
+    private static void WriteTrustedRootPublicationJournal(
+        string statePath,
+        TrustedRootPublicationCommandJournal operation)
+    {
+        var path = Path.Combine(
+            statePath,
+            "trusted-root-publication",
+            operation.OperationId,
+            "command.json");
+        var directory = Path.GetDirectoryName(path)
+            ?? throw new InvalidDataException(
+                $"Path '{path}' has no parent directory.");
+        Directory.CreateDirectory(directory);
+        WriteAtomicJson(path, operation);
+    }
+
+    private static TrustedRootWorkerCompletion
+        ReadTrustedRootWorkerCompletion(string statePath)
+    {
+        var path = Path.Combine(
+            statePath,
+            "publish-trusted-root.completed");
+        var completion = JsonSerializer.Deserialize<TrustedRootWorkerCompletion>(
+            File.ReadAllText(path),
+            JsonOptions)
+            ?? throw new InvalidDataException(
+                "Trusted-root worker completion is empty.");
+        if (completion.SchemaVersion != 2
+            || !Guid.TryParseExact(completion.OperationId, "N", out _)
+            || completion.OperationId.Any(char.IsUpper)
+            || completion.Generation < 2
+            || completion.GenerationId
+                != $"generation-{completion.Generation:D8}"
+            || string.IsNullOrWhiteSpace(completion.TrustDomainId)
+            || string.IsNullOrWhiteSpace(completion.PublicationId)
+            || !IsLowerHexSha256(completion.ManifestSha256))
+        {
+            throw new InvalidDataException(
+                "Trusted-root worker completion has invalid state.");
+        }
+        return completion;
+    }
+
+    private static void ValidateTrustedRootWorkerCompletion(
+        TrustedRootWorkerCompletion completion,
+        TrustedRootPublicationCommandJournal operation)
+    {
+        var committed = operation.CommittedSnapshot
+            ?? throw new InvalidDataException(
+                "Trusted-root recovery omits its committed snapshot.");
+        if (completion.OperationId != operation.OperationId
+            || completion.TrustDomainId
+                != operation.StartingSnapshot.Tuf.Trust.TrustDomainId
+            || completion.Generation
+                != operation.StartingSnapshot.Tuf.Trust.Generation + 1
+            || completion.Generation != committed.Tuf.Trust.Generation
+            || completion.GenerationId != committed.Tuf.Trust.GenerationId
+            || completion.PublicationId != committed.Tuf.Trust.PublicationId
+            || completion.ManifestSha256
+                != committed.Tuf.Trust.GenerationManifestSha256)
+        {
+            throw new InvalidDataException(
+                "Trusted-root worker completion does not match the durable " +
+                "command journal and committed state.");
+        }
     }
 
     private static void ValidatePublishPostconditions(
@@ -3900,7 +4808,7 @@ internal sealed partial class SigstoreOperationExecutor(
                 postconditionToken.Token);
             execution.Check(
                 "aggregate-status-ready",
-                aggregate.Ready,
+                IsReadyForActiveOperation(aggregate),
                 "ready=true with no status errors",
                 aggregate.Reason ?? "ready",
                 "aggregate-status",
@@ -3947,85 +4855,125 @@ internal sealed partial class SigstoreOperationExecutor(
 
         SigstoreOperationSnapshot before;
         SigstoreResourceInstanceSnapshot workerBefore;
-        ExecuteCommandResult workerStart;
+        ExecuteCommandResult? workerStart = null;
+        TufRootRotationCommandJournal operation;
         using (stateInspector.AcquireLock(
             resource.StatePath,
             "dashboard-rotate-tuf-root-preflight"))
         {
             requestCancellationToken.ThrowIfCancellationRequested();
-            if (!await ValidatePreconditionsAsync(
-                    execution,
-                    requestCancellationToken))
+            var incomplete = LoadIncompleteTufRootRotation(
+                resource.StatePath);
+            if (incomplete is null)
             {
-                return execution.Failure(
-                    "TUF root rotation preconditions are not satisfied.");
+                if (!await ValidatePreconditionsAsync(
+                        execution,
+                        requestCancellationToken))
+                {
+                    return execution.Failure(
+                        "TUF root rotation preconditions are not satisfied.");
+                }
+                before = await CaptureAsync(requestCancellationToken);
+                workerBefore = runtime.GetRequiredSnapshot(
+                    resource.Components.TufBootstrap.Resource);
+                if (!ValidateCapture(execution, "preflight", before)
+                    || !execution.Check(
+                        "worker-ready",
+                        IsSuccessfulTerminal(workerBefore),
+                        "a completed one-shot with exit code 0",
+                        Describe(workerBefore),
+                        "preflight",
+                        workerBefore.Resource)
+                    || !execution.Check(
+                        "worker-baseline-identity",
+                        HasContainerIdentity(workerBefore),
+                        "a non-empty container identity",
+                        workerBefore.ContainerId ?? "missing",
+                        "preflight",
+                        workerBefore.Resource))
+                {
+                    return execution.Failure(
+                        "TUF root rotation preconditions are not satisfied.");
+                }
+                operation = new TufRootRotationCommandJournal(
+                    1,
+                    execution.OperationId.ToString("N"),
+                    "requested",
+                    DateTimeOffset.UtcNow,
+                    before,
+                    workerBefore,
+                    null);
+                WriteTufRootRotationJournal(
+                    resource.StatePath,
+                    operation);
             }
-
-            before = await CaptureAsync(requestCancellationToken);
+            else
+            {
+                operation = incomplete;
+                before = operation.StartingSnapshot;
+                workerBefore = operation.WorkerBefore;
+                var current = await CaptureAsync(requestCancellationToken);
+                var rootVersion = current.Tuf.Metadata.Root.Version;
+                if (current.Tuf.Trust.TrustDomainId
+                        != before.Tuf.Trust.TrustDomainId
+                    || current.Tuf.Trust.Generation
+                        != before.Tuf.Trust.Generation
+                    || rootVersion != before.Tuf.Metadata.Root.Version
+                        && rootVersion != before.Tuf.Metadata.Root.Version + 1)
+                {
+                    execution.AddError(
+                        "recovery",
+                        resource.Name,
+                        null,
+                        "Current state does not match the durable TUF root " +
+                        "rotation journal.");
+                    return execution.Failure(
+                        "TUF root rotation recovery failed closed.");
+                }
+                resource.SetOperationRecovery(
+                    SigstoreOperationCommand.RotateTufRootCommand,
+                    operation.Status,
+                    "TUF Root Recovery Pending",
+                    "The durable root rotation must complete before another " +
+                    "trust mutation.");
+            }
             execution.Before = before;
-            if (!ValidateCapture(
-                    execution,
-                    "preflight",
-                    before))
-            {
-                return execution.Failure(
-                    "The current TUF repository is not internally consistent.");
-            }
-
-            workerBefore = runtime.GetRequiredSnapshot(
-                resource.Components.TufBootstrap.Resource);
-            if (!execution.Check(
-                    "worker-ready",
-                    IsSuccessfulTerminal(workerBefore),
-                    "a completed one-shot with exit code 0",
-                    Describe(workerBefore),
-                    "preflight",
-                    workerBefore.Resource))
-            {
-                return execution.Failure(
-                    "The TUF worker is not ready for a new one-shot run.");
-            }
-            if (!execution.Check(
-                    "worker-baseline-identity",
-                    HasContainerIdentity(workerBefore),
-                    "a non-empty container identity",
-                    workerBefore.ContainerId ?? "missing",
-                    "preflight",
-                    workerBefore.Resource))
-            {
-                return execution.Failure(
-                    "The completed TUF worker has no observable container identity.");
-            }
 
             await execution.ReportAsync(
                 "write-signal",
                 1,
-                "Writing rotate-root.request signal file for the TUF worker.");
-
-            // Write the signal file that tells the Go worker to rotate
-            // instead of refresh. The file is in the state directory root
-            // (not inside the TUF layout) to avoid layout validation failure.
+                incomplete is null
+                    ? "Writing operation-bound TUF root rotation request."
+                    : "Replaying the operation-bound TUF root rotation request.");
             var signalPath = Path.Combine(
                 resource.StatePath,
                 "rotate-root.request");
-            await File.WriteAllTextAsync(
-                signalPath,
-                "rotate",
-                requestCancellationToken);
+            var completionPath = Path.Combine(
+                resource.StatePath,
+                "tuf-root-rotations",
+                operation.OperationId,
+                "completion.json");
+            if (!File.Exists(signalPath) && !File.Exists(completionPath))
+            {
+                WriteTufRootRotationRequest(signalPath, operation);
+            }
 
-            await execution.ReportAsync(
-                "start-worker",
-                2,
-                "Starting a new TUF one-shot while handing off state.lock.");
-
-            using var critical = new CancellationTokenSource(WorkerTimeout);
-            workerStart = await runtime.ExecuteCommandAsync(
-                resource.Components.TufBootstrap.Resource,
-                KnownResourceCommands.StartCommand,
-                critical.Token);
+            if (File.Exists(signalPath))
+            {
+                await execution.ReportAsync(
+                    "start-worker",
+                    2,
+                    "Starting a TUF one-shot while handing off state.lock.");
+                using var critical =
+                    new CancellationTokenSource(WorkerTimeout);
+                workerStart = await runtime.ExecuteCommandAsync(
+                    resource.Components.TufBootstrap.Resource,
+                    KnownResourceCommands.StartCommand,
+                    critical.Token);
+            }
         }
 
-        if (!workerStart.Success)
+        if (workerStart is { Success: false })
         {
             execution.AddError(
                 "start-worker",
@@ -4039,14 +4987,15 @@ internal sealed partial class SigstoreOperationExecutor(
                 "The TUF worker could not be started for root rotation.");
         }
 
-        await execution.ReportAsync(
-            "wait-worker",
-            3,
-            "Waiting for the root rotation worker to complete.");
-
         SigstoreResourceInstanceSnapshot workerAfter;
-        using (var critical = new CancellationTokenSource(WorkerTimeout))
+        if (workerStart is not null)
         {
+            await execution.ReportAsync(
+                "wait-worker",
+                3,
+                "Waiting for the root rotation worker to complete.");
+            using var critical =
+                new CancellationTokenSource(WorkerTimeout);
             try
             {
                 workerAfter = await runtime.WaitForSnapshotAsync(
@@ -4068,6 +5017,11 @@ internal sealed partial class SigstoreOperationExecutor(
                     before,
                     "The root rotation worker did not complete within the timeout.");
             }
+        }
+        else
+        {
+            workerAfter = runtime.GetRequiredSnapshot(
+                resource.Components.TufBootstrap.Resource);
         }
 
         execution.Resources.Add(
@@ -4103,6 +5057,20 @@ internal sealed partial class SigstoreOperationExecutor(
         {
             var after = await CaptureAsync(postconditionToken.Token);
             execution.After = after;
+            var completion = ReadTufRootRotationCompletion(
+                resource.StatePath,
+                operation.OperationId);
+            ValidateTufRootRotationCompletion(
+                completion,
+                operation,
+                after);
+            execution.Check(
+                "worker-completion-bound",
+                true,
+                operation.OperationId,
+                completion.OperationId,
+                "postconditions",
+                resource.Components.TufBootstrap.Resource.Name);
             ValidateRotationPostconditions(
                 execution,
                 before,
@@ -4153,8 +5121,231 @@ internal sealed partial class SigstoreOperationExecutor(
             "complete",
             7,
             "TUF root key rotated successfully. Root version advanced by 1.");
+        operation = operation with
+        {
+            Status = "completed",
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+            WorkerAfter = workerAfter
+        };
+        WriteTufRootRotationJournal(resource.StatePath, operation);
+        resource.ClearOperationRecovery(
+            SigstoreOperationCommand.RotateTufRootCommand);
         return execution.Success(
             "TUF root key rotated, signed by old and new keys, and verified.");
+    }
+
+    private void RefreshTufRootRotationRecoveryState()
+    {
+        try
+        {
+            var operation = LoadIncompleteTufRootRotation(resource.StatePath);
+            if (operation is null)
+            {
+                resource.ClearOperationRecovery(
+                    SigstoreOperationCommand.RotateTufRootCommand);
+                return;
+            }
+            resource.SetOperationRecovery(
+                SigstoreOperationCommand.RotateTufRootCommand,
+                operation.Status,
+                "TUF Root Recovery Pending",
+                "The operation-bound TUF root request must replay before " +
+                "another trust mutation.");
+        }
+        catch (Exception exception)
+            when (exception is IOException
+                or UnauthorizedAccessException
+                or JsonException
+                or InvalidDataException)
+        {
+            resource.SetOperationRecovery(
+                SigstoreOperationCommand.RotateTufRootCommand,
+                "invalid-journal",
+                "TUF Root Recovery Failed Closed",
+                exception.Message);
+        }
+    }
+
+    private static TufRootRotationCommandJournal?
+        LoadIncompleteTufRootRotation(string statePath)
+    {
+        var root = Path.Combine(statePath, "tuf-root-rotations");
+        if (!Directory.Exists(root))
+        {
+            return null;
+        }
+        var journals = Directory
+            .EnumerateFiles(root, "hosting-state.json", SearchOption.AllDirectories)
+            .Select(path =>
+            {
+                var operation = JsonSerializer.Deserialize<
+                    TufRootRotationCommandJournal>(
+                        File.ReadAllText(path),
+                        JsonOptions)
+                    ?? throw new InvalidDataException(
+                        $"TUF root journal '{path}' is empty.");
+                if (operation.SchemaVersion != 1
+                    || !Guid.TryParseExact(operation.OperationId, "N", out _)
+                    || operation.OperationId.Any(char.IsUpper)
+                    || Path.GetFileName(Path.GetDirectoryName(path))
+                        != operation.OperationId
+                    || operation.Status is not ("requested" or "completed")
+                    || operation.StartingSnapshot.Tuf.Trust.Generation < 1
+                    || operation.StartingSnapshot.Tuf.Trust.GenerationId
+                        != $"generation-{operation.StartingSnapshot.Tuf.Trust.Generation:D8}"
+                    || operation.StartingSnapshot.Tuf.Metadata.Root.Version < 1
+                    || operation.WorkerBefore.Resource != "tuf-bootstrap"
+                    || !HasContainerIdentity(operation.WorkerBefore)
+                    || !IsSuccessfulTerminal(operation.WorkerBefore)
+                    || operation.Status == "completed"
+                        && (operation.WorkerAfter is null
+                            || !IsNewInstance(
+                                operation.WorkerBefore,
+                                operation.WorkerAfter)
+                            || !IsSuccessfulTerminal(operation.WorkerAfter)))
+                {
+                    throw new InvalidDataException(
+                        $"TUF root journal '{path}' has invalid state.");
+                }
+                return operation;
+            })
+            .Where(operation => operation.Status != "completed")
+            .ToArray();
+        return journals.Length switch
+        {
+            0 => null,
+            1 => journals[0],
+            _ => throw new InvalidDataException(
+                "Multiple incomplete TUF root rotation journals exist.")
+        };
+    }
+
+    private static void WriteTufRootRotationJournal(
+        string statePath,
+        TufRootRotationCommandJournal operation)
+    {
+        var path = Path.Combine(
+            statePath,
+            "tuf-root-rotations",
+            operation.OperationId,
+            "hosting-state.json");
+        var directory = Path.GetDirectoryName(path)
+            ?? throw new InvalidDataException(
+                $"Path '{path}' has no parent directory.");
+        Directory.CreateDirectory(directory);
+        WriteAtomicJson(path, operation);
+    }
+
+    private static void WriteTufRootRotationRequest(
+        string path,
+        TufRootRotationCommandJournal operation)
+    {
+        var before = operation.StartingSnapshot;
+        WriteCreateNewJson(
+            path,
+            new TufRootRotationWorkerRequest(
+                SchemaVersion: 1,
+                OperationId: operation.OperationId,
+                TrustDomainId: before.Tuf.Trust.TrustDomainId,
+                StartingGeneration: before.Tuf.Trust.Generation,
+                StartingGenerationId: before.Tuf.Trust.GenerationId,
+                StartingGenerationManifestSha256:
+                    before.Tuf.Trust.GenerationManifestSha256,
+                StartingRootVersion: before.Tuf.Metadata.Root.Version,
+                StartingPublicationId: before.Tuf.Trust.PublicationId,
+                StartingPublicationManifestSha256:
+                    before.Tuf.Trust.PublicationManifestSha256));
+    }
+
+    private static TufRootRotationWorkerCompletion
+        ReadTufRootRotationCompletion(
+            string statePath,
+            string operationId)
+    {
+        var path = Path.Combine(
+            statePath,
+            "tuf-root-rotations",
+            operationId,
+            "completion.json");
+        return JsonSerializer.Deserialize<TufRootRotationWorkerCompletion>(
+                File.ReadAllBytes(path),
+                JsonOptions)
+            ?? throw new InvalidDataException(
+                $"TUF root completion '{path}' is empty.");
+    }
+
+    private static void ValidateTufRootRotationCompletion(
+        TufRootRotationWorkerCompletion completion,
+        TufRootRotationCommandJournal operation,
+        SigstoreOperationSnapshot after)
+    {
+        var before = operation.StartingSnapshot;
+        if (completion.SchemaVersion != 1
+            || completion.OperationId != operation.OperationId
+            || completion.TrustDomainId != before.Tuf.Trust.TrustDomainId
+            || completion.Generation != before.Tuf.Trust.Generation
+            || completion.GenerationId != before.Tuf.Trust.GenerationId
+            || completion.GenerationManifestSha256
+                != before.Tuf.Trust.GenerationManifestSha256
+            || completion.PreviousRootVersion
+                != before.Tuf.Metadata.Root.Version
+            || completion.RootVersion != completion.PreviousRootVersion + 1
+            || completion.RootVersion != after.Tuf.Metadata.Root.Version
+            || completion.TargetsVersion != after.Tuf.Metadata.Targets.Version
+            || completion.PreviousPublicationId
+                != before.Tuf.Trust.PublicationId
+            || completion.PreviousPublicationManifestSha256
+                != before.Tuf.Trust.PublicationManifestSha256
+            || completion.PublicationId != after.Tuf.Trust.PublicationId
+            || completion.PublicationManifestSha256
+                != after.Tuf.Trust.PublicationManifestSha256
+            || completion.TrustedRootSha256
+                != after.Tuf.Trust.TrustedRootSha256
+            || completion.SigningConfigSha256
+                != after.Tuf.Trust.SigningConfigSha256
+            || !IsLowerHexSha256(completion.GenerationManifestSha256)
+            || !IsLowerHexSha256(
+                completion.PreviousPublicationManifestSha256)
+            || !IsLowerHexSha256(completion.PublicationManifestSha256)
+            || !IsLowerHexSha256(completion.TrustedRootSha256)
+            || !IsLowerHexSha256(completion.SigningConfigSha256)
+            || completion.CompletedAtUtc == default)
+        {
+            throw new InvalidDataException(
+                "The TUF root worker completion does not match the operation " +
+                "journal and committed state.");
+        }
+    }
+
+    private static void WriteAtomicJson<T>(string path, T value)
+    {
+        var directory = Path.GetDirectoryName(path)
+            ?? throw new InvalidDataException(
+                $"Path '{path}' has no parent directory.");
+        var temporary = Path.Combine(
+            directory,
+            $".atomic.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+        var bytes = Encoding.UTF8.GetBytes(
+            JsonSerializer.Serialize(value, JsonOptions) + "\n");
+        using (var stream = new FileStream(
+            temporary,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            4096,
+            FileOptions.WriteThrough))
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(
+                    temporary,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+        }
+        File.Move(temporary, path, overwrite: true);
+        SyncParentDirectory(path);
     }
 
     private async Task<ExecuteCommandResult> ExecuteRestartClientsCoreAsync(
@@ -4311,7 +5502,7 @@ internal sealed partial class SigstoreOperationExecutor(
         var aggregate = await runtime.CollectStatusAsync(critical.Token);
         execution.Check(
             "aggregate-status-ready",
-            aggregate.Ready
+            IsReadyForActiveOperation(aggregate)
                 && aggregate.Clients.Count == clients.Length,
             $"ready=true and {clients.Length} clients",
             aggregate.Reason
@@ -4404,7 +5595,7 @@ internal sealed partial class SigstoreOperationExecutor(
         var status = await runtime.CollectStatusAsync(cancellationToken);
         return execution.Check(
             "trust-status-ready",
-            status.Ready,
+            IsReadyForActiveOperation(status),
             "ready=true with no status errors",
             status.Reason ?? "ready",
             "preflight",
@@ -4435,7 +5626,7 @@ internal sealed partial class SigstoreOperationExecutor(
         }
 
         var status = await runtime.CollectStatusAsync(cancellationToken);
-        if (status.Ready)
+        if (IsReadyForActiveOperation(status))
         {
             return execution.Check(
                 "trust-status-ready",
@@ -4452,7 +5643,8 @@ internal sealed partial class SigstoreOperationExecutor(
         // errors about domain, generation, trusted-root, or signing-config.
         var unsafeErrors = status.Errors
             .Where(error =>
-                !error.Message.StartsWith(
+                error.Source != "operation"
+                && !error.Message.StartsWith(
                     "tufRootVersion",
                     StringComparison.Ordinal)
                 && !error.Message.StartsWith(
@@ -4886,7 +6078,7 @@ internal sealed partial class SigstoreOperationExecutor(
                     resource.Components.Tuf.Resource.Name)
                 & execution.Check(
                     "failed-worker-status-ready",
-                    status.Ready,
+                    IsReadyForActiveOperation(status),
                     "ready=true",
                     status.Reason ?? "ready",
                     "rollback-validation",
@@ -5010,6 +6202,13 @@ internal sealed partial class SigstoreOperationExecutor(
         && disk.TrustedRootSha256 == client.TrustedRootSha256
         && disk.SigningConfigSha256 == client.SigningConfigSha256;
 
+    internal static bool IsReadyForActiveOperation(
+        SigstoreAggregateTrustStatus status) =>
+        status.Ready
+        || status.Operation is not null
+            && status.Errors.Count == 1
+            && status.Errors[0].Source == "operation";
+
     internal static bool HasContainerIdentity(
         SigstoreResourceInstanceSnapshot snapshot) =>
         !string.IsNullOrWhiteSpace(snapshot.ContainerId);
@@ -5070,6 +6269,7 @@ internal sealed partial class SigstoreOperationExecutor(
             new SigstoreOperationResult(
                 1,
                 command,
+                active.Id.ToString("N"),
                 false,
                 "contention",
                 $"Cannot run {command} because {active.Command} is already " +
@@ -5089,6 +6289,42 @@ internal sealed partial class SigstoreOperationExecutor(
                         "operation-exclusive",
                         $"{active.Command} has held the operation gate since " +
                             $"{active.StartedAtUtc:O}.")
+                ]));
+    }
+
+    private ExecuteCommandResult? CreateRecoveryBlockResult(string command)
+    {
+        RefreshDurableRecoveryState(resource);
+        var recovery = resource.GetPresentation().Recovery;
+        if (recovery is null || recovery.Command == command)
+        {
+            return null;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        return SigstoreOperationCommand.CreateResult(
+            new SigstoreOperationResult(
+                1,
+                command,
+                Guid.NewGuid().ToString("N"),
+                false,
+                "recovery-pending",
+                $"Cannot run {command} because {recovery.Command} recovery " +
+                    $"is pending in phase {recovery.Phase}.",
+                now,
+                now,
+                [],
+                null,
+                null,
+                [],
+                [],
+                null,
+                [
+                    new(
+                        "recovery-pending",
+                        resource.Name,
+                        "recovery-exclusive",
+                        recovery.Message)
                 ]));
     }
 
@@ -5165,6 +6401,8 @@ internal sealed partial class SigstoreOperationExecutor(
         SigstoreResource.SigstoreOperationLease lease,
         int total)
     {
+        public Guid OperationId => lease.Operation.Id;
+
         public List<SigstoreOperationProgress> Progress { get; } = [];
 
         public List<SigstoreResourceLifecycleResult> Resources { get; } = [];
@@ -5272,6 +6510,7 @@ internal sealed partial class SigstoreOperationExecutor(
                 new SigstoreOperationResult(
                     1,
                     lease.Operation.Command,
+                    lease.Operation.Id.ToString("N"),
                     success,
                     Phase,
                     message,
@@ -5297,6 +6536,72 @@ internal sealed record OidcRotationWorkerRequest(
     int StartingGeneration,
     string StartingGenerationId,
     string StartingOidcKeyId);
+
+internal sealed record TufRootRotationWorkerRequest(
+    int SchemaVersion,
+    string OperationId,
+    string TrustDomainId,
+    int StartingGeneration,
+    string StartingGenerationId,
+    string StartingGenerationManifestSha256,
+    int StartingRootVersion,
+    string StartingPublicationId,
+    string StartingPublicationManifestSha256);
+
+internal sealed record TufRootRotationCommandJournal(
+    int SchemaVersion,
+    string OperationId,
+    string Status,
+    DateTimeOffset UpdatedAtUtc,
+    SigstoreOperationSnapshot StartingSnapshot,
+    SigstoreResourceInstanceSnapshot WorkerBefore,
+    SigstoreResourceInstanceSnapshot? WorkerAfter);
+
+internal sealed record TufRootRotationWorkerCompletion(
+    int SchemaVersion,
+    string OperationId,
+    string TrustDomainId,
+    int Generation,
+    string GenerationId,
+    string GenerationManifestSha256,
+    int PreviousRootVersion,
+    int RootVersion,
+    int TargetsVersion,
+    string PreviousPublicationId,
+    string PreviousPublicationManifestSha256,
+    string PublicationId,
+    string PublicationManifestSha256,
+    string TrustedRootSha256,
+    string SigningConfigSha256,
+    DateTimeOffset CompletedAtUtc);
+
+internal sealed record TrustedRootClientConvergence(
+    string Resource,
+    string ResourceId,
+    string ContainerId,
+    DateTime? StartTimeUtc,
+    SigstoreClientTrustStatus TrustStatus);
+
+internal sealed record TrustedRootPublicationCommandJournal(
+    int SchemaVersion,
+    string OperationId,
+    string Status,
+    DateTimeOffset UpdatedAtUtc,
+    SigstoreOperationSnapshot StartingSnapshot,
+    SigstoreResourceInstanceSnapshot WorkerBefore,
+    SigstoreOperationSnapshot? CommittedSnapshot,
+    SigstoreResourceInstanceSnapshot? WorkerAfter,
+    IReadOnlyList<TrustedRootClientConvergence> Clients);
+
+internal sealed record TrustedRootWorkerCompletion(
+    int SchemaVersion,
+    string OperationId,
+    string TrustDomainId,
+    DateTimeOffset CompletedAtUtc,
+    int Generation,
+    string GenerationId,
+    string PublicationId,
+    string ManifestSha256);
 
 internal sealed record OidcRotationWorkerCompletion(
     int SchemaVersion,
@@ -6184,6 +7489,7 @@ internal sealed record SigstoreOperationError(
 internal sealed record SigstoreOperationResult(
     int SchemaVersion,
     string Command,
+    string OperationId,
     bool Success,
     string Phase,
     string Message,

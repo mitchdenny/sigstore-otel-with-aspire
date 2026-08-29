@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -14,16 +15,25 @@ internal sealed class StateFileLock : IDisposable
     private const int LockNonBlocking = 4;
     private const int LockUnlock = 8;
 
+    private static readonly ConcurrentDictionary<string, string> Owners =
+        new(StringComparer.Ordinal);
+
     private readonly FileStream _stream;
     private readonly bool _usesFlock;
+    private readonly string _path;
+    private readonly string _operation;
     private bool _disposed;
 
     private StateFileLock(
         FileStream stream,
-        bool usesFlock)
+        bool usesFlock,
+        string path,
+        string operation)
     {
         _stream = stream;
         _usesFlock = usesFlock;
+        _path = path;
+        _operation = operation;
     }
 
     public static StateFileLock Acquire(
@@ -41,7 +51,8 @@ internal sealed class StateFileLock : IDisposable
         }
 
         Directory.CreateDirectory(statePath);
-        var path = Path.Combine(statePath, FileName);
+        var path = Path.GetFullPath(
+            Path.Combine(statePath, FileName));
         var stopwatch = Stopwatch.StartNew();
 
         while (true)
@@ -68,16 +79,25 @@ internal sealed class StateFileLock : IDisposable
                             Marshal.GetLastPInvokeError()));
                 }
                 WriteOwner(stream, operation);
+                Owners[path] = operation;
                 return new StateFileLock(
                     stream,
-                    usesFlock);
+                    usesFlock,
+                    path,
+                    operation);
             }
             catch (IOException exception)
             {
+                var timedOut = stopwatch.Elapsed >= timeout;
+                var owner = timedOut
+                    ? ReadOwner(path, stream)
+                    : string.Empty;
                 stream?.Dispose();
-                if (stopwatch.Elapsed >= timeout)
+                if (timedOut)
                 {
-                    var owner = ReadOwner(path);
+                    owner = owner.Length == 0
+                        ? ReadOwner(path)
+                        : owner;
                     throw new InvalidOperationException(
                         $"Sigstore state at '{statePath}' is locked by another " +
                         $"operation{owner}. The operating-system lock is " +
@@ -113,6 +133,8 @@ internal sealed class StateFileLock : IDisposable
         finally
         {
             _stream.Dispose();
+            _ = ((ICollection<KeyValuePair<string, string>>)Owners).Remove(
+                new KeyValuePair<string, string>(_path, _operation));
         }
         _disposed = true;
     }
@@ -140,9 +162,56 @@ internal sealed class StateFileLock : IDisposable
 
     private static string ReadOwner(string path)
     {
+        if (Owners.TryGetValue(path, out var operation))
+        {
+            return $" (current in-process owner: '{operation}')";
+        }
+
         try
         {
-            var contents = File.ReadAllText(path).Trim();
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite);
+            return ReadOwner(stream);
+        }
+        catch (IOException)
+        {
+            return string.Empty;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string ReadOwner(
+        string path,
+        FileStream? stream)
+    {
+        if (Owners.TryGetValue(path, out var operation))
+        {
+            return $" (current in-process owner: '{operation}')";
+        }
+
+        return stream is null
+            ? ReadOwner(path)
+            : ReadOwner(stream);
+    }
+
+    private static string ReadOwner(FileStream stream)
+    {
+        try
+        {
+            stream.Position = 0;
+            using var reader = new StreamReader(
+                stream,
+                Encoding.UTF8,
+                detectEncodingFromByteOrderMarks: true,
+                bufferSize: 1024,
+                leaveOpen: true);
+            var contents = reader.ReadToEnd().Trim();
             return contents.Length == 0
                 ? string.Empty
                 : $" (last owner metadata: {contents})";

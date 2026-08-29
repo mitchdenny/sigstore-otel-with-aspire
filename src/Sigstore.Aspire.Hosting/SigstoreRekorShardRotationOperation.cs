@@ -72,6 +72,11 @@ internal sealed partial class SigstoreOperationExecutor
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.RotateRekorShardCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RotateRekorShardCommand,
                 "Rotating Rekor Shard",
@@ -901,7 +906,8 @@ internal sealed partial class SigstoreOperationExecutor
             CancellationToken.None);
         execution.Check(
             "aggregate-status-ready",
-            aggregate.Ready && aggregate.Clients.Count == clients.Length,
+            IsReadyForActiveOperation(aggregate)
+                && aggregate.Clients.Count == clients.Length,
             $"ready=true and {clients.Length} converged clients",
             aggregate.Reason
                 ?? $"ready={aggregate.Ready}, " +
@@ -1737,6 +1743,7 @@ internal sealed partial class SigstoreOperationExecutor
         var result = new RekorShardRotationOperationResult(
             1,
             SigstoreOperationCommand.RotateRekorShardCommand,
+            execution.OperationId.ToString("N"),
             success,
             execution.Phase,
             message,
@@ -1902,6 +1909,7 @@ internal sealed record RekorShardRotationEvidence(
 internal sealed record RekorShardRotationOperationResult(
     int SchemaVersion,
     string Command,
+    string OperationId,
     bool Success,
     string Phase,
     string Message,

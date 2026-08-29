@@ -889,3 +889,92 @@ its CA fingerprint stayed
 Old artifact 20 and new artifact 39 both verified in .NET, Go, Java,
 JavaScript, Python, and Rust. The known Python omitted-index-zero issue was not
 encountered in this run. A repeated rotation was rejected before mutation.
+
+## Complete Lifecycle Validation (Step 14)
+
+Run the lifecycle on a fresh, non-isolated AppHost. Fixed
+`*.dev.localhost` ports mean only one validation AppHost may run at a time:
+
+```bash
+aspire start --non-interactive --format Json
+./eng/validate-sigstore-lifecycle.sh
+```
+
+The harness waits for every concrete resource and then uses only the public
+`sigstore` commands, including their operation gate, shared `state.lock`,
+durable worker protocols, and normal child restarts. The supported order is:
+
+1. `status`, then `refresh-tuf`
+2. `rotate-tuf-root`, then `restart-clients`
+3. `publish-trusted-root`
+4. `rotate-oidc-signing-key`
+5. `rotate-timestamp-authority`
+6. `rotate-fulcio-ca`
+7. `rotate-rekor-shard`
+8. `rotate-ct-log-shard`
+
+The root rotation intentionally leaves clients stale until
+`restart-clients`; this is the only expected non-ready boundary in a
+successful sequence. Every other successful operation must finish with all
+six clients and all required resources ready. The full sequence advances
+generation `1` to `7`, TUF root `1` to `2`, and targets/snapshot/timestamp
+`1` to `8`/`9`/`9`. The harness checks every intermediate transition, starts
+an overlapping `refresh-tuf` while trusted-root publication owns the command
+gate, and requires a structured `contention` rejection with no partial
+mutation. It finally restarts `fulcio`, `tesseract-secondary`, and `tuf` and
+proves the committed trust, routing, and signer fingerprints are unchanged.
+
+`status` is read-only and authoritative. `ready: false` is expected while an
+operation is active, clients are stale, a signer or route activation is
+pending, a required historical shard is unavailable, or recovery is
+required. Mutating commands are disabled while another command owns the
+in-process gate or shared OS lock. If a durable journal survives an AppHost
+or child interruption, only the matching command remains enabled; invoking
+it replays from its last validated checkpoint. Unrelated direct invocations
+return `phase: "recovery-pending"`. Multiple, malformed, unbound, or tampered
+journals fail closed as `lifecycle-recovery`; they are not guessed, deleted,
+or bypassed.
+
+Recovery rolls back only before activation, where the old signer/route is
+still authoritative. Once additive trust or routing has committed, recovery
+is forward-only: it validates the operation ID, trust domain, generation,
+worker completion, resource identity, and stored proof before resuming
+client convergence or activation. A missing or mismatched historical shard,
+completion, runtime projection, or client identity requires operator
+inspection; automatic recovery deliberately stops.
+
+Successful validation writes a redacted, mode-`0600` report to
+`.sigstore/lifecycle-evidence/lifecycle-<trust-domain>.json`. It contains
+operation IDs, exact generation/TUF transitions, public component
+fingerprints, resource lifecycle identities, preserved-history checks,
+client convergence, artifact proof IDs/hashes, and errors. It never includes
+JWTs, private keys, passwords, or worker tokens. The entire directory is
+run-scoped and ignored by Git.
+
+### Reset, backup, and retention
+
+Stopping and starting a **new AppHost process** is the supported safe reset:
+the AppHost deletes and recreates `.sigstore` and `.shady-blob-store`, yielding
+a new trust domain, generation 1, TUF version 1 topology, and a fresh artifact
+sequence. Stop the existing AppHost cleanly before starting the replacement;
+never delete or edit either directory while the AppHost is running.
+
+These directories are demonstration state, not a production backup format.
+A filesystem copy is useful only for offline investigation of that run; this
+AppHost intentionally discards it at the next process start and provides no
+restore command. Child-resource restarts within the same AppHost preserve the
+state.
+
+Normal operations retain old Fulcio/TSA verification roots, OIDC overlap,
+Rekor and CT shard catalogs, immutable generations, checkpoints, and
+artifacts additively. Destructive trust retirement is intentionally not
+implemented. Test retirement only on a disposable stopped run by constructing
+an explicit scenario that first proves no retained artifact depends on the
+material; do not infer safety from current traffic.
+
+The cross-SDK ProtoJSON/sigstore-python omitted-index-zero incompatibility
+remains visible and out of scope. Validation never seeds an entry, skips
+artifact zero, rewrites a bundle, or uses public Sigstore. When it occurs,
+the affected Python sequential worker reports it and the same retained bundle
+is verified only through the existing generation-pinned targeted Python
+verifier, with that exception disclosed in the evidence.

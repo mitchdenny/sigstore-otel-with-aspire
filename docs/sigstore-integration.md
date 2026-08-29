@@ -1559,27 +1559,157 @@ passing:
 
 ## Step 14: Harden the complete lifecycle
 
-### Scope
+Step 14 treats the operations from Steps 0-13 as one state machine. It does not
+add a shortcut command or another mutation implementation. The repeatable
+public-surface driver is:
 
-- Exercise concurrent command rejection and idempotency.
-- Add fault-injection coverage around stage, publish, restart, and verify.
-- Confirm recovery after operation-worker or affected-child termination during
-  each operation phase without ending the AppHost run.
-- Document reset, backup, recovery, and intentionally destructive trust-retirement
-  scenarios.
-- Run the complete sequence against a populated artifact store within one
-  AppHost run.
+```bash
+aspire start --non-interactive --format Json
+./eng/validate-sigstore-lifecycle.sh
+```
 
-### Validation gate
+The driver requires Bash, `jq`, the fixed canonical ports, and a fresh
+non-isolated AppHost. It waits for each concrete resource and invokes the
+existing confirmed, non-cancelable commands in this dependency order:
 
-- Every operation has deterministic success, failure, and recovery behavior.
-- No successful command leaves clients or services on an unreported generation.
-- The artifact stream resumes after every supported rotation.
-- Historical artifacts remain verifiable under normal additive policy.
-- Every supported child-resource restart preserves the final committed
-  run-scoped state.
-- A subsequent AppHost process starts a new trust domain and empty artifact
-  store as specified by Step 0a.
+| Boundary | Command | Generation | Root | Targets | Snapshot | Timestamp | Required result |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Initial | `status` | 1 | 1 | 1 | 1 | 1 | Ready; six current clients |
+| Metadata | `refresh-tuf` | 1 | 1 | 1 | 2 | 2 | Content and identities unchanged |
+| Root | `rotate-tuf-root` | 1 | 2 | 2 | 3 | 3 | Root chain valid; clients visibly stale |
+| Root uptake | `restart-clients` | 1 | 2 | 2 | 3 | 3 | Six clients current |
+| Additive root | `publish-trusted-root` | 2 | 2 | 3 | 4 | 4 | Additive entries and history retained |
+| OIDC | `rotate-oidc-signing-key` | 3 | 2 | 4 | 5 | 5 | Old/new token continuity proved |
+| TSA | `rotate-timestamp-authority` | 4 | 2 | 5 | 6 | 6 | Old/new RFC3161 proofs retained |
+| Fulcio | `rotate-fulcio-ca` | 5 | 2 | 6 | 7 | 7 | Old/new CA and SCT proofs retained |
+| Rekor | `rotate-rekor-shard` | 6 | 2 | 7 | 8 | 8 | Primary retained; secondary selected |
+| CT | `rotate-ct-log-shard` | 7 | 2 | 8 | 9 | 9 | Primary retained; Fulcio selects secondary |
+
+Every row checks exact before/after versions, unchanged fields, operation
+postconditions, six-client convergence, required-resource health, and public
+status. The underlying Go composition test performs the same sequence from
+generation 1 in one state directory and additionally checks immutable
+generations 1-7, root-chain validity, additive authority/shard counts, routing
+selection, and bounded active TSA/Fulcio private material.
+
+### Concurrency and durable recovery
+
+All mutating command families share two exclusion layers. The in-process
+command lease returns a structured `phase: "contention"` result for an
+overlap. The OS `state.lock` rejects AppHost/one-shot-worker overlap with the
+current lock owner and without mutation. The lifecycle driver proves the
+public path by holding `publish-trusted-root` active and requiring an
+overlapping `refresh-tuf` to be rejected; the command becomes available again
+when the owner exits.
+
+Before every status read, command-state update, and mutation entry point, the
+AppHost reconstructs recovery from all durable journal families. Exactly one
+incomplete operation enables only its matching replay command. An unrelated
+invocation returns structured `phase: "recovery-pending"` without reaching a
+runtime command. Multiple incomplete operations, unexpected JSON members,
+invalid operation IDs, mismatched trust domains/generations, duplicate client
+records, unbound worker completions, or malformed activation evidence produce
+`Lifecycle Recovery Failed Closed`.
+
+The root worker request is strict schema-1 JSON bound to the operation ID,
+trust domain, starting generation/manifest, root version, and publication.
+The worker holds `state.lock`, first recovers any interrupted TUF publication,
+then either rotates once or validates the already committed state. Its
+operation-scoped completion is atomically persisted before request cleanup.
+AppHost replay independently binds every completion field to the hosting
+journal and live committed repository, preventing a crash after worker commit
+from rotating root twice.
+
+Trusted-root publication journals the worker commit and each client's
+container/start identity plus exact trust status. Replay skips a recorded
+client only when that same live identity still reports the recorded committed
+trust; stale, missing, or restarted clients converge individually. Root,
+trusted-root, OIDC, TSA, Fulcio, Rekor, and CT recovery is rollback-safe before
+activation and forward-only after additive trust or routing activation.
+Stored proof, runtime projection, service identity, and shard history are
+revalidated before each resumed side effect.
+
+Internal fault seams cover worker termination at activation/completion,
+AppHost orchestration failure after durable commit, affected-child restart,
+partial client convergence, replay with restarted clients, lock contention,
+and tampered requests/completions. These seams are test-only callbacks and
+temporary state; no production fault environment variable or bypass exists.
+Temporary candidates are either atomically promoted, retained as journal
+evidence, or cleaned before a new pre-activation attempt.
+
+### Health and evidence
+
+Public `status` never reports ready while an operation is active, recovery is
+pending, a client is stale, a signer or route has not activated, CT projection
+is incomplete, or any required historical shard compute is unavailable.
+Internal postcondition checks ignore only the status error for the operation
+that currently owns the lease; all other errors still fail the command. A
+successful replay clears recovery and re-enables commands without retaining a
+stale monitor value.
+
+The lifecycle driver writes
+`.sigstore/lifecycle-evidence/lifecycle-<trust-domain>.json` with mode `0600`.
+The schema contains operation IDs, exact generation/TUF transitions, public
+component fingerprints, resource lifecycle identities, history checks,
+client convergence, artifact proof IDs/hashes, representative child restart
+checks, and errors. It allowlists fields from command results: JWTs, private
+keys, passwords, candidate secrets, and worker tokens cannot enter the report
+or telemetry. `.sigstore`, `.shady-blob-store`, the report, and all temporary
+fault state remain ignored and untracked.
+
+After the composed state is ready, the driver restarts `fulcio`,
+`tesseract-secondary`, and `tuf` through Aspire, waits for each concrete
+resource, and proves generation 7, routing, component fingerprints, historical
+catalogs, and all clients remain current. Artifact production must continue
+through every boundary; retained pre/post boundary artifacts are verified in
+all six language implementations through the normal stream or their existing
+targeted verification route.
+
+### Operator policy
+
+- **Automatic recovery:** replay the one matching command when status names a
+  valid incomplete operation. Before activation, replay may discard only its
+  uncommitted candidate. After activation, it resumes forward from the
+  validated checkpoint.
+- **Intentional fail-closed:** do not edit state to bypass multiple, malformed,
+  unbound, missing-history, mismatched-identity, or changed-committed-state
+  errors. Stop the run and retain an offline copy for investigation.
+- **Backup limitation:** `.sigstore` and `.shady-blob-store` are demonstration
+  run state, not a supported backup/restore format. A copy is useful for
+  offline evidence only; a new AppHost process intentionally deletes it.
+- **Safe reset:** stop the AppHost cleanly, verify no child remains, then start
+  a new AppHost. The new run must have a different trust domain, generation 1,
+  initial TUF versions/topology, and a fresh artifact sequence. Never delete
+  either state directory while an AppHost is live.
+- **Historical retention:** normal operations are additive. Preserve old
+  Fulcio/TSA roots, OIDC overlap evidence, Rekor/CT shard catalogs, immutable
+  generations, tiles/checkpoints, and bundles while retained artifacts depend
+  on them.
+- **Destructive retirement:** there is no production retirement command.
+  Exercise removal only as an explicit disposable, stopped-run scenario after
+  proving that no retained artifact depends on the material.
+- **Known index-zero limitation:** never seed, skip, rewrite, or reserialize a
+  bundle to hide the cross-SDK ProtoJSON/sigstore-python omitted-index-zero
+  defect. If the Python sequential worker encounters it, report the blocked
+  artifact and use only the existing generation-pinned targeted verifier for
+  that same bundle. No public Sigstore fallback is allowed.
+
+### Validation gates
+
+1. Run Bootstrap and Hosting tests, the full TUF Go suite and `go vet`, OIDC,
+   AppHost and .NET client builds, and Go, JavaScript, Java, Python-container,
+   and Rust client tests.
+2. Run the full-sequence composition, contention, termination, tamper, partial
+   convergence, and replay tests; then run `bash -n
+   eng/validate-sigstore-lifecycle.sh` and `git diff --check`.
+3. Run the public lifecycle driver on the exact implementation HEAD and retain
+   its redacted report. Verify representative artifacts at the initial,
+   root/trusted-root, OIDC overlap, old/new TSA, old/new Fulcio, old/new Rekor,
+   and old/new CT boundaries in all six languages, disclosing only the targeted
+   Python exception above.
+4. Restart representative affected and unaffected children inside the run,
+   then stop/start the AppHost and prove the intentional reset contract. Leave
+   the final exact-HEAD AppHost running for inspection.
 
 ## Rotation safety rules
 
