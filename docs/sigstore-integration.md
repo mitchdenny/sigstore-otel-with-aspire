@@ -1711,6 +1711,53 @@ targeted verification route.
    then stop/start the AppHost and prove the intentional reset contract. Leave
    the final exact-HEAD AppHost running for inspection.
 
+### Complete-run validation evidence
+
+The full public driver passed on `2026-08-29` at implementation commit
+`f3896f61ca902d71d0e127a165c87b338e577757`. Its composed trust domain was
+`sha256-d532aeba3339c4c113fa53e8bf61b58bf30fd932402d0a5673f09a99efa3bd31`.
+The exact command execution IDs and transitions were:
+
+| Command | Execution ID | Generation | TUF root/targets/snapshot/timestamp |
+| --- | --- | --- | --- |
+| `refresh-tuf` | `48701912f12b477d86edbbb2b730a586` | 1 to 1 | `1/1/1/1` to `1/1/2/2` |
+| `rotate-tuf-root` | `b492434d7ed244e6849c017e89124e42` | 1 to 1 | `1/1/2/2` to `2/2/3/3` |
+| `restart-clients` | `325629e85a474c93b28ec687d3f42082` | 1 to 1 | unchanged `2/2/3/3` |
+| contended `refresh-tuf` | `14c6ec699c3548669fdefaf27b225521` | unchanged | structured `recovery-pending` |
+| `publish-trusted-root` | `b83ab73d6ba64e0abb0237fbdd17d054` | 1 to 2 | `2/2/3/3` to `2/3/4/4` |
+| `rotate-oidc-signing-key` | `cf13d726f9974bdc8b7c12c19d3c4b86` | 2 to 3 | `2/3/4/4` to `2/4/5/5` |
+| `rotate-timestamp-authority` | `c3e40b3eb3614abe8c9456abf156be7f` | 3 to 4 | `2/4/5/5` to `2/5/6/6` |
+| `rotate-fulcio-ca` | `5c4f788489934e9eb1bc3b9e6268522d` | 4 to 5 | `2/5/6/6` to `2/6/7/7` |
+| `rotate-rekor-shard` | `2e9aa813d41545a092602cc954fb1c5e` | 5 to 6 | `2/6/7/7` to `2/7/8/8` |
+| `rotate-ct-log-shard` | `2fbcb31226fa43729a25d77d03b3246a` | 6 to 7 | `2/7/8/8` to `2/8/9/9` |
+
+Every successful row ended with its exact postconditions passing. Generation 7
+was Healthy with six current clients, no operation or recovery marker, two TSA
+roots, two Fulcio roots, three Rekor entries, two CT entries, the secondary
+Rekor and CT routes selected, and immutable generations 1-7. Restarting
+`fulcio`, `tesseract-secondary`, and `tuf` preserved those values and resumed
+traffic through artifact `173`.
+
+The retained-artifact matrix used initial artifact `1`, post-root artifact
+`11`, post-trusted-root artifact `46`, OIDC continuity artifacts `47` and `64`,
+old/new TSA artifacts `64` and `84`, old/new Fulcio artifacts `85` and `106`,
+old/new Rekor artifacts `106` and `126`, and old/new CT artifacts `126` and
+`148`. Every ID except `1` passed the final generation-pinned targeted route in
+.NET, Go, Java, JavaScript, Python, and Rust, with one agreed artifact hash and
+one agreed bundle hash per ID. Artifact `1` passed the other five languages;
+Python returned the known missing `logIndex`, inclusion-proof `logIndex`, and
+`hashes` fields. The bundle was not seeded, skipped, rewritten, reserialized,
+or sent to public Sigstore.
+
+The report was mode `0600`, contained numeric proof IDs and public hashes, and
+had SHA-256
+`d5710f7f8e85429cc3c808e4698c341922ac96c832c2fd3b54009e38b84e6874`.
+No token or private-key field was present. A clean subsequent AppHost created
+trust domain
+`sha256-26be5e8fd5c0bb4b7d46a44a751792ac051c03368f5712e6fd2f29c2be0c8de4`,
+generation 1, initial TUF topology, and one generation directory. Artifact
+`173` was absent, and fresh artifact `9` passed all six targeted verifiers.
+
 ## Rotation safety rules
 
 - Publish trust before activating a new signer.

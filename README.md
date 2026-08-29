@@ -920,9 +920,10 @@ six clients and all required resources ready. The full sequence advances
 generation `1` to `7`, TUF root `1` to `2`, and targets/snapshot/timestamp
 `1` to `8`/`9`/`9`. The harness checks every intermediate transition, starts
 an overlapping `refresh-tuf` while trusted-root publication owns the command
-gate, and requires a structured `contention` rejection with no partial
-mutation. It finally restarts `fulcio`, `tesseract-secondary`, and `tuf` and
-proves the committed trust, routing, and signer fingerprints are unchanged.
+gate, and requires a structured `contention` or `recovery-pending` rejection
+with no partial mutation. It finally restarts `fulcio`,
+`tesseract-secondary`, and `tuf` and proves the committed trust, routing, and
+signer fingerprints are unchanged.
 
 `status` is read-only and authoritative. `ready: false` is expected while an
 operation is active, clients are stale, a signer or route activation is
@@ -976,5 +977,32 @@ The cross-SDK ProtoJSON/sigstore-python omitted-index-zero incompatibility
 remains visible and out of scope. Validation never seeds an entry, skips
 artifact zero, rewrites a bundle, or uses public Sigstore. When it occurs,
 the affected Python sequential worker reports it and the same retained bundle
-is verified only through the existing generation-pinned targeted Python
-verifier, with that exception disclosed in the evidence.
+is submitted only to the existing generation-pinned targeted Python verifier.
+Its real success or parser failure is disclosed in the evidence.
+
+### Complete-run evidence
+
+The complete lifecycle passed on `2026-08-29` at implementation commit
+`f3896f61ca902d71d0e127a165c87b338e577757`. The run advanced trust domain
+`sha256-d532aeba3339c4c113fa53e8bf61b58bf30fd932402d0a5673f09a99efa3bd31`
+from generation 1 to 7 with TUF versions `1/1/1/1` to `2/8/9/9`. All
+operations completed without an unresolved journal; the deliberate
+`refresh-tuf` overlap returned structured `recovery-pending`, and the owning
+trusted-root publication completed without partial mutation.
+
+The final generation retained two TSA roots, two Fulcio roots, three Rekor
+entries, two CT entries, and immutable generations 1-7. Artifacts `11`, `46`,
+`47`, `64`, `84`, `85`, `106`, `126`, and `148` each passed the targeted
+verifier in all six languages with one artifact hash and one bundle hash per
+ID. Initial artifact `1` passed .NET, Go, Java, JavaScript, and Rust; Python
+returned the documented missing index-zero ProtoJSON fields without any
+rewrite or fallback. The composed store continued through artifact `173`.
+
+After `fulcio`, `tesseract-secondary`, and `tuf` were restarted, status
+remained Healthy with all six clients on generation 7. A subsequent AppHost
+created trust domain
+`sha256-26be5e8fd5c0bb4b7d46a44a751792ac051c03368f5712e6fd2f29c2be0c8de4`,
+generation 1, initial TUF versions, one generation directory, and no artifact
+`173`; fresh artifact `9` then passed all six targeted verifiers. The
+mode-`0600` composed report SHA-256 is
+`d5710f7f8e85429cc3c808e4698c341922ac96c832c2fd3b54009e38b84e6874`.
