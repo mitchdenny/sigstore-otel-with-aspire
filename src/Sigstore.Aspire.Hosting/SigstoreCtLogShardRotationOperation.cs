@@ -1210,7 +1210,10 @@ internal sealed partial class SigstoreOperationExecutor
             cancellationToken);
         execution.Check(
             "aggregate-status-ready",
-            IsReadyForActiveOperation(aggregate)
+            IsReadyForCtLogFinalization(
+                aggregate,
+                operation.OperationId,
+                operation.Status)
                 && aggregate.Clients.Count == clients.Length
                 && aggregate.CtLog is
                 {
@@ -1270,6 +1273,42 @@ internal sealed partial class SigstoreOperationExecutor
             $"CT log shard rotated: {operation.PriorShardId} -> " +
             $"{operation.CandidateShardId}.",
             BuildCtLogShardRotationEvidence(operation, recovered));
+    }
+
+    internal static bool IsReadyForCtLogFinalization(
+        SigstoreAggregateTrustStatus status,
+        string operationId,
+        string operationStatus)
+    {
+        if (IsReadyForActiveOperation(status))
+        {
+            return true;
+        }
+
+        var ctLog = status.CtLog;
+        return status.Operation is
+            {
+                Command: SigstoreOperationCommand.RotateCtLogShardCommand
+            }
+            && status.Recovery is
+            {
+                Command: SigstoreOperationCommand.RotateCtLogShardCommand
+            } recovery
+            && recovery.Phase == operationStatus
+            && ctLog is not null
+            && ctLog.IncompleteRotationOperationId == operationId
+            && ctLog.IncompleteRotationStatus == operationStatus
+            && !ctLog.FulcioCtPromotionPending
+            && ctLog.TrustedRootCtlogCount == ctLog.Shards.Count
+            && ctLog.Shards.Count == 2
+            && ctLog.Shards.All(
+                shard => shard.InTrustedRoot
+                    && (!shard.ComputeRequired
+                        || shard.ComputeHealthy == true)
+                    && shard.AcceptedRootsMatchRuntime)
+            && status.Errors.Count == 2
+            && status.Errors.Count(error => error.Source == "ctlog") == 1
+            && status.Errors.Count(error => error.Source == "operation") == 1;
     }
 
     private async Task<CtLogShardRotationCommandJournal>

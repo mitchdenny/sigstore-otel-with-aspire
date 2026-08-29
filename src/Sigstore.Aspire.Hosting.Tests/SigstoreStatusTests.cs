@@ -430,6 +430,128 @@ public sealed class SigstoreStatusTests
                 StringComparison.Ordinal));
     }
 
+    [Fact]
+    public void CtFinalizationIgnoresOnlyItsBoundRecoveryMarkers()
+    {
+        const string operationId = "11111111111111111111111111111111";
+        const string operationStatus = SigstoreCtLogShard.StatusNewShardProved;
+        var secondary = new SigstoreCtLogShardHealthStatus(
+            "sha256-" + new string('1', 64),
+            "secondary",
+            "active",
+            SigstoreCtLogShard.SecondaryUrl,
+            SigstoreCtLogShard.SecondaryOrigin,
+            SigstoreCtLogShard.SecondaryResourceName,
+            new string('1', 64),
+            new string('1', 64),
+            "secondary-state",
+            1,
+            1,
+            new string('2', 64),
+            new string('3', 64),
+            true,
+            true,
+            true,
+            new string('4', 64),
+            1,
+            [new string('5', 64)],
+            true);
+        var primary = secondary with
+        {
+            ShardId = "sha256-" + new string('6', 64),
+            Slot = "primary",
+            Status = "historical",
+            BaseUrl = SigstoreCtLogShard.PrimaryUrl,
+            Origin = SigstoreCtLogShard.PrimaryOrigin,
+            Resource = SigstoreCtLogShard.PrimaryResourceName,
+            PublicKeySha256 = new string('6', 64),
+            LogIdSha256 = new string('6', 64),
+            StateId = "primary-state"
+        };
+        var ctLog = new SigstoreCtLogStatus(
+            secondary.ShardId,
+            "secondary",
+            SigstoreCtLogShard.SecondaryOrigin,
+            secondary.PublicKeySha256,
+            false,
+            null,
+            2,
+            [],
+            [primary, secondary],
+            operationId,
+            operationStatus);
+        var status = new SigstoreAggregateTrustStatus(
+            1,
+            "sigstore",
+            false,
+            "Degraded",
+            "ctlog: recovery pending",
+            DateTimeOffset.UtcNow,
+            null,
+            null,
+            [],
+            [],
+            [
+                new("ctlog", "bound recovery pending"),
+                new("operation", "rotation active")
+            ],
+            Operation: new(
+                SigstoreOperationCommand.RotateCtLogShardCommand,
+                "aggregate-status",
+                25,
+                26,
+                "Finalizing CT log rotation.",
+                DateTimeOffset.UtcNow),
+            Recovery: new(
+                SigstoreOperationCommand.RotateCtLogShardCommand,
+                operationStatus,
+                "Lifecycle Recovery Pending",
+                "The durable journal is not finalized.",
+                DateTimeOffset.UtcNow),
+            CtLog: ctLog);
+
+        Assert.True(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status,
+                operationId,
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status,
+                new string('2', 32),
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status with
+                {
+                    Errors =
+                    [
+                        .. status.Errors,
+                        new("resources", "required resource is unhealthy")
+                    ]
+                },
+                operationId,
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status with
+                {
+                    CtLog = ctLog with
+                    {
+                        Shards =
+                        [
+                            primary,
+                            secondary with
+                            {
+                                ComputeHealthy = false
+                            }
+                        ]
+                    }
+                },
+                operationId,
+                operationStatus));
+    }
+
     private static SigstoreClientTrustStatus NewClientStatus(
         string resource,
         string language) =>
