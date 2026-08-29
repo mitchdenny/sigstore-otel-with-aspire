@@ -35,12 +35,12 @@ internal static class SigstoreParentHealthMonitor
         ResourceNotificationService notifications,
         CancellationToken cancellationToken)
     {
-        var requiredResources = resource
-            .GetRegistrations()
-            .RequiredResources
+        var registrations = resource.GetRegistrations();
+        var monitoredResources = registrations.RequiredResources
+            .Concat(registrations.ConditionalResources)
             .OrderBy(item => item.Name, StringComparer.Ordinal)
             .ToArray();
-        var requiredNames = requiredResources
+        var monitoredNames = monitoredResources
             .Select(item => item.Name)
             .ToHashSet(StringComparer.Ordinal);
         var observed = new Dictionary<string, SigstoreObservedResource>(
@@ -48,13 +48,13 @@ internal static class SigstoreParentHealthMonitor
         var wasHealthy = false;
         SigstoreRuntimeHealthSnapshot? last = null;
 
-        foreach (var required in requiredResources)
+        foreach (var monitored in monitoredResources)
         {
             if (notifications.TryGetCurrentState(
-                    required.Name,
+                    monitored.Name,
                     out var current))
             {
-                observed[required.Name] = Observe(current);
+                observed[monitored.Name] = Observe(current);
             }
         }
 
@@ -66,7 +66,7 @@ internal static class SigstoreParentHealthMonitor
                 .WatchAsync(cancellationToken)
                 .ConfigureAwait(false))
             {
-                if (!requiredNames.Contains(resourceEvent.Resource.Name))
+                if (!monitoredNames.Contains(resourceEvent.Resource.Name))
                 {
                     continue;
                 }
@@ -82,6 +82,16 @@ internal static class SigstoreParentHealthMonitor
 
         async Task PublishIfChangedAsync()
         {
+            var currentRegistrations = resource.GetRegistrations();
+            var requiredNames = currentRegistrations.RequiredResources
+                .Select(item => item.Name)
+                .Concat(
+                    currentRegistrations.ConditionalResources
+                        .Where(
+                            item => resource.IsConditionalResourceActive(
+                                item.Name))
+                        .Select(item => item.Name))
+                .ToHashSet(StringComparer.Ordinal);
             var current = Evaluate(
                 requiredNames,
                 observed,

@@ -145,6 +145,16 @@ func main() {
 		return
 	}
 
+	rekorRotationRequest := filepath.Join(statePath, rekorRotationRequestFile)
+	if pathExists(rekorRotationRequest) {
+		action, err := dispatchRekorRotation(statePath)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		fmt.Printf("%s Sigstore TUF repository at %s.\n", action, filepath.Join(statePath, "tuf"))
+		return
+	}
+
 	rotationRequest := filepath.Join(statePath, "rotate-root.request")
 	if pathExists(rotationRequest) {
 		action, err := rotateTUFRootKey(statePath)

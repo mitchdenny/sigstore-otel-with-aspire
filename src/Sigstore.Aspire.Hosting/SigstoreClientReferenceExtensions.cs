@@ -39,6 +39,8 @@ public static class SigstoreClientReferenceExtensions
                 "--add-host",
                 "rekor-sigstore.dev.localhost:host-gateway",
                 "--add-host",
+                "rekor-secondary-sigstore.dev.localhost:host-gateway",
+                "--add-host",
                 "timestamp-sigstore.dev.localhost:host-gateway");
         }
 

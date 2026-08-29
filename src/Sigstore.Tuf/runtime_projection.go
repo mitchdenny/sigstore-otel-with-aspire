@@ -20,6 +20,7 @@ const (
 	runtimeFulcioComponent      = "fulcio"
 	runtimeFulcioNextComponent  = "fulcio.next"
 	runtimeTesseractComponent   = "tesseract"
+	runtimeRekorComponent       = "rekor-secondary"
 	runtimeFulcioRootCertFile   = "root.pem"
 	runtimeFulcioRootKeyFile    = "root.key"
 	runtimeFulcioPasswordFile   = "password"
@@ -308,6 +309,15 @@ func validateFulcioRotationRuntimeProjection(
 	}
 
 	expectedRuntimeEntries := []string{runtimeFulcioComponent, runtimeTesseractComponent}
+	if bootstrap.RekorPublicKeySHA256 != "" {
+		manifest, err := readOIDCGenerationManifest(statePath, bootstrap.GenerationID)
+		if err != nil {
+			return err
+		}
+		if manifest.RekorRotationOperationID != "" {
+			expectedRuntimeEntries = append(expectedRuntimeEntries, runtimeRekorComponent)
+		}
+	}
 	if pathExists(stagePath) {
 		expectedRuntimeEntries = append(expectedRuntimeEntries, runtimeFulcioNextComponent)
 		staged, err := runtimeComponentMatches(

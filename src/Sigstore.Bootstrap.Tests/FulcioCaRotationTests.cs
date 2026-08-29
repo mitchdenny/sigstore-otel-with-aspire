@@ -992,6 +992,14 @@ public sealed class FulcioCaRotationTests
                 prior.Generation,
                 prior.GenerationId,
                 prior.FulcioRootSha256,
+                prior.RekorRotationOperationId,
+                prior.RekorPriorGeneration,
+                prior.RekorPriorGenerationId,
+                prior.RekorPriorPublicKeySha256,
+                prior.RekorPriorShardId,
+                prior.RekorPriorBaseUrl,
+                prior.RekorShardId,
+                prior.RekorBaseUrl,
                 CollectHashes(newGenerationPath));
             var manifestPath = Path.Combine(
                 newGenerationPath,

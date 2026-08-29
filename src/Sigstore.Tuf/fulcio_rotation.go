@@ -479,6 +479,14 @@ func rotateFulcioGeneration(
 		FulcioPriorGeneration:     current.Generation,
 		FulcioPriorGenerationID:   current.GenerationID,
 		FulcioPriorRootSHA256:     current.FulcioRootSHA256,
+		RekorRotationOperationID:  currentManifest.RekorRotationOperationID,
+		RekorPriorGeneration:      currentManifest.RekorPriorGeneration,
+		RekorPriorGenerationID:    currentManifest.RekorPriorGenerationID,
+		RekorPriorPublicKeySHA256: currentManifest.RekorPriorPublicKeySHA256,
+		RekorPriorShardID:         currentManifest.RekorPriorShardID,
+		RekorPriorBaseURL:         currentManifest.RekorPriorBaseURL,
+		RekorShardID:              currentManifest.RekorShardID,
+		RekorBaseURL:              currentManifest.RekorBaseURL,
 		Files:                     newFiles,
 	}
 	manifestBytes, err := json.MarshalIndent(genManifest, "", "  ")

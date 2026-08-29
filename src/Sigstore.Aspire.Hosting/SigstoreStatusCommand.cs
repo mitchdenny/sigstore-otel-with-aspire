@@ -2,6 +2,8 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using Sigstore.Bootstrap;
 
 namespace Aspire.Hosting.ApplicationModel;
 
@@ -88,6 +90,27 @@ public sealed record SigstoreRecoveryStatus(
     string Message,
     DateTimeOffset UpdatedAtUtc);
 
+public sealed record SigstoreRekorShardHealthStatus(
+    string ShardId,
+    string Slot,
+    string Status,
+    string BaseUrl,
+    string Origin,
+    string Resource,
+    string PublicKeySha256,
+    string StateId,
+    long TreeSize,
+    string CheckpointSha256,
+    bool StaticRouteReady,
+    bool ComputeRequired,
+    bool? ComputeHealthy);
+
+public sealed record SigstoreRekorStatus(
+    string ActiveShardId,
+    string ActiveSigningConfigUrl,
+    int TrustedRootTlogCount,
+    IReadOnlyList<SigstoreRekorShardHealthStatus> Shards);
+
 public sealed record SigstoreAggregateTrustStatus(
     int SchemaVersion,
     string Resource,
@@ -103,7 +126,8 @@ public sealed record SigstoreAggregateTrustStatus(
     SigstoreTimestampAuthorityStatus? TimestampAuthority = null,
     SigstoreActiveOperationStatus? Operation = null,
     SigstoreRecoveryStatus? Recovery = null,
-    SigstoreFulcioStatus? Fulcio = null);
+    SigstoreFulcioStatus? Fulcio = null,
+    SigstoreRekorStatus? Rekor = null);
 
 internal sealed record PublishedTrustStatus(
     int SchemaVersion,
@@ -145,6 +169,14 @@ internal sealed record GenerationManifestStatus(
     string? TsaPriorGenerationId,
     string? TsaPriorRootSha256,
     string? TsaPriorLeafSha256,
+    string? RekorRotationOperationId,
+    int RekorPriorGeneration,
+    string? RekorPriorGenerationId,
+    string? RekorPriorPublicKeySha256,
+    string? RekorPriorShardId,
+    string? RekorPriorBaseUrl,
+    string? RekorShardId,
+    string? RekorBaseUrl,
     SortedDictionary<string, string> Files);
 
 internal sealed record TrustDomainManifestStatus(
@@ -188,6 +220,44 @@ internal sealed record TufManifestStatus(
     string SourceFingerprint,
     SortedDictionary<string, string> Files);
 
+internal sealed record RekorShardCatalogStatus(
+    int SchemaVersion,
+    string TrustDomainId,
+    string ActiveShardId,
+    DateTimeOffset UpdatedAtUtc,
+    IReadOnlyList<RekorShardCatalogEntryStatus> Shards);
+
+internal sealed record RekorShardCatalogEntryStatus(
+    string ShardId,
+    string Slot,
+    string BaseUrl,
+    string Origin,
+    string PublicKeySha256,
+    string LogIdSha256,
+    string StateId,
+    string DataPath,
+    string ResourceName,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset ActivatedAtUtc,
+    string Status);
+
+internal sealed record RekorShardMetadataStatus(
+    int SchemaVersion,
+    string OperationId,
+    string TrustDomainId,
+    string ShardId,
+    string Slot,
+    string BaseUrl,
+    string Origin,
+    string PublicKeySha256,
+    string LogIdSha256,
+    string StateId,
+    string DataPath,
+    string ResourceName,
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset? ActivatedAtUtc,
+    string? Status);
+
 internal sealed class SigstoreStatusException(string message)
     : Exception(message);
 
@@ -206,6 +276,12 @@ internal static class SigstoreStatusCommand
         {
             PropertyNameCaseInsensitive = false,
             WriteIndented = true
+        };
+
+    private static readonly JsonSerializerOptions StrictJsonOptions =
+        new(JsonOptions)
+        {
+            UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
         };
 
     public static async Task<ExecuteCommandResult> ExecuteAsync(
@@ -247,6 +323,7 @@ internal static class SigstoreStatusCommand
         SigstoreServedTrustStatus? served = null;
         SigstoreTimestampAuthorityStatus? timestampAuthority = null;
         SigstoreFulcioStatus? fulcio = null;
+        SigstoreRekorStatus? rekor = null;
 
         try
         {
@@ -438,6 +515,21 @@ internal static class SigstoreStatusCommand
             }
         }
 
+        if (disk is not null)
+        {
+            try
+            {
+                rekor = await ReadRekorStatusAsync(
+                    resource,
+                    cancellationToken);
+            }
+            catch (Exception exception)
+                when (IsExpectedStatusFailure(exception))
+            {
+                errors.Add(new("rekor", exception.Message));
+            }
+        }
+
         if (runtime.State != "Healthy")
         {
             errors.Add(
@@ -479,6 +571,7 @@ internal static class SigstoreStatusCommand
             && served is not null
             && timestampAuthority is not null
             && fulcio is not null
+            && rekor is not null
             && clients.Count == registrations.Clients.Count;
         var reason = errors.Count == 0
             ? null
@@ -516,7 +609,228 @@ internal static class SigstoreStatusCommand
                     recovery.DisplayState,
                     recovery.Message,
                     recovery.UpdatedAtUtc),
-            fulcio);
+            fulcio,
+            rekor);
+    }
+
+    internal static async Task<SigstoreRekorStatus> ReadRekorStatusAsync(
+        SigstoreResource resource,
+        CancellationToken cancellationToken)
+    {
+        var statePath = resource.StatePath;
+        var generationLink = ReadRequiredLink(
+            Path.Combine(statePath, "active-generation"));
+        var activeGenerationPath = Path.Combine(statePath, generationLink);
+        var generation = DeserializeRequired<GenerationManifestStatus>(
+            ReadRequiredBytes(
+                Path.Combine(activeGenerationPath, "manifest.json")),
+            "active generation manifest");
+        var trustDomain = DeserializeRequired<TrustDomainManifestStatus>(
+            ReadRequiredBytes(Path.Combine(statePath, "trust-domain.json")),
+            "trust-domain manifest");
+
+        var catalogPath = Path.Combine(
+            statePath,
+            "data",
+            "rekor-shards",
+            "state.json");
+        RekorShardCatalogStatus catalog;
+        if (File.Exists(catalogPath))
+        {
+            catalog = DeserializeStrict<RekorShardCatalogStatus>(
+                ReadRequiredBytes(catalogPath),
+                "Rekor shard catalog");
+        }
+        else
+        {
+            if (generation.RekorRotationOperationId is not null)
+            {
+                throw new SigstoreStatusException(
+                    "The rotated Rekor generation has no shard catalog.");
+            }
+            var primaryMaterial =
+                SigstoreStateBootstrapper.ValidateRekorShardMaterial(
+                    Path.Combine(
+                        statePath,
+                        "generations",
+                        "generation-00000001"));
+            catalog = new RekorShardCatalogStatus(
+                1,
+                trustDomain.TrustDomainId,
+                primaryMaterial.ShardId,
+                trustDomain.CreatedAtUtc,
+                [
+                    new RekorShardCatalogEntryStatus(
+                        primaryMaterial.ShardId,
+                        "primary",
+                        "http://rekor-sigstore.dev.localhost:3000",
+                        "rekor-sigstore.dev.localhost",
+                        primaryMaterial.PublicKeySha256,
+                        primaryMaterial.LogId,
+                        trustDomain.RekorStateId,
+                        "data/rekor",
+                        "rekor-server",
+                        trustDomain.CreatedAtUtc,
+                        trustDomain.CreatedAtUtc,
+                        "active")
+                ]);
+        }
+
+        ValidateRekorCatalog(catalog, generation, trustDomain);
+        var trustedRootPath = Path.Combine(
+            statePath,
+            "tuf",
+            "active",
+            "targets",
+            "trusted_root.json");
+        var tlogs = SigstoreRekorShard.ReadTlogEntries(
+            ReadRequiredBytes(trustedRootPath));
+        var signingConfigUrl = ReadActiveRekorSigningConfigUrl(
+            ReadRequiredBytes(
+                Path.Combine(
+                    statePath,
+                    "tuf",
+                    "active",
+                    "targets",
+                    "signing_config.v0.2.json")));
+        var activeShard = catalog.Shards.Single(
+            shard => shard.ShardId == catalog.ActiveShardId);
+        if (signingConfigUrl != activeShard.BaseUrl)
+        {
+            throw new SigstoreStatusException(
+                $"SigningConfig routes Rekor to '{signingConfigUrl}', expected " +
+                $"active shard '{activeShard.BaseUrl}'.");
+        }
+
+        var gatewayValue = await resource.Components.Rekor
+            .GetEndpoint("http")
+            .GetValueAsync(cancellationToken)
+            ?? throw new SigstoreStatusException(
+                "The Rekor gateway endpoint is not allocated.");
+        var gateway = EnsureTrailingSlash(
+            new Uri(gatewayValue, UriKind.Absolute));
+        using var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(10)
+        };
+        var results = new List<SigstoreRekorShardHealthStatus>();
+        foreach (var shard in catalog.Shards)
+        {
+            var signerGenerationPath = shard.Slot == "primary"
+                ? Path.Combine(
+                    statePath,
+                    "generations",
+                    "generation-00000001")
+                : activeGenerationPath;
+            var material =
+                SigstoreStateBootstrapper.ValidateRekorShardMaterial(
+                    signerGenerationPath);
+            if (material.PublicKeySha256 != shard.PublicKeySha256
+                || material.LogId != shard.LogIdSha256
+                || material.ShardId != shard.ShardId)
+            {
+                throw new SigstoreStatusException(
+                    $"{shard.Slot} Rekor signer does not match its shard catalog.");
+            }
+
+            var spki = ReadRekorSpki(
+                Path.Combine(
+                    signerGenerationPath,
+                    "public",
+                    "rekor",
+                    "signer.pub"));
+            var dataPath = Path.Combine(
+                statePath,
+                shard.DataPath.Replace(
+                    '/',
+                    Path.DirectorySeparatorChar));
+            var stateId = File.ReadAllText(
+                Path.Combine(dataPath, "bootstrap-state"));
+            if (stateId != shard.StateId)
+            {
+                throw new SigstoreStatusException(
+                    $"{shard.Slot} Rekor data does not match its shard state ID.");
+            }
+            if (shard.Slot == "secondary")
+            {
+                ValidateSecondaryRekorMetadata(
+                    statePath,
+                    shard,
+                    generation.RekorRotationOperationId
+                        ?? throw new SigstoreStatusException(
+                            "Secondary Rekor shard has no rotation operation."),
+                    trustDomain.TrustDomainId);
+            }
+
+            var checkpointBytes = ReadRequiredBytes(
+                Path.Combine(dataPath, "checkpoint"));
+            var checkpoint = SigstoreRekorShard.ReadAndVerifyCheckpoint(
+                checkpointBytes,
+                shard.Origin,
+                spki);
+            var tlogMatches = tlogs.Count(
+                tlog => tlog.BaseUrl == shard.BaseUrl
+                    && tlog.PublicKeySha256 == shard.PublicKeySha256);
+            if (tlogMatches != 1)
+            {
+                throw new SigstoreStatusException(
+                    $"{shard.Slot} Rekor shard does not have exactly one " +
+                    "matching TrustedRoot entry.");
+            }
+
+            var routeBytes = await ReadGatewayBytesAsync(
+                client,
+                gateway,
+                "checkpoint",
+                new Uri(shard.BaseUrl, UriKind.Absolute).Authority,
+                cancellationToken);
+            var routeCheckpoint =
+                SigstoreRekorShard.ReadAndVerifyCheckpoint(
+                    routeBytes,
+                    shard.Origin,
+                    spki);
+            if (routeCheckpoint.TreeSize < checkpoint.TreeSize)
+            {
+                throw new SigstoreStatusException(
+                    $"{shard.Slot} Rekor checkpoint route regressed from " +
+                    $"{checkpoint.TreeSize} to {routeCheckpoint.TreeSize}.");
+            }
+
+            var computeRequired = shard.Status == "active";
+            bool? computeHealthy = null;
+            if (computeRequired)
+            {
+                await ProbeGatewayAsync(
+                    client,
+                    gateway,
+                    "healthz",
+                    new Uri(shard.BaseUrl, UriKind.Absolute).Authority,
+                    cancellationToken);
+                computeHealthy = true;
+            }
+
+            results.Add(
+                new SigstoreRekorShardHealthStatus(
+                    shard.ShardId,
+                    shard.Slot,
+                    shard.Status,
+                    shard.BaseUrl,
+                    shard.Origin,
+                    shard.ResourceName,
+                    shard.PublicKeySha256,
+                    shard.StateId,
+                    routeCheckpoint.TreeSize,
+                    Hash(routeBytes),
+                    true,
+                    computeRequired,
+                    computeHealthy));
+        }
+
+        return new SigstoreRekorStatus(
+            catalog.ActiveShardId,
+            signingConfigUrl,
+            tlogs.Count,
+            results);
     }
 
     internal static SigstoreDiskTrustStatus ReadDiskStatus(string statePath)
@@ -595,6 +909,7 @@ internal static class SigstoreStatusCommand
             generationManifest.Files);
         ValidateFulcioRotationMetadata(generationManifest);
         ValidateTimestampRotationMetadata(generationManifest);
+        ValidateRekorRotationMetadata(generationManifest);
         var generationManifestHash = Hash(generationManifestBytes);
 
         var transition = DeserializeRequired<TransitionJournalStatus>(
@@ -640,7 +955,13 @@ internal static class SigstoreStatusCommand
                     == generationManifest.Generation - 1
                 && (transition.Operation != "fulcio-rotation"
                     || transition.TransitionId
-                        != generationManifest.FulcioRotationOperationId))
+                        != generationManifest.FulcioRotationOperationId)
+            || generationManifest.RekorRotationOperationId is not null
+                && generationManifest.RekorPriorGeneration
+                    == generationManifest.Generation - 1
+                && (transition.Operation != "rekor-shard-rotation"
+                    || transition.TransitionId
+                        != generationManifest.RekorRotationOperationId))
         {
             throw new SigstoreStatusException(
                 "The active generation does not match the committed transition.");
@@ -1149,6 +1470,253 @@ internal static class SigstoreStatusCommand
         return ParseClientStatus(payload, registration);
     }
 
+    private static void ValidateRekorCatalog(
+        RekorShardCatalogStatus catalog,
+        GenerationManifestStatus generation,
+        TrustDomainManifestStatus trustDomain)
+    {
+        if (catalog.SchemaVersion != 1
+            || catalog.TrustDomainId != trustDomain.TrustDomainId
+            || catalog.UpdatedAtUtc == default
+            || catalog.UpdatedAtUtc.Offset != TimeSpan.Zero
+            || catalog.Shards is null
+            || catalog.Shards.Count is not (1 or 2)
+            || catalog.Shards.Select(shard => shard.ShardId)
+                .Distinct(StringComparer.Ordinal)
+                .Count() != catalog.Shards.Count
+            || catalog.Shards.Count(shard => shard.Status == "active") != 1
+            || catalog.UpdatedAtUtc
+                < catalog.Shards.Max(shard => shard.ActivatedAtUtc))
+        {
+            throw new SigstoreStatusException(
+                "The Rekor shard catalog is malformed.");
+        }
+
+        foreach (var shard in catalog.Shards)
+        {
+            if (!IsLowerHexSha256(shard.PublicKeySha256)
+                || shard.LogIdSha256 != shard.PublicKeySha256
+                || shard.ShardId != $"sha256-{shard.PublicKeySha256}"
+                || shard.CreatedAtUtc == default
+                || shard.ActivatedAtUtc == default
+                || shard.CreatedAtUtc.Offset != TimeSpan.Zero
+                || shard.ActivatedAtUtc.Offset != TimeSpan.Zero
+                || shard.ActivatedAtUtc < shard.CreatedAtUtc
+                || shard.Status is not ("active" or "historical")
+                || !Guid.TryParseExact(shard.StateId, "D", out _)
+                || shard.StateId.Any(char.IsUpper))
+            {
+                throw new SigstoreStatusException(
+                    $"The {shard.Slot} Rekor shard catalog entry is malformed.");
+            }
+        }
+
+        var primary = catalog.Shards[0];
+        if (primary.Slot != "primary"
+            || primary.BaseUrl
+                != "http://rekor-sigstore.dev.localhost:3000"
+            || primary.Origin != "rekor-sigstore.dev.localhost"
+            || primary.DataPath != "data/rekor"
+            || primary.ResourceName != "rekor-server"
+            || primary.StateId != trustDomain.RekorStateId
+            || primary.CreatedAtUtc != trustDomain.CreatedAtUtc
+            || primary.ActivatedAtUtc != trustDomain.CreatedAtUtc)
+        {
+            throw new SigstoreStatusException(
+                "The primary Rekor shard does not match the trust domain.");
+        }
+
+        if (catalog.Shards.Count == 1)
+        {
+            if (catalog.ActiveShardId != primary.ShardId
+                || primary.Status != "active"
+                || generation.RekorRotationOperationId is not null
+                || generation.RekorPublicKeySha256
+                    != primary.PublicKeySha256)
+            {
+                throw new SigstoreStatusException(
+                    "The single-shard Rekor catalog does not match the " +
+                    "active generation.");
+            }
+            return;
+        }
+
+        var secondary = catalog.Shards[1];
+        if (primary.Status != "historical"
+            || secondary.Status != "active"
+            || catalog.ActiveShardId != secondary.ShardId
+            || secondary.Slot != "secondary"
+            || secondary.BaseUrl
+                != "http://rekor-secondary-sigstore.dev.localhost:3000"
+            || secondary.Origin
+                != "rekor-secondary-sigstore.dev.localhost"
+            || secondary.DataPath != "data/rekor-shards/secondary"
+            || secondary.ResourceName != "rekor-server-secondary"
+            || generation.RekorRotationOperationId is null
+            || generation.RekorPriorPublicKeySha256
+                != primary.PublicKeySha256
+            || generation.RekorPriorShardId != primary.ShardId
+            || generation.RekorPriorBaseUrl != primary.BaseUrl
+            || generation.RekorPublicKeySha256
+                != secondary.PublicKeySha256
+            || generation.RekorShardId != secondary.ShardId
+            || generation.RekorBaseUrl != secondary.BaseUrl)
+        {
+            throw new SigstoreStatusException(
+                "The rotated Rekor shard catalog does not match the active " +
+                "generation.");
+        }
+    }
+
+    private static void ValidateSecondaryRekorMetadata(
+        string statePath,
+        RekorShardCatalogEntryStatus shard,
+        string operationId,
+        string trustDomainId)
+    {
+        var metadata = DeserializeStrict<RekorShardMetadataStatus>(
+            ReadRequiredBytes(
+                Path.Combine(
+                    statePath,
+                    "data",
+                    "rekor-shards",
+                    "secondary",
+                    "shard.json")),
+            "secondary Rekor shard metadata");
+        if (metadata.SchemaVersion != 1
+            || metadata.OperationId != operationId
+            || metadata.TrustDomainId != trustDomainId
+            || metadata.ShardId != shard.ShardId
+            || metadata.Slot != shard.Slot
+            || metadata.BaseUrl != shard.BaseUrl
+            || metadata.Origin != shard.Origin
+            || metadata.PublicKeySha256 != shard.PublicKeySha256
+            || metadata.LogIdSha256 != shard.LogIdSha256
+            || metadata.StateId != shard.StateId
+            || metadata.DataPath != shard.DataPath
+            || metadata.ResourceName != shard.ResourceName
+            || metadata.CreatedAtUtc != shard.CreatedAtUtc
+            || metadata.ActivatedAtUtc != shard.ActivatedAtUtc
+            || metadata.Status != shard.Status)
+        {
+            throw new SigstoreStatusException(
+                "The secondary Rekor shard metadata does not match the catalog.");
+        }
+    }
+
+    private static string ReadActiveRekorSigningConfigUrl(
+        ReadOnlySpan<byte> payload)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(payload.ToArray());
+            var services = document.RootElement
+                .GetProperty("rekorTlogUrls")
+                .EnumerateArray()
+                .Where(
+                    service => service
+                        .GetProperty("majorApiVersion")
+                        .GetInt32() == 2)
+                .Select(
+                    service => service.GetProperty("url").GetString())
+                .ToArray();
+            if (services is not [var selected]
+                || !Uri.TryCreate(
+                    selected,
+                    UriKind.Absolute,
+                    out var uri)
+                || uri.Scheme is not ("http" or "https"))
+            {
+                throw new SigstoreStatusException(
+                    "SigningConfig must select exactly one absolute Rekor v2 URL.");
+            }
+            return uri.AbsoluteUri.TrimEnd('/');
+        }
+        catch (Exception exception)
+            when (exception is JsonException
+                or InvalidOperationException
+                or KeyNotFoundException)
+        {
+            throw new SigstoreStatusException(
+                $"SigningConfig Rekor routing is malformed: {exception.Message}");
+        }
+    }
+
+    private static byte[] ReadRekorSpki(string path)
+    {
+        using var key = ECDsa.Create();
+        try
+        {
+            key.ImportFromPem(
+                Encoding.UTF8.GetString(ReadRequiredBytes(path)));
+        }
+        catch (CryptographicException exception)
+        {
+            throw new SigstoreStatusException(
+                $"Rekor public key '{path}' is malformed: {exception.Message}");
+        }
+        if (key.KeySize != 256)
+        {
+            throw new SigstoreStatusException(
+                $"Rekor public key '{path}' is not ECDSA P-256.");
+        }
+        return key.ExportSubjectPublicKeyInfo();
+    }
+
+    private static async Task<byte[]> ReadGatewayBytesAsync(
+        HttpClient client,
+        Uri gateway,
+        string relativePath,
+        string host,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Get,
+            new Uri(gateway, relativePath));
+        request.Headers.Host = host;
+        using var response = await client.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            throw new SigstoreStatusException(
+                $"{host}/{relativePath} returned HTTP " +
+                $"{(int)response.StatusCode}.");
+        }
+        var payload = await response.Content.ReadAsByteArrayAsync(
+            cancellationToken);
+        if (payload.Length is 0 or > MaximumStatusBytes)
+        {
+            throw new SigstoreStatusException(
+                $"{host}/{relativePath} returned an invalid payload length.");
+        }
+        return payload;
+    }
+
+    private static async Task ProbeGatewayAsync(
+        HttpClient client,
+        Uri gateway,
+        string relativePath,
+        string host,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Get,
+            new Uri(gateway, relativePath));
+        request.Headers.Host = host;
+        using var response = await client.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            throw new SigstoreStatusException(
+                $"{host}/{relativePath} returned HTTP " +
+                $"{(int)response.StatusCode}.");
+        }
+    }
+
     private static async Task<byte[]> ReadHttpBytesAsync(
         HttpClient client,
         Uri uri,
@@ -1177,6 +1745,25 @@ internal static class SigstoreStatusCommand
                 $"{uri} returned an invalid payload length.");
         }
         return payload;
+    }
+
+    private static T DeserializeStrict<T>(
+        ReadOnlySpan<byte> payload,
+        string description)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<T>(
+                    payload,
+                    StrictJsonOptions)
+                ?? throw new SigstoreStatusException(
+                    $"{description} is empty.");
+        }
+        catch (JsonException exception)
+        {
+            throw new SigstoreStatusException(
+                $"{description} is malformed: {exception.Message}");
+        }
     }
 
     private static void ValidateGenerationFiles(
@@ -1285,6 +1872,22 @@ internal static class SigstoreStatusCommand
             == second.TsaPriorRootSha256
         && first.TsaPriorLeafSha256
             == second.TsaPriorLeafSha256
+        && first.RekorRotationOperationId
+            == second.RekorRotationOperationId
+        && first.RekorPriorGeneration
+            == second.RekorPriorGeneration
+        && first.RekorPriorGenerationId
+            == second.RekorPriorGenerationId
+        && first.RekorPriorPublicKeySha256
+            == second.RekorPriorPublicKeySha256
+        && first.RekorPriorShardId
+            == second.RekorPriorShardId
+        && first.RekorPriorBaseUrl
+            == second.RekorPriorBaseUrl
+        && first.RekorShardId
+            == second.RekorShardId
+        && first.RekorBaseUrl
+            == second.RekorBaseUrl
         && DictionariesEqual(first.Files, second.Files);
 
     private static void ValidateFulcioRotationMetadata(
@@ -1333,6 +1936,7 @@ internal static class SigstoreStatusCommand
                 throw new SigstoreStatusException(
                     "The active generation has partial TSA rotation metadata.");
             }
+
             return;
         }
         if (!Guid.TryParseExact(
@@ -1355,6 +1959,52 @@ internal static class SigstoreStatusCommand
         {
             throw new SigstoreStatusException(
                 "The active generation has invalid TSA rotation metadata.");
+        }
+    }
+
+    private static void ValidateRekorRotationMetadata(
+        GenerationManifestStatus generation)
+    {
+        if (generation.RekorRotationOperationId is null)
+        {
+            if (generation.RekorPriorGeneration != 0
+                || generation.RekorPriorGenerationId is not null
+                || generation.RekorPriorPublicKeySha256 is not null
+                || generation.RekorPriorShardId is not null
+                || generation.RekorPriorBaseUrl is not null
+                || generation.RekorShardId is not null
+                || generation.RekorBaseUrl is not null)
+            {
+                throw new SigstoreStatusException(
+                    "The active generation has partial Rekor shard rotation metadata.");
+            }
+            return;
+        }
+
+        if (!Guid.TryParseExact(
+                generation.RekorRotationOperationId,
+                "N",
+                out _)
+            || generation.RekorRotationOperationId.Any(char.IsUpper)
+            || generation.RekorPriorGeneration
+                != generation.Generation - 1
+            || generation.RekorPriorGenerationId
+                != $"generation-{generation.RekorPriorGeneration:D8}"
+            || !IsLowerHexSha256(
+                generation.RekorPriorPublicKeySha256 ?? "")
+            || generation.RekorPriorPublicKeySha256
+                == generation.RekorPublicKeySha256
+            || generation.RekorPriorShardId
+                != $"sha256-{generation.RekorPriorPublicKeySha256}"
+            || generation.RekorPriorBaseUrl
+                != "http://rekor-sigstore.dev.localhost:3000"
+            || generation.RekorShardId
+                != $"sha256-{generation.RekorPublicKeySha256}"
+            || generation.RekorBaseUrl
+                != "http://rekor-secondary-sigstore.dev.localhost:3000")
+        {
+            throw new SigstoreStatusException(
+                "The active generation has invalid Rekor shard rotation metadata.");
         }
     }
 
@@ -2058,7 +2708,10 @@ internal static class SigstoreStatusCommand
             or TaskCanceledException
             or UriFormatException
             or InvalidDataException
-            or CryptographicException;
+            or CryptographicException
+            or JsonException
+            or KeyNotFoundException
+            or FormatException;
 
     private sealed record ClientStatusResult(
         string Source,

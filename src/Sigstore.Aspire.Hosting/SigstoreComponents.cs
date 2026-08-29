@@ -11,6 +11,7 @@ public sealed record SigstoreComponents(
     IResourceBuilder<ContainerResource> Fulcio,
     IResourceBuilder<ContainerResource> Timestamp,
     IResourceBuilder<ContainerResource> RekorServer,
+    IResourceBuilder<ContainerResource> RekorServerSecondary,
     IResourceBuilder<ContainerResource> Rekor,
     IResourceBuilder<ContainerResource> TufBootstrap,
     IResourceBuilder<ContainerResource> TufStateReady,

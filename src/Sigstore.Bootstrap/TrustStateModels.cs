@@ -36,6 +36,14 @@ internal sealed record GenerationManifest(
     int FulcioPriorGeneration,
     string? FulcioPriorGenerationId,
     string? FulcioPriorRootSha256,
+    string? RekorRotationOperationId,
+    int RekorPriorGeneration,
+    string? RekorPriorGenerationId,
+    string? RekorPriorPublicKeySha256,
+    string? RekorPriorShardId,
+    string? RekorPriorBaseUrl,
+    string? RekorShardId,
+    string? RekorBaseUrl,
     SortedDictionary<string, string> Files);
 
 internal sealed record GenerationReference(

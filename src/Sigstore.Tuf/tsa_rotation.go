@@ -445,6 +445,15 @@ func rotateTsaGeneration(
 		FulcioPriorGenerationID:   currentManifest.FulcioPriorGenerationID,
 		FulcioPriorRootSHA256:     currentManifest.FulcioPriorRootSHA256,
 
+		RekorRotationOperationID:  currentManifest.RekorRotationOperationID,
+		RekorPriorGeneration:      currentManifest.RekorPriorGeneration,
+		RekorPriorGenerationID:    currentManifest.RekorPriorGenerationID,
+		RekorPriorPublicKeySHA256: currentManifest.RekorPriorPublicKeySHA256,
+		RekorPriorShardID:         currentManifest.RekorPriorShardID,
+		RekorPriorBaseURL:         currentManifest.RekorPriorBaseURL,
+		RekorShardID:              currentManifest.RekorShardID,
+		RekorBaseURL:              currentManifest.RekorBaseURL,
+
 		Files: newFiles,
 	}
 	manifestBytes, err := json.MarshalIndent(genManifest, "", "  ")

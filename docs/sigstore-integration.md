@@ -1354,17 +1354,58 @@ affected.
 
 ### Scope
 
-- Treat a Rekor signing-key change as a new logical log shard.
-- Preserve the old append-only log and public key.
-- Add the new shard to trusted root and signing configuration.
-- Route new entries to the new shard.
+- **Topology**: the initial shard retains
+  `http://rekor-sigstore.dev.localhost:3000`, its generation-1 signer,
+  `.sigstore/data/rekor`, writer, checkpoint and tiles. The bounded secondary
+  shard uses the stable URL
+  `http://rekor-secondary-sigstore.dev.localhost:3000`, an
+  explicit-start `rekor-server-secondary`, a signer-only
+  `runtime/rekor-secondary` projection, and independent
+  `.sigstore/data/rekor-shards/secondary` storage. The `rekor` nginx gateway
+  keeps serving static checkpoints/tiles for both.
+- **Trust and routing**: immutable generation N+1 replaces only
+  `private/rekor/signer.key` and `public/rekor/signer.pub`. The old
+  `TransparencyLogInstance` remains unchanged and the new instance is appended
+  to `TrustedRoot`; the single active Rekor v2 `SigningConfig` route changes to
+  the secondary URL. Root/bootstrap, OIDC, Fulcio, CT, TSA, standby and
+  historical trust remain byte-identical.
+- **Safe order**: prepare and validate the candidate, runtime projection,
+  independent data root and schema-1 catalog; start and prove the secondary
+  writer and nginx route; commit additive TUF trust plus the new exclusive
+  route; converge all six clients; prove the first secondary entry (including
+  index zero), new-log artifact, retained old artifact, and old
+  checkpoint/tile continuity. The initial writer is never restarted onto the
+  new key.
+- **Recovery**: the schema-1 hosting journal records candidate, server/route,
+  TUF preparing/committed, generation switch, each client, first entry,
+  old/new proofs and completion. Pre-commit failure leaves the old route
+  active. Post-commit recovery proceeds forward after strict
+  signer/log-ID/data/URL/hash validation. Replaying the same incomplete
+  operation is idempotent; a second independent rotation in the run is rejected
+  without mutation.
+- **Retention and health**: the secondary writer is conditionally excluded
+  from initial parent health, then required after activation. The primary
+  writer becomes historical at that boundary and is no longer health-required;
+  this bounded implementation leaves both writers available, while nginx's
+  immutable historical checkpoint/tile route remains the health-independent
+  retention contract. Historical availability never depends on changing the
+  old signer or storage.
 
 ### Validation gate
 
-- The old log remains readable and verifiable.
-- New entries use the new log identifier.
-- Trusted root contains both log instances.
-- All clients validate bundles from both shards.
+- The old checkpoint, tiles, data hashes, log ID, public key and root URL remain
+  readable and unchanged except for legitimate pre-cutover appends.
+- The secondary route is healthy before TUF selection; new entries and bundles
+  use its distinct log ID and URL.
+- TrustedRoot contains both exact log instances while SigningConfig selects
+  only the secondary Rekor v2 URL.
+- All six clients converge to the same additive generation and verify selected
+  old/new bundles through native targeted routes.
+- The known Python omitted-index-zero bundle parser issue is reported rather
+  than seeded around, hidden, or serialized differently.
+- Fault tests cover candidate/server/route/TUF/generation/client/entry/proof
+  boundaries, tampered signer/data/URL/hash state, active-secret bounds,
+  contention, replay and bounded-repeat rejection.
 
 ## Step 13: Implement CT log shard rotation
 

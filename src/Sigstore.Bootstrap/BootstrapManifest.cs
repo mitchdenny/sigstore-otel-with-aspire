@@ -41,6 +41,11 @@ internal sealed record FulcioCaMaterialInfo(
     DateTimeOffset NotBeforeUtc,
     DateTimeOffset NotAfterUtc);
 
+internal sealed record RekorShardMaterialInfo(
+    string PublicKeySha256,
+    string LogId,
+    string ShardId);
+
 internal sealed record FulcioRuntimeProjectionInfo(
     string ActiveRootSha256,
     string ActivePublicKeySha256,

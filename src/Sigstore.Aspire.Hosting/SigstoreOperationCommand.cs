@@ -23,6 +23,7 @@ internal static class SigstoreOperationCommand
     public const string RotateTimestampAuthorityCommand =
         "rotate-timestamp-authority";
     public const string RotateFulcioCaCommand = "rotate-fulcio-ca";
+    public const string RotateRekorShardCommand = "rotate-rekor-shard";
 
     private static readonly JsonSerializerOptions JsonOptions =
         new(JsonSerializerDefaults.Web)
@@ -230,6 +231,19 @@ internal static class SigstoreOperationCommand
             && presentation.RuntimeHealth.State == "Healthy"
             && (presentation.Recovery is null
                 || presentation.Recovery.Command == RotateFulcioCaCommand)
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
+    internal static ResourceCommandState GetRekorShardRotationCommandState(
+        SigstoreResource resource)
+    {
+        var presentation = resource.GetPresentation();
+        return presentation.Operation is null
+            && presentation.RuntimeHealth.State == "Healthy"
+            && (presentation.Recovery is null
+                || presentation.Recovery.Command
+                   == RotateRekorShardCommand)
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }

@@ -369,6 +369,9 @@ func publishTrustedRootLocked(
 	if err != nil {
 		return "", err
 	}
+	if _, err := ensureRekorShardCatalogLocked(statePath, bootstrap); err != nil {
+		return "", fmt.Errorf("ensure Rekor shard catalog: %w", err)
+	}
 
 	// Reject repeated invocation: this command is one-shot per trust domain.
 	if bootstrap.Generation > 1 {
@@ -573,6 +576,15 @@ func advanceTrustGeneration(statePath string, current bootstrapManifest) (bootst
 		FulcioPriorGenerationID:   currentGenerationManifest.FulcioPriorGenerationID,
 		FulcioPriorRootSHA256:     currentGenerationManifest.FulcioPriorRootSHA256,
 
+		RekorRotationOperationID:  currentGenerationManifest.RekorRotationOperationID,
+		RekorPriorGeneration:      currentGenerationManifest.RekorPriorGeneration,
+		RekorPriorGenerationID:    currentGenerationManifest.RekorPriorGenerationID,
+		RekorPriorPublicKeySHA256: currentGenerationManifest.RekorPriorPublicKeySHA256,
+		RekorPriorShardID:         currentGenerationManifest.RekorPriorShardID,
+		RekorPriorBaseURL:         currentGenerationManifest.RekorPriorBaseURL,
+		RekorShardID:              currentGenerationManifest.RekorShardID,
+		RekorBaseURL:              currentGenerationManifest.RekorBaseURL,
+
 		Files: newFiles,
 	}
 	manifestBytes, err := json.MarshalIndent(genManifest, "", "  ")
@@ -668,6 +680,11 @@ func switchActiveGeneration(statePath string, current bootstrapManifest, newBoot
 		genManifest.TsaLeafSHA256 != current.TsaLeafSHA256:
 		operation = "tsa-rotation"
 		transitionID = genManifest.TSARotationOperationID
+	case genManifest.RekorRotationOperationID != "" &&
+		genManifest.RekorPriorGeneration == current.Generation &&
+		genManifest.RekorPublicKeySHA256 != current.RekorPublicKeySHA256:
+		operation = "rekor-shard-rotation"
+		transitionID = genManifest.RekorRotationOperationID
 	}
 	now := time.Now().UTC()
 	newJournal := trustTransitionJournal{
@@ -1268,6 +1285,12 @@ func validateNextGenerationForRecovery(
 	if !reflect.DeepEqual(actualFiles, nextManifest.Files) {
 		return generationManifest{}, bootstrapManifest{}, "", errors.New(
 			"next-generation file set or hashes do not match its manifest",
+		)
+	}
+	if err := validateRekorGenerationMaterial(nextGenPath, nextManifest); err != nil {
+		return generationManifest{}, bootstrapManifest{}, "", fmt.Errorf(
+			"validate next-generation Rekor material: %w",
+			err,
 		)
 	}
 
