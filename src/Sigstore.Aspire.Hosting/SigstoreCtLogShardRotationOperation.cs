@@ -72,6 +72,11 @@ internal sealed partial class SigstoreOperationExecutor
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.RotateCtLogShardCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RotateCtLogShardCommand,
                 "Rotating CT Log Shard",
@@ -1205,7 +1210,10 @@ internal sealed partial class SigstoreOperationExecutor
             cancellationToken);
         execution.Check(
             "aggregate-status-ready",
-            aggregate.Ready
+            IsReadyForCtLogFinalization(
+                aggregate,
+                operation.OperationId,
+                operation.Status)
                 && aggregate.Clients.Count == clients.Length
                 && aggregate.CtLog is
                 {
@@ -1265,6 +1273,37 @@ internal sealed partial class SigstoreOperationExecutor
             $"CT log shard rotated: {operation.PriorShardId} -> " +
             $"{operation.CandidateShardId}.",
             BuildCtLogShardRotationEvidence(operation, recovered));
+    }
+
+    internal static bool IsReadyForCtLogFinalization(
+        SigstoreAggregateTrustStatus status,
+        string operationId,
+        string operationStatus)
+    {
+        var ctLog = status.CtLog;
+        return status.Operation is
+            {
+                Command: SigstoreOperationCommand.RotateCtLogShardCommand
+            }
+            && status.Recovery is
+            {
+                Command: SigstoreOperationCommand.RotateCtLogShardCommand
+            } recovery
+            && recovery.Phase == operationStatus
+            && ctLog is not null
+            && ctLog.IncompleteRotationOperationId == operationId
+            && ctLog.IncompleteRotationStatus == operationStatus
+            && !ctLog.FulcioCtPromotionPending
+            && ctLog.TrustedRootCtlogCount == ctLog.Shards.Count
+            && ctLog.Shards.Count == 2
+            && ctLog.Shards.All(
+                shard => shard.InTrustedRoot
+                    && (!shard.ComputeRequired
+                        || shard.ComputeHealthy == true)
+                    && shard.AcceptedRootsMatchRuntime)
+            && status.Errors.Count == 2
+            && status.Errors.Count(error => error.Source == "ctlog") == 1
+            && status.Errors.Count(error => error.Source == "operation") == 1;
     }
 
     private async Task<CtLogShardRotationCommandJournal>
@@ -2053,6 +2092,7 @@ internal sealed partial class SigstoreOperationExecutor
         var result = new CtLogShardRotationOperationResult(
             1,
             SigstoreOperationCommand.RotateCtLogShardCommand,
+            execution.OperationId.ToString("N"),
             success,
             execution.Phase,
             message,
@@ -2314,6 +2354,7 @@ internal sealed record CtLogShardRotationEvidence(
 internal sealed record CtLogShardRotationOperationResult(
     int SchemaVersion,
     string Command,
+    string OperationId,
     bool Success,
     string Phase,
     string Message,

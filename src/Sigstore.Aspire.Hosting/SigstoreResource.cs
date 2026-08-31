@@ -15,6 +15,8 @@ public sealed class SigstoreResource(
     private EndpointReference? _artifactStoreEndpoint;
     private SigstoreRuntimeHealthSnapshot _runtimeHealth =
         SigstoreRuntimeHealthSnapshot.Starting([]);
+    private SigstoreTufMetadataFreshnessStatus? _tufMetadataFreshness;
+    private bool? _tufRepositoryCoherent;
     private SigstoreOperationState? _operation;
     private SigstoreOperationRecoveryState? _recovery;
     private readonly HashSet<string> _activeConditionalResources =
@@ -231,6 +233,33 @@ public sealed class SigstoreResource(
         }
     }
 
+    internal bool SetTufMetadataFreshness(
+        SigstoreTufMetadataFreshnessStatus freshness,
+        bool repositoryCoherent = true)
+    {
+        ArgumentNullException.ThrowIfNull(freshness);
+
+        lock (_sync)
+        {
+            if (_tufMetadataFreshness is not null
+                && _tufMetadataFreshness.State == freshness.State
+                && _tufMetadataFreshness.Reason == freshness.Reason
+                && _tufMetadataFreshness.RefreshAtUtc == freshness.RefreshAtUtc
+                && _tufMetadataFreshness.AutomaticRefreshRequired
+                    == freshness.AutomaticRefreshRequired
+                && _tufMetadataFreshness.TrustMaintenanceRequired
+                    == freshness.TrustMaintenanceRequired
+                && _tufMetadataFreshness.Roles.SequenceEqual(freshness.Roles)
+                && _tufRepositoryCoherent == repositoryCoherent)
+            {
+                return false;
+            }
+            _tufMetadataFreshness = freshness;
+            _tufRepositoryCoherent = repositoryCoherent;
+            return true;
+        }
+    }
+
     internal bool TryBeginOperation(
         string command,
         string displayState,
@@ -304,6 +333,8 @@ public sealed class SigstoreResource(
         {
             return new SigstoreParentPresentationSnapshot(
                 _runtimeHealth,
+                _tufMetadataFreshness,
+                _tufRepositoryCoherent,
                 _operation,
                 _recovery);
         }
@@ -409,6 +440,8 @@ internal sealed record SigstoreOperationState(
 
 internal sealed record SigstoreParentPresentationSnapshot(
     SigstoreRuntimeHealthSnapshot RuntimeHealth,
+    SigstoreTufMetadataFreshnessStatus? TufMetadataFreshness,
+    bool? TufRepositoryCoherent,
     SigstoreOperationState? Operation,
     SigstoreOperationRecoveryState? Recovery);
 

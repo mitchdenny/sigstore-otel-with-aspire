@@ -287,6 +287,7 @@ public sealed class SigstoreOperationTests
                     schemaVersion = 2,
                     operationId,
                     trustDomainId = before.Trust.TrustDomainId,
+                    completedAtUtc = now,
                     priorGeneration = 1,
                     priorGenerationId = "generation-00000001",
                     priorOidcKeyId = oldKid,
@@ -301,6 +302,7 @@ public sealed class SigstoreOperationTests
                     {
                         $"private/oidc/retained/signer-{oldKid}.key"
                     },
+                    tokenLifetimeSeconds = 360,
                     overlapExpiresAtUtc = now.AddMinutes(6).ToString("O")
                 }));
             File.Delete(requestPath);
@@ -786,7 +788,7 @@ public sealed class SigstoreOperationTests
             CancellationToken.None);
         var output = ReadResult(result);
 
-        Assert.True(result.Success);
+        Assert.True(result.Success, output.Message);
         Assert.True(output.Success);
         Assert.Equal(
             SigstoreOperationCommand.RefreshTufCommand,
@@ -819,6 +821,362 @@ public sealed class SigstoreOperationTests
             IndexOf(events, "lock:release:dashboard-refresh-tuf-preflight")
             < IndexOf(events, "wait:tuf-bootstrap"));
         Assert.Null(model.Parent.Resource.GetPresentation().Operation);
+    }
+
+    [Fact]
+    public async Task AutomaticRefreshRunsInitialPublicationThroughExistingCommand()
+    {
+        using var model = new OperationModelFixture();
+        var state = NewTufState();
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events);
+        inspector.TufStates.Enqueue(state);
+        inspector.TufStates.Enqueue(
+            NewTufState(state, refresh: true));
+        var servedStates = new Queue<SigstoreServedTufSnapshot>(
+        [
+            NewServed(state),
+            NewServed(NewTufState(state, refresh: true))
+        ]);
+        var operation = new FakeTufRefreshOperation(
+            CommandResults.Success(message: "automatic refresh complete"));
+        var timeProvider = new FixedTimeProvider(DateTimeOffset.UtcNow);
+        var monitor = new SigstoreTufRefreshMonitor(
+            model.Parent.Resource,
+            inspector,
+            operation,
+            _ => Task.FromResult(servedStates.Dequeue()),
+            timeProvider,
+            NullLogger.Instance);
+        timeProvider.Advance(
+            SigstoreTufRefreshMonitor.InitialRefreshDelay);
+
+        var result = await monitor.RunOnceAsync(CancellationToken.None);
+
+        Assert.True(result.Attempted);
+        Assert.True(result.Succeeded);
+        Assert.Equal(1, operation.Calls);
+        Assert.Equal("Current", result.Freshness!.State);
+        Assert.Equal(
+            "Current",
+            model.Parent.Resource.GetPresentation()
+                .TufMetadataFreshness!.State);
+        Assert.Equal(
+            [
+                "lock:acquire:automatic-tuf-refresh-inspection",
+                "lock:release:automatic-tuf-refresh-inspection",
+                "lock:acquire:automatic-tuf-refresh-postconditions",
+                "lock:release:automatic-tuf-refresh-postconditions"
+            ],
+            events);
+    }
+
+    [Fact]
+    public async Task AutomaticRefreshDefersAndRetriesAcrossOperationRecoveryAndLock()
+    {
+        using var model = new OperationModelFixture();
+        var now = DateTimeOffset.UtcNow;
+        var due = NewTufState(NewTufState(), refresh: true);
+        due = due with
+        {
+            Metadata = due.Metadata with
+            {
+                Snapshot = due.Metadata.Snapshot with
+                {
+                    ExpiresAtUtc = now.AddHours(2)
+                },
+                Timestamp = due.Metadata.Timestamp with
+                {
+                    ExpiresAtUtc = now.AddMinutes(30)
+                }
+            }
+        };
+        var refreshed = NewTufState(due, refresh: true);
+        refreshed = refreshed with
+        {
+            Metadata = refreshed.Metadata with
+            {
+                Snapshot = refreshed.Metadata.Snapshot with
+                {
+                    ExpiresAtUtc = now.AddDays(30)
+                },
+                Timestamp = refreshed.Metadata.Timestamp with
+                {
+                    ExpiresAtUtc = now.AddDays(1)
+                }
+            }
+        };
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events);
+        var servedStates = new Queue<SigstoreServedTufSnapshot>(
+            [NewServed(due), NewServed(refreshed)]);
+        var operation = new FakeTufRefreshOperation(
+            CommandResults.Success(message: "automatic refresh complete"));
+        var monitor = new SigstoreTufRefreshMonitor(
+            model.Parent.Resource,
+            inspector,
+            operation,
+            _ => Task.FromResult(servedStates.Dequeue()),
+            new FixedTimeProvider(now),
+            NullLogger.Instance);
+
+        Assert.True(
+            model.Parent.Resource.TryBeginOperation(
+                SigstoreOperationCommand.RotateTufRootCommand,
+                "Rotating TUF Root",
+                out var lease,
+                out _));
+        var active = await monitor.RunOnceAsync(CancellationToken.None);
+        Assert.False(active.Attempted);
+        Assert.Equal(
+            "operation-active:rotate-tuf-root",
+            active.Outcome);
+        Assert.Empty(events);
+        lease!.Dispose();
+
+        model.Parent.Resource.SetOperationRecovery(
+            SigstoreOperationCommand.RotateFulcioCaCommand,
+            "activation-committed",
+            "Fulcio Recovery",
+            "Recovery is pending.");
+        var recovery = await monitor.RunOnceAsync(CancellationToken.None);
+        Assert.False(recovery.Attempted);
+        Assert.Equal(
+            "recovery-pending:rotate-fulcio-ca",
+            recovery.Outcome);
+        Assert.Empty(events);
+        model.Parent.Resource.ClearOperationRecovery(
+            SigstoreOperationCommand.RotateFulcioCaCommand);
+
+        inspector.LockFailuresRemaining = 1;
+        var contended = await monitor.RunOnceAsync(CancellationToken.None);
+        Assert.False(contended.Attempted);
+        Assert.Contains(
+            "locked by another operation",
+            contended.Outcome,
+            StringComparison.Ordinal);
+
+        inspector.TufStates.Enqueue(due);
+        inspector.TufStates.Enqueue(refreshed);
+        var retried = await monitor.RunOnceAsync(CancellationToken.None);
+        Assert.True(retried.Attempted);
+        Assert.True(retried.Succeeded);
+        Assert.Equal(1, operation.Calls);
+    }
+
+    [Fact]
+    public async Task AutomaticRefreshFailsClosedOnDiskServedMismatch()
+    {
+        using var model = new OperationModelFixture();
+        var state = NewTufState();
+        var served = NewServed(state) with
+        {
+            Metadata = state.Metadata with
+            {
+                Timestamp = state.Metadata.Timestamp with
+                {
+                    Sha256 = Hash('0')
+                }
+            }
+        };
+        var inspector = new FakeStateInspector(
+            new ConcurrentQueue<string>());
+        inspector.TufStates.Enqueue(state);
+        var operation = new FakeTufRefreshOperation(
+            CommandResults.Success(message: "must not run"));
+        var monitor = new SigstoreTufRefreshMonitor(
+            model.Parent.Resource,
+            inspector,
+            operation,
+            _ => Task.FromResult(served),
+            new FixedTimeProvider(DateTimeOffset.UtcNow),
+            NullLogger.Instance);
+
+        var result = await monitor.RunOnceAsync(CancellationToken.None);
+
+        Assert.False(result.Attempted);
+        Assert.Equal("disk-served-mismatch", result.Outcome);
+        Assert.Equal(0, operation.Calls);
+        Assert.False(
+            model.Parent.Resource.GetPresentation()
+                .TufRepositoryCoherent);
+        Assert.Equal(
+            ResourceCommandState.Disabled,
+            SigstoreOperationCommand.GetRefreshTufCommandState(
+                model.Parent.Resource));
+    }
+
+    [Fact]
+    public async Task AutomaticRefreshInspectionFailureDisablesMutations()
+    {
+        using var model = new OperationModelFixture();
+        var inspector = new FakeStateInspector(
+            new ConcurrentQueue<string>())
+        {
+            ReadTufStateException =
+                new InvalidDataException("Injected malformed metadata.")
+        };
+        var operation = new FakeTufRefreshOperation(
+            CommandResults.Success(message: "must not run"));
+        var monitor = new SigstoreTufRefreshMonitor(
+            model.Parent.Resource,
+            inspector,
+            operation,
+            _ => Task.FromResult(NewServed(NewTufState())),
+            new FixedTimeProvider(DateTimeOffset.UtcNow),
+            NullLogger.Instance);
+
+        var result = await monitor.RunOnceAsync(CancellationToken.None);
+
+        Assert.False(result.Attempted);
+        Assert.Equal("metadata-inspection-failed", result.Outcome);
+        Assert.Equal("Unavailable", result.Freshness!.State);
+        Assert.False(
+            model.Parent.Resource.GetPresentation()
+                .TufRepositoryCoherent);
+        Assert.Equal(
+            ResourceCommandState.Disabled,
+            SigstoreOperationCommand.GetRefreshTufCommandState(
+                model.Parent.Resource));
+        Assert.Equal(
+            ResourceCommandState.Disabled,
+            SigstoreOperationCommand.GetMutationCommandState(
+                model.Parent.Resource));
+        Assert.Equal(0, operation.Calls);
+        Assert.Null(model.Parent.Resource.GetPresentation().Operation);
+    }
+
+    [Fact]
+    public async Task ExpiredMetadataRefreshSucceedsWithExitedClientAndExitZeroWorker()
+    {
+        using var model = new OperationModelFixture();
+        var now = DateTimeOffset.UtcNow;
+        var before = NewTufState();
+        before = before with
+        {
+            Metadata = before.Metadata with
+            {
+                Root = before.Metadata.Root with
+                {
+                    ExpiresAtUtc = now.AddDays(6)
+                },
+                Snapshot = before.Metadata.Snapshot with
+                {
+                    ExpiresAtUtc = now.AddHours(-2)
+                },
+                Timestamp = before.Metadata.Timestamp with
+                {
+                    ExpiresAtUtc = now.AddHours(-1)
+                }
+            }
+        };
+        var after = NewTufState(before, refresh: true);
+        after = after with
+        {
+            Metadata = after.Metadata with
+            {
+                Snapshot = after.Metadata.Snapshot with
+                {
+                    ExpiresAtUtc = now.AddDays(30)
+                },
+                Timestamp = after.Metadata.Timestamp with
+                {
+                    ExpiresAtUtc = now.AddDays(1)
+                }
+            }
+        };
+        var downClient = model.Parent.Resource.GetRegistrations().Clients
+            .OrderBy(client => client.Resource.Name, StringComparer.Ordinal)
+            .First();
+        var required = new[]
+        {
+            new SigstoreRequiredResourceStatus(
+                downClient.Resource.Name,
+                KnownResourceStates.Exited,
+                "Unknown"),
+            new SigstoreRequiredResourceStatus(
+                model.Parent.Resource.Components.Tuf.Resource.Name,
+                KnownResourceStates.Running,
+                "Healthy")
+        };
+        model.Parent.Resource.SetRuntimeHealth(
+            new SigstoreRuntimeHealthSnapshot(
+                "Degraded",
+                $"{downClient.Resource.Name} is Exited (health Unknown).",
+                required,
+                1,
+                2));
+        model.Parent.Resource.SetTufMetadataFreshness(
+            SigstoreTufMetadataPolicy.Evaluate(before.Metadata, now));
+        Assert.Equal(
+            ResourceCommandState.Enabled,
+            SigstoreOperationCommand.GetRefreshTufCommandState(
+                model.Parent.Resource));
+        Assert.Equal(
+            ResourceCommandState.Disabled,
+            SigstoreOperationCommand.GetRestartClientsCommandState(
+                model.Parent.Resource));
+        Assert.Equal(
+            ResourceCommandState.Disabled,
+            SigstoreOperationCommand.GetMutationCommandState(
+                model.Parent.Resource));
+
+        var beforeStatus = NewClientDownAggregate(
+            model,
+            before,
+            downClient,
+            required,
+            includeFreshnessErrors: true,
+            now);
+        var afterStatus = NewClientDownAggregate(
+            model,
+            after,
+            downClient,
+            required,
+            includeFreshnessErrors: true,
+            now);
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events);
+        inspector.TufStates.Enqueue(before);
+        inspector.TufStates.Enqueue(after);
+        inspector.TrustFingerprints.Enqueue(Hash('1'));
+        inspector.TrustFingerprints.Enqueue(Hash('2'));
+        inspector.MaterialFingerprints.Enqueue(Hash('3'));
+        inspector.MaterialFingerprints.Enqueue(Hash('3'));
+        var runtime = NewRuntime(model, events, inspector);
+        runtime.ServedStates.Enqueue(NewServed(before));
+        runtime.ServedStates.Enqueue(NewServed(after));
+        runtime.Statuses.Enqueue(beforeStatus);
+        runtime.Statuses.Enqueue(afterStatus);
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Tuf.Resource,
+            Running("tuf", "tuf-id"),
+            Running("tuf", "tuf-id"),
+            Running("tuf", "tuf-id"));
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.TufBootstrap.Resource,
+            Exited("tuf-bootstrap", "worker-before", 0));
+        runtime.WaitResults["tuf-bootstrap"] =
+            Exited("tuf-bootstrap", "worker-after", 0, offsetSeconds: 10);
+
+        var result = await NewExecutor(model, runtime, inspector)
+            .ExecuteRefreshTufAsync(CancellationToken.None);
+        var output = ReadResult(result);
+
+        Assert.True(result.Success, output.Message);
+        Assert.Contains(
+            output.Postconditions,
+            check => check.Name == "worker-ran-once" && check.Passed);
+        Assert.Contains(
+            output.Postconditions,
+            check => check.Name == "aggregate-status-ready" && check.Passed);
+
+        model.Parent.Resource.SetTufMetadataFreshness(
+            SigstoreTufMetadataPolicy.Evaluate(after.Metadata, now));
+        Assert.Equal(
+            ResourceCommandState.Enabled,
+            SigstoreOperationCommand.GetRestartClientsCommandState(
+                model.Parent.Resource));
     }
 
     [Fact]
@@ -915,6 +1273,143 @@ public sealed class SigstoreOperationTests
         {
             lease!.Dispose();
         }
+    }
+
+    [Theory]
+    [InlineData(SigstoreOperationCommand.RefreshTufCommand)]
+    [InlineData(SigstoreOperationCommand.RotateTufRootCommand)]
+    [InlineData(SigstoreOperationCommand.RestartClientsCommand)]
+    [InlineData(SigstoreOperationCommand.PublishTrustedRootCommand)]
+    [InlineData(SigstoreOperationCommand.RotateOidcSigningKeyCommand)]
+    [InlineData(SigstoreOperationCommand.RotateTimestampAuthorityCommand)]
+    [InlineData(SigstoreOperationCommand.RotateFulcioCaCommand)]
+    [InlineData(SigstoreOperationCommand.RotateRekorShardCommand)]
+    [InlineData(SigstoreOperationCommand.RotateCtLogShardCommand)]
+    public async Task EveryMutatingCommandRejectsAnOverlappingOperation(
+        string command)
+    {
+        using var model = new OperationModelFixture();
+        Assert.True(
+            model.Parent.Resource.TryBeginOperation(
+                SigstoreOperationCommand.RefreshTufCommand,
+                "Blocking lifecycle operation",
+                out var lease,
+                out _));
+        try
+        {
+            var events = new ConcurrentQueue<string>();
+            var inspector = new FakeStateInspector(events);
+            var executor = NewExecutor(
+                model,
+                NewRuntime(model, events, inspector),
+                inspector);
+            var result = command switch
+            {
+                SigstoreOperationCommand.RefreshTufCommand =>
+                    await executor.ExecuteRefreshTufAsync(CancellationToken.None),
+                SigstoreOperationCommand.RotateTufRootCommand =>
+                    await executor.ExecuteRotateTufRootAsync(CancellationToken.None),
+                SigstoreOperationCommand.RestartClientsCommand =>
+                    await executor.ExecuteRestartClientsAsync(CancellationToken.None),
+                SigstoreOperationCommand.PublishTrustedRootCommand =>
+                    await executor.ExecutePublishTrustedRootAsync(CancellationToken.None),
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand =>
+                    await executor.ExecuteRotateOidcSigningKeyAsync(
+                        CancellationToken.None),
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand =>
+                    await executor.ExecuteRotateTimestampAuthorityAsync(
+                        CancellationToken.None),
+                SigstoreOperationCommand.RotateFulcioCaCommand =>
+                    await executor.ExecuteRotateFulcioCaAsync(CancellationToken.None),
+                SigstoreOperationCommand.RotateRekorShardCommand =>
+                    await executor.ExecuteRotateRekorShardAsync(CancellationToken.None),
+                SigstoreOperationCommand.RotateCtLogShardCommand =>
+                    await executor.ExecuteRotateCtLogShardAsync(CancellationToken.None),
+                _ => throw new InvalidOperationException(command)
+            };
+            var output = ReadResult(result);
+
+            Assert.False(result.Success);
+            Assert.Equal("contention", output.Phase);
+            Assert.Contains(
+                "refresh-tuf is already active",
+                output.Message,
+                StringComparison.Ordinal);
+            Assert.Empty(events);
+            Assert.NotNull(model.Parent.Resource.GetPresentation().Operation);
+        }
+        finally
+        {
+            lease!.Dispose();
+        }
+        Assert.Null(model.Parent.Resource.GetPresentation().Operation);
+    }
+
+    [Theory]
+    [InlineData(SigstoreOperationCommand.RefreshTufCommand)]
+    [InlineData(SigstoreOperationCommand.RotateTufRootCommand)]
+    [InlineData(SigstoreOperationCommand.RestartClientsCommand)]
+    [InlineData(SigstoreOperationCommand.PublishTrustedRootCommand)]
+    [InlineData(SigstoreOperationCommand.RotateOidcSigningKeyCommand)]
+    [InlineData(SigstoreOperationCommand.RotateTimestampAuthorityCommand)]
+    [InlineData(SigstoreOperationCommand.RotateFulcioCaCommand)]
+    [InlineData(SigstoreOperationCommand.RotateRekorShardCommand)]
+    [InlineData(SigstoreOperationCommand.RotateCtLogShardCommand)]
+    public async Task EveryMutatingCommandRejectsSharedStateLockContention(
+        string command)
+    {
+        using var model = new OperationModelFixture();
+        var inspector = new SigstoreFileStateInspector();
+        var runtime = new FakeRuntime(
+            new ConcurrentQueue<string>(),
+            () => false);
+        using (inspector.AcquireLock(
+            model.Parent.Resource.StatePath,
+            "test-worker-holder"))
+        {
+            var executor = NewExecutor(model, runtime, inspector);
+            var result = command switch
+            {
+                SigstoreOperationCommand.RefreshTufCommand =>
+                    await executor.ExecuteRefreshTufAsync(CancellationToken.None),
+                SigstoreOperationCommand.RotateTufRootCommand =>
+                    await executor.ExecuteRotateTufRootAsync(CancellationToken.None),
+                SigstoreOperationCommand.RestartClientsCommand =>
+                    await executor.ExecuteRestartClientsAsync(CancellationToken.None),
+                SigstoreOperationCommand.PublishTrustedRootCommand =>
+                    await executor.ExecutePublishTrustedRootAsync(CancellationToken.None),
+                SigstoreOperationCommand.RotateOidcSigningKeyCommand =>
+                    await executor.ExecuteRotateOidcSigningKeyAsync(
+                        CancellationToken.None),
+                SigstoreOperationCommand.RotateTimestampAuthorityCommand =>
+                    await executor.ExecuteRotateTimestampAuthorityAsync(
+                        CancellationToken.None),
+                SigstoreOperationCommand.RotateFulcioCaCommand =>
+                    await executor.ExecuteRotateFulcioCaAsync(CancellationToken.None),
+                SigstoreOperationCommand.RotateRekorShardCommand =>
+                    await executor.ExecuteRotateRekorShardAsync(CancellationToken.None),
+                SigstoreOperationCommand.RotateCtLogShardCommand =>
+                    await executor.ExecuteRotateCtLogShardAsync(CancellationToken.None),
+                _ => throw new InvalidOperationException(command)
+            };
+            var output = ReadResult(result);
+            Assert.False(result.Success);
+            Assert.False(result.Success);
+            var error = Assert.Single(output.Errors);
+            Assert.Equal(output.Phase, error.Phase);
+            Assert.Equal(model.Parent.Resource.Name, error.Resource);
+            Assert.Null(error.Postcondition);
+            Assert.Contains(
+                "locked by another operation",
+                error.Message,
+                StringComparison.Ordinal);
+            Assert.Empty(runtime.ExecutedCommands);
+            Assert.Null(model.Parent.Resource.GetPresentation().Operation);
+        }
+
+        using var recovered = inspector.AcquireLock(
+            model.Parent.Resource.StatePath,
+            "test-recovered");
     }
 
     [Theory]
@@ -1556,37 +2051,6 @@ public sealed class SigstoreOperationTests
         runtime.CtShardProofs.Enqueue(
             NewFulcioProof(fulcioRoot, secondaryCtKey, 3_000, 'd'));
         runtime.Statuses.Enqueue(NewAggregate(model, before));
-        runtime.Statuses.Enqueue(
-            NewAggregate(model, after) with
-            {
-                CtLog = new SigstoreCtLogStatus(
-                    $"sha256-{secondaryCtKey}",
-                    SigstoreCtLogShard.SecondarySlot,
-                    SigstoreCtLogShard.SecondaryOrigin,
-                    secondaryCtKey,
-                    false,
-                    null,
-                    2,
-                    [],
-                    [
-                        NewShardHealth(
-                            SigstoreCtLogShard.PrimarySlot,
-                            primaryCtKey,
-                            "historical",
-                            primaryCheckpoint,
-                            acceptedRootsSha256,
-                            acceptedFingerprints),
-                        NewShardHealth(
-                            SigstoreCtLogShard.SecondarySlot,
-                            secondaryCtKey,
-                            "active",
-                            secondaryCheckpoint,
-                            acceptedRootsSha256,
-                            acceptedFingerprints)
-                    ],
-                    null,
-                    null)
-            });
 
         var workerBefore = Exited("tuf-bootstrap", "worker-before", 0);
         runtime.SetSnapshotSequence(
@@ -1701,6 +2165,7 @@ public sealed class SigstoreOperationTests
             var createdAtUtc = request.RootElement
                 .GetProperty("candidateCreatedAtUtc")
                 .GetDateTimeOffset();
+            const string operationStatus = "new-shard-proved";
 
             var newGenerationPath = System.IO.Path.Combine(
                 generationsPath,
@@ -1766,6 +2231,58 @@ public sealed class SigstoreOperationTests
                 System.IO.Path.Combine(
                     statePath,
                     "rotate-ct-log-shard.request"));
+            runtime.Statuses.Enqueue(
+                NewAggregate(model, after) with
+                {
+                    Ready = false,
+                    State = "Degraded",
+                    Reason = "ctlog: recovery pending",
+                    Errors =
+                    [
+                        new("ctlog", "bound recovery pending"),
+                        new("operation", "rotation active")
+                    ],
+                    Operation = new(
+                        SigstoreOperationCommand.RotateCtLogShardCommand,
+                        "aggregate-status",
+                        25,
+                        26,
+                        "Finalizing CT log rotation.",
+                        DateTimeOffset.UtcNow),
+                    Recovery = new(
+                        SigstoreOperationCommand.RotateCtLogShardCommand,
+                        operationStatus,
+                        "Lifecycle Recovery Pending",
+                        "The durable journal is not finalized.",
+                        DateTimeOffset.UtcNow),
+                    CtLog = new SigstoreCtLogStatus(
+                        $"sha256-{secondaryCtKey}",
+                        SigstoreCtLogShard.SecondarySlot,
+                        SigstoreCtLogShard.SecondaryOrigin,
+                        secondaryCtKey,
+                        false,
+                        null,
+                        2,
+                        [],
+                        [
+                            NewShardHealth(
+                                SigstoreCtLogShard.PrimarySlot,
+                                primaryCtKey,
+                                "historical",
+                                primaryCheckpoint,
+                                acceptedRootsSha256,
+                                acceptedFingerprints),
+                            NewShardHealth(
+                                SigstoreCtLogShard.SecondarySlot,
+                                secondaryCtKey,
+                                "active",
+                                secondaryCheckpoint,
+                                acceptedRootsSha256,
+                                acceptedFingerprints)
+                        ],
+                        operationId,
+                        operationStatus)
+                });
         };
 
         var result = await NewExecutor(model, runtime, inspector)
@@ -2093,10 +2610,21 @@ public sealed class SigstoreOperationTests
     }
 
     [Fact]
-    public async Task RestartClientsIsSortedHealthyAndTrustPreserving()
+    public async Task RestartClientsRecoversExitedAndUnhealthyClients()
     {
         using var model = new OperationModelFixture();
+        var now = DateTimeOffset.UtcNow;
         var tuf = NewTufState();
+        tuf = tuf with
+        {
+            Metadata = tuf.Metadata with
+            {
+                Root = tuf.Metadata.Root with
+                {
+                    ExpiresAtUtc = now.AddDays(6)
+                }
+            }
+        };
         var events = new ConcurrentQueue<string>();
         var inspector = new FakeStateInspector(events);
         inspector.TufStates.Enqueue(tuf);
@@ -2108,8 +2636,6 @@ public sealed class SigstoreOperationTests
         var runtime = NewRuntime(model, events, inspector);
         runtime.ServedStates.Enqueue(NewServed(tuf));
         runtime.ServedStates.Enqueue(NewServed(tuf));
-        runtime.Statuses.Enqueue(NewAggregate(model, tuf));
-        runtime.Statuses.Enqueue(NewAggregate(model, tuf));
         runtime.SetSnapshotSequence(
             model.Parent.Resource.Components.Tuf.Resource,
             Running("tuf", "tuf-id"),
@@ -2120,11 +2646,107 @@ public sealed class SigstoreOperationTests
             .Clients
             .OrderBy(client => client.Resource.Name, StringComparer.Ordinal)
             .ToArray();
+        var downClient = clients[0];
+        var unhealthyClient = clients[1];
+        var required = new[]
+        {
+            new SigstoreRequiredResourceStatus(
+                downClient.Resource.Name,
+                KnownResourceStates.Exited,
+                "Unknown"),
+            new SigstoreRequiredResourceStatus(
+                unhealthyClient.Resource.Name,
+                KnownResourceStates.Running,
+                nameof(HealthStatus.Unhealthy)),
+            new SigstoreRequiredResourceStatus(
+                model.Parent.Resource.Components.Tuf.Resource.Name,
+                KnownResourceStates.Running,
+                "Healthy")
+        };
+        model.Parent.Resource.SetRuntimeHealth(
+            new SigstoreRuntimeHealthSnapshot(
+                "Degraded",
+                $"{downClient.Resource.Name} is Exited (health Unknown).",
+                required,
+                1,
+                3));
+        model.Parent.Resource.SetTufMetadataFreshness(
+            SigstoreTufMetadataPolicy.Evaluate(
+                tuf.Metadata,
+                now));
+        var degraded = NewClientDownAggregate(
+                model,
+                tuf,
+                downClient,
+                required,
+                includeFreshnessErrors: true,
+                now);
+        runtime.Statuses.Enqueue(
+            degraded with
+            {
+                Clients = degraded.Clients
+                    .Where(
+                        client =>
+                            client.Resource != unhealthyClient.Resource.Name)
+                    .ToArray(),
+                Errors =
+                [
+                    .. degraded.Errors,
+                    new(
+                        unhealthyClient.Resource.Name,
+                        "resource is Running (health Unhealthy); the status " +
+                            "endpoint was not queried.")
+                ]
+            });
+        var maintenanceErrors = new List<SigstoreStatusError>();
+        var maintenanceFreshness =
+            SigstoreTufMetadataPolicy.Evaluate(tuf.Metadata, now);
+        SigstoreStatusCommand.AppendTufMetadataFreshnessErrors(
+            maintenanceFreshness,
+            maintenanceErrors);
+        runtime.Statuses.Enqueue(
+            NewAggregate(model, tuf) with
+            {
+                Ready = false,
+                State = "Degraded",
+                Reason =
+                    $"{maintenanceErrors[0].Source}: " +
+                    maintenanceErrors[0].Message,
+                Errors =
+                [
+                    .. maintenanceErrors,
+                    new("operation", "Client restart is active.")
+                ],
+                Operation = new(
+                    SigstoreOperationCommand.RestartClientsCommand,
+                    "aggregate-status",
+                    7,
+                    9,
+                    "Checking recovered clients.",
+                    now),
+                TufMetadataFreshness = maintenanceFreshness
+            });
+        Assert.Equal(
+            ResourceCommandState.Enabled,
+            SigstoreOperationCommand.GetRestartClientsCommandState(
+                model.Parent.Resource));
         foreach (var client in clients)
         {
-            var before = Running(
-                client.Resource.Name,
-                $"{client.Resource.Name}-before");
+            var before = client == downClient
+                ? Exited(
+                    client.Resource.Name,
+                    $"{client.Resource.Name}-before",
+                    1)
+                : client == unhealthyClient
+                    ? Running(
+                        client.Resource.Name,
+                        $"{client.Resource.Name}-before") with
+                        {
+                            Health = nameof(HealthStatus.Unhealthy)
+                        }
+                    : Running(
+                        client.Resource.Name,
+                        $"{client.Resource.Name}-before");
             var after = Running(
                 client.Resource.Name,
                 $"{client.Resource.Name}-after",
@@ -2142,7 +2764,7 @@ public sealed class SigstoreOperationTests
             .ExecuteRestartClientsAsync(CancellationToken.None);
         var output = ReadResult(result);
 
-        Assert.True(result.Success);
+        Assert.True(result.Success, output.Message);
         Assert.Equal(6, output.Resources.Count);
         Assert.All(
             output.Resources,
@@ -2152,8 +2774,11 @@ public sealed class SigstoreOperationTests
         Assert.Equal(
             clients.Select(client => client.Resource.Name),
             runtime.ExecutedCommands.Select(call => call.Resource));
+        Assert.Equal(
+            KnownResourceCommands.StartCommand,
+            runtime.ExecutedCommands[0].Command);
         Assert.All(
-            runtime.ExecutedCommands,
+            runtime.ExecutedCommands.Skip(1),
             call => Assert.Equal(
                 KnownResourceCommands.RestartCommand,
                 call.Command));
@@ -2246,8 +2871,42 @@ public sealed class SigstoreOperationTests
     public async Task RotateTufRootAdvancesRootVersionAndPreservesBootstrap()
     {
         using var model = new OperationModelFixture();
+        var now = DateTimeOffset.UtcNow;
         var before = NewTufState();
+        before = before with
+        {
+            Metadata = before.Metadata with
+            {
+                Root = before.Metadata.Root with
+                {
+                    ExpiresAtUtc = now.AddDays(6)
+                }
+            }
+        };
         var after = NewTufState(before, rotation: true);
+        after = after with
+        {
+            Metadata = after.Metadata with
+            {
+                Root = after.Metadata.Root with
+                {
+                    ExpiresAtUtc = now.AddDays(365)
+                }
+            }
+        };
+        var freshness = SigstoreTufMetadataPolicy.Evaluate(
+            before.Metadata,
+            now);
+        model.Parent.Resource.SetTufMetadataFreshness(freshness);
+        Assert.True(freshness.TrustMaintenanceRequired);
+        Assert.Equal(
+            ResourceCommandState.Enabled,
+            SigstoreOperationCommand.GetTufRootRotationCommandState(
+                model.Parent.Resource));
+        Assert.Equal(
+            ResourceCommandState.Enabled,
+            SigstoreOperationCommand.GetRefreshTufCommandState(
+                model.Parent.Resource));
         var events = new ConcurrentQueue<string>();
         var inspector = new FakeStateInspector(events);
         inspector.TufStates.Enqueue(before);
@@ -2260,7 +2919,21 @@ public sealed class SigstoreOperationTests
         var runtime = NewRuntime(model, events, inspector);
         runtime.ServedStates.Enqueue(NewServed(before));
         runtime.ServedStates.Enqueue(NewServed(after));
-        runtime.Statuses.Enqueue(NewAggregate(model, before));
+        var maintenanceErrors = new List<SigstoreStatusError>();
+        SigstoreStatusCommand.AppendTufMetadataFreshnessErrors(
+            freshness,
+            maintenanceErrors);
+        runtime.Statuses.Enqueue(
+            NewAggregate(model, before) with
+            {
+                Ready = false,
+                State = "Degraded",
+                Reason =
+                    $"{maintenanceErrors[0].Source}: " +
+                    maintenanceErrors[0].Message,
+                Errors = maintenanceErrors,
+                TufMetadataFreshness = freshness
+            });
         runtime.Statuses.Enqueue(NewAggregate(model, after));
         runtime.SetSnapshotSequence(
             model.Parent.Resource.Components.Tuf.Resource,
@@ -2272,13 +2945,59 @@ public sealed class SigstoreOperationTests
             Exited("tuf-bootstrap", "worker-before", 0));
         runtime.WaitResults["tuf-bootstrap"] =
             Exited("tuf-bootstrap", "worker-after", 0, offsetSeconds: 10);
+        runtime.OnExecuteCommand = (target, command) =>
+        {
+            if (target.Name != "tuf-bootstrap"
+                || command != KnownResourceCommands.StartCommand)
+            {
+                return;
+            }
+            var request = JsonDocument.Parse(
+                File.ReadAllBytes(
+                    System.IO.Path.Combine(
+                        model.Parent.Resource.StatePath,
+                        "rotate-root.request")));
+            var operationId = request.RootElement
+                .GetProperty("operationId")
+                .GetString()!;
+            var directory = System.IO.Path.Combine(
+                model.Parent.Resource.StatePath,
+                "tuf-root-rotations",
+                operationId);
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(
+                System.IO.Path.Combine(directory, "completion.json"),
+                JsonSerializer.Serialize(
+                    new TufRootRotationWorkerCompletion(
+                        1,
+                        operationId,
+                        before.Trust.TrustDomainId,
+                        before.Trust.Generation,
+                        before.Trust.GenerationId,
+                        before.Trust.GenerationManifestSha256,
+                        before.Metadata.Root.Version,
+                        after.Metadata.Root.Version,
+                        after.Metadata.Targets.Version,
+                        before.Trust.PublicationId,
+                        before.Trust.PublicationManifestSha256,
+                        after.Trust.PublicationId,
+                        after.Trust.PublicationManifestSha256,
+                        after.Trust.TrustedRootSha256,
+                        after.Trust.SigningConfigSha256,
+                        DateTimeOffset.UtcNow),
+                    JsonOptions));
+        };
 
         var executor = NewExecutor(model, runtime, inspector);
         var result = await executor.ExecuteRotateTufRootAsync(
             CancellationToken.None);
         var output = ReadResult(result);
 
-        Assert.True(result.Success);
+        Assert.True(
+            result.Success,
+            output.Message + ": " + string.Join(
+                "; ",
+                output.Errors.Select(error => error.Message)));
         Assert.True(output.Success);
         Assert.Equal(
             SigstoreOperationCommand.RotateTufRootCommand,
@@ -2316,12 +3035,36 @@ public sealed class SigstoreOperationTests
             < IndexOf(events, "wait:tuf-bootstrap"));
         Assert.Null(model.Parent.Resource.GetPresentation().Operation);
 
-        // Signal file should have been written during the operation.
-        // (In production it would be consumed by the worker.)
         var signalPath = System.IO.Path.Combine(
             model.Parent.Resource.StatePath,
             "rotate-root.request");
         Assert.True(File.Exists(signalPath));
+        using var request = JsonDocument.Parse(File.ReadAllBytes(signalPath));
+        Assert.Equal(
+            1,
+            request.RootElement.GetProperty("schemaVersion").GetInt32());
+        Assert.Equal(
+            output.OperationId,
+            request.RootElement.GetProperty("operationId").GetString());
+        Assert.Equal(
+            before.Trust.TrustDomainId,
+            request.RootElement.GetProperty("trustDomainId").GetString());
+        Assert.Equal(
+            before.Trust.GenerationManifestSha256,
+            request.RootElement
+                .GetProperty("startingGenerationManifestSha256")
+                .GetString());
+        Assert.Equal(
+            before.Trust.PublicationManifestSha256,
+            request.RootElement
+                .GetProperty("startingPublicationManifestSha256")
+                .GetString());
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Equal(
+                UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                File.GetUnixFileMode(signalPath));
+        }
     }
 
     [Fact]
@@ -2350,6 +3093,347 @@ public sealed class SigstoreOperationTests
             output.Message,
             StringComparison.Ordinal);
         lease!.Dispose();
+    }
+
+    [Fact]
+    public async Task DurableRecoveryBlocksUnrelatedCommandsAndTamperingFailsClosed()
+    {
+        using var model = new OperationModelFixture();
+        var tuf = NewTufState();
+        var operationId = Guid.NewGuid().ToString("N");
+        var worker = Exited("tuf-bootstrap", "worker-before", 0);
+        var journal = new TufRootRotationCommandJournal(
+            1,
+            operationId,
+            "requested",
+            DateTimeOffset.UtcNow,
+            new SigstoreOperationSnapshot(
+                tuf,
+                NewServed(tuf),
+                Hash('1'),
+                Hash('3'),
+                Running("tuf", "tuf-id")),
+            worker,
+            null);
+        var directory = System.IO.Path.Combine(
+            model.Parent.Resource.StatePath,
+            "tuf-root-rotations",
+            operationId);
+        Directory.CreateDirectory(directory);
+        var journalPath = System.IO.Path.Combine(
+            directory,
+            "hosting-state.json");
+        File.WriteAllText(
+            journalPath,
+            JsonSerializer.Serialize(journal, JsonOptions));
+
+        SigstoreOperationExecutor.RefreshDurableRecoveryState(
+            model.Parent.Resource);
+
+        var recovery = model.Parent.Resource.GetPresentation().Recovery;
+        Assert.NotNull(recovery);
+        Assert.Equal(
+            SigstoreOperationCommand.RotateTufRootCommand,
+            recovery.Command);
+        Assert.Equal(
+            ResourceCommandState.Enabled,
+            SigstoreOperationCommand.GetTufRootRotationCommandState(
+                model.Parent.Resource));
+        Assert.Equal(
+            ResourceCommandState.Disabled,
+            SigstoreOperationCommand.GetMutationCommandState(
+                model.Parent.Resource));
+
+        var runtime = new FakeRuntime(
+            new ConcurrentQueue<string>(),
+            () => false);
+        var result = await NewExecutor(
+                model,
+                runtime,
+                new FakeStateInspector(new ConcurrentQueue<string>()))
+            .ExecuteRefreshTufAsync(CancellationToken.None);
+        var output = ReadResult(result);
+        Assert.False(result.Success);
+        Assert.Equal("recovery-pending", output.Phase);
+        Assert.Contains(
+            output.Errors,
+            error => error.Postcondition == "recovery-exclusive");
+        Assert.Empty(runtime.ExecutedCommands);
+
+        var serialized = JsonSerializer.Serialize(journal, JsonOptions);
+        File.WriteAllText(
+            journalPath,
+            serialized[..^1] + ",\"unexpected\":true}");
+        SigstoreOperationExecutor.RefreshDurableRecoveryState(
+            model.Parent.Resource);
+
+        recovery = model.Parent.Resource.GetPresentation().Recovery;
+        Assert.NotNull(recovery);
+        Assert.Equal("lifecycle-recovery", recovery.Command);
+        Assert.Equal("invalid-or-ambiguous-journal", recovery.Phase);
+        Assert.Equal(
+            ResourceCommandState.Disabled,
+            SigstoreOperationCommand.GetTufRootRotationCommandState(
+                model.Parent.Resource));
+    }
+
+    [Fact]
+    public async Task TufRootRecoveryAcceptsDurableCommitWithoutRestartingWorker()
+    {
+        using var model = new OperationModelFixture();
+        var before = NewTufState();
+        var after = NewTufState(before, rotation: true);
+        var operationId = Guid.NewGuid().ToString("N");
+        var workerBefore = Exited(
+            "tuf-bootstrap",
+            "worker-before",
+            0);
+        var workerAfter = Exited(
+            "tuf-bootstrap",
+            "worker-after",
+            0,
+            offsetSeconds: 10);
+        var operationDirectory = System.IO.Path.Combine(
+            model.Parent.Resource.StatePath,
+            "tuf-root-rotations",
+            operationId);
+        Directory.CreateDirectory(operationDirectory);
+        File.WriteAllText(
+            System.IO.Path.Combine(
+                operationDirectory,
+                "hosting-state.json"),
+            JsonSerializer.Serialize(
+                new TufRootRotationCommandJournal(
+                    1,
+                    operationId,
+                    "requested",
+                    DateTimeOffset.UtcNow.AddMinutes(-1),
+                    new SigstoreOperationSnapshot(
+                        before,
+                        NewServed(before),
+                        Hash('1'),
+                        Hash('3'),
+                        Running("tuf", "tuf-id")),
+                    workerBefore,
+                    null),
+                JsonOptions));
+        File.WriteAllText(
+            System.IO.Path.Combine(operationDirectory, "completion.json"),
+            JsonSerializer.Serialize(
+                new TufRootRotationWorkerCompletion(
+                    1,
+                    operationId,
+                    before.Trust.TrustDomainId,
+                    before.Trust.Generation,
+                    before.Trust.GenerationId,
+                    before.Trust.GenerationManifestSha256,
+                    before.Metadata.Root.Version,
+                    after.Metadata.Root.Version,
+                    after.Metadata.Targets.Version,
+                    before.Trust.PublicationId,
+                    before.Trust.PublicationManifestSha256,
+                    after.Trust.PublicationId,
+                    after.Trust.PublicationManifestSha256,
+                    after.Trust.TrustedRootSha256,
+                    after.Trust.SigningConfigSha256,
+                    DateTimeOffset.UtcNow),
+                JsonOptions));
+
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events);
+        inspector.TufStates.Enqueue(after);
+        inspector.TufStates.Enqueue(after);
+        inspector.TrustFingerprints.Enqueue(Hash('2'));
+        inspector.TrustFingerprints.Enqueue(Hash('2'));
+        inspector.MaterialFingerprints.Enqueue(Hash('3'));
+        inspector.MaterialFingerprints.Enqueue(Hash('3'));
+        var runtime = NewRuntime(model, events, inspector);
+        runtime.ServedStates.Enqueue(NewServed(after));
+        runtime.ServedStates.Enqueue(NewServed(after));
+        runtime.Statuses.Enqueue(NewAggregate(model, after));
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Tuf.Resource,
+            Running("tuf", "tuf-id"),
+            Running("tuf", "tuf-id"),
+            Running("tuf", "tuf-id"));
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.TufBootstrap.Resource,
+            workerAfter);
+
+        var result = await NewExecutor(model, runtime, inspector)
+            .ExecuteRotateTufRootAsync(CancellationToken.None);
+        var output = ReadResult(result);
+
+        Assert.True(result.Success, output.Message);
+        Assert.Empty(runtime.ExecutedCommands);
+        Assert.Equal(
+            before.Metadata.Root.Version + 1,
+            output.After!.Tuf.Metadata.Root.Version);
+        var completed = JsonSerializer.Deserialize<
+            TufRootRotationCommandJournal>(
+                File.ReadAllText(
+                    System.IO.Path.Combine(
+                        operationDirectory,
+                        "hosting-state.json")),
+                JsonOptions);
+        Assert.NotNull(completed);
+        Assert.Equal("completed", completed.Status);
+        Assert.Equal(workerAfter, completed.WorkerAfter);
+        Assert.Null(model.Parent.Resource.GetPresentation().Recovery);
+    }
+
+    [Fact]
+    public async Task TrustedRootRecoveryResumesPartialClientConvergence()
+    {
+        using var model = new OperationModelFixture();
+        var before = NewTufState();
+        var after = NewTsaRotationTufState(before);
+        var tufServer = Running("tuf", "tuf-id");
+        var workerBefore = Exited(
+            "tuf-bootstrap",
+            "worker-before",
+            0);
+        var workerAfter = Exited(
+            "tuf-bootstrap",
+            "worker-after",
+            0,
+            offsetSeconds: 10);
+        var clients = model.Parent.Resource.GetRegistrations().Clients
+            .OrderBy(client => client.Resource.Name, StringComparer.Ordinal)
+            .ToArray();
+        var converged = clients.Take(2).ToArray();
+        var pending = clients.Skip(2).ToArray();
+        var operationId = Guid.NewGuid().ToString("N");
+        var startedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var startingSnapshot = new SigstoreOperationSnapshot(
+            before,
+            NewServed(before),
+            Hash('1'),
+            Hash('3'),
+            tufServer);
+        var committedSnapshot = new SigstoreOperationSnapshot(
+            after,
+            NewServed(after),
+            Hash('2'),
+            Hash('4'),
+            tufServer);
+        var recordedClients = converged
+            .Select(
+                client =>
+                {
+                    var snapshot = Running(
+                        client.Resource.Name,
+                        $"{client.Resource.Name}-converged",
+                        offsetSeconds: 20);
+                    return new TrustedRootClientConvergence(
+                        client.Resource.Name,
+                        snapshot.ResourceId,
+                        snapshot.ContainerId!,
+                        snapshot.StartTimeUtc,
+                        NewClientStatus(client, after.Trust));
+                })
+            .ToArray();
+        var directory = System.IO.Path.Combine(
+            model.Parent.Resource.StatePath,
+            "trusted-root-publication",
+            operationId);
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(
+            System.IO.Path.Combine(directory, "command.json"),
+            JsonSerializer.Serialize(
+                new TrustedRootPublicationCommandJournal(
+                    1,
+                    operationId,
+                    "clients-converging",
+                    startedAt,
+                    startingSnapshot,
+                    workerBefore,
+                    committedSnapshot,
+                    workerAfter,
+                    recordedClients),
+                JsonOptions));
+        File.WriteAllText(
+            System.IO.Path.Combine(
+                model.Parent.Resource.StatePath,
+                "publish-trusted-root.completed"),
+            JsonSerializer.Serialize(
+                new TrustedRootWorkerCompletion(
+                    2,
+                    operationId,
+                    before.Trust.TrustDomainId,
+                    DateTimeOffset.UtcNow.AddMinutes(-1),
+                    after.Trust.Generation,
+                    after.Trust.GenerationId,
+                    after.Trust.PublicationId,
+                    after.Trust.GenerationManifestSha256),
+                JsonOptions));
+
+        var events = new ConcurrentQueue<string>();
+        var inspector = new FakeStateInspector(events);
+        inspector.TufStates.Enqueue(after);
+        inspector.TrustFingerprints.Enqueue(Hash('2'));
+        inspector.MaterialFingerprints.Enqueue(Hash('4'));
+        var runtime = NewRuntime(model, events, inspector);
+        runtime.ServedStates.Enqueue(NewServed(after));
+        runtime.Statuses.Enqueue(NewAggregate(model, after));
+        runtime.SetSnapshotSequence(
+            model.Parent.Resource.Components.Tuf.Resource,
+            tufServer);
+        foreach (var recorded in recordedClients)
+        {
+            var client = clients.Single(item =>
+                item.Resource.Name == recorded.Resource);
+            runtime.SetSnapshotSequence(
+                client.Resource,
+                new SigstoreResourceInstanceSnapshot(
+                    recorded.Resource,
+                    recorded.ResourceId,
+                    "Running",
+                    "Healthy",
+                    null,
+                    null,
+                    recorded.StartTimeUtc,
+                    null,
+                    recorded.ContainerId));
+            runtime.ClientStatuses[client.Resource.Name] =
+                recorded.TrustStatus;
+        }
+        foreach (var client in pending)
+        {
+            var current = Running(
+                client.Resource.Name,
+                $"{client.Resource.Name}-stale");
+            var restarted = Running(
+                client.Resource.Name,
+                $"{client.Resource.Name}-current",
+                offsetSeconds: 30);
+            runtime.SetSnapshotSequence(client.Resource, current);
+            runtime.WaitResults[client.Resource.Name] = restarted;
+            runtime.ClientStatuses[client.Resource.Name] =
+                NewClientStatus(client, after.Trust);
+        }
+
+        var result = await NewExecutor(model, runtime, inspector)
+            .ExecutePublishTrustedRootAsync(CancellationToken.None);
+        var output = ReadResult(result);
+
+        Assert.True(result.Success, output.Message);
+        Assert.Equal(
+            pending.Select(client => client.Resource.Name),
+            runtime.ExecutedCommands
+                .Where(call => call.Command
+                    == KnownResourceCommands.RestartCommand)
+                .Select(call => call.Resource));
+        Assert.Equal(pending.Length, output.Resources.Count);
+        var completed = JsonSerializer.Deserialize<
+            TrustedRootPublicationCommandJournal>(
+                File.ReadAllText(
+                    System.IO.Path.Combine(directory, "command.json")),
+                JsonOptions);
+        Assert.NotNull(completed);
+        Assert.Equal("completed", completed.Status);
+        Assert.Equal(6, completed.Clients.Count);
+        Assert.Null(model.Parent.Resource.GetPresentation().Recovery);
     }
 
     [Fact]
@@ -2452,7 +3536,7 @@ public sealed class SigstoreOperationTests
             output.Command);
         Assert.Contains(
             output.Postconditions,
-            check => check.Name == "trust-status-stale-root-acceptable"
+            check => check.Name == "trust-status-ready"
                 && check.Passed);
         Assert.Equal(6, output.Resources.Count);
     }
@@ -3001,7 +4085,61 @@ public sealed class SigstoreOperationTests
             NewServed(state).Trust,
             clients,
             [],
-            []);
+            [])
+        {
+            TufMetadata = state.Metadata,
+            TufMetadataFreshness = SigstoreTufMetadataPolicy.Evaluate(
+                state.Metadata,
+                DateTimeOffset.UtcNow)
+        };
+    }
+
+    private static SigstoreAggregateTrustStatus NewClientDownAggregate(
+        OperationModelFixture model,
+        SigstoreTufStateSnapshot state,
+        SigstoreClientRegistration downClient,
+        IReadOnlyList<SigstoreRequiredResourceStatus> required,
+        bool includeFreshnessErrors,
+        DateTimeOffset now)
+    {
+        var freshness = SigstoreTufMetadataPolicy.Evaluate(
+            state.Metadata,
+            now);
+        var errors = new List<SigstoreStatusError>
+        {
+            new(
+                downClient.Resource.Name,
+                "resource is Exited (health Unknown); the status endpoint was not queried."),
+            new(
+                "resources",
+                $"{downClient.Resource.Name} is Exited (health Unknown).")
+        };
+        if (includeFreshnessErrors)
+        {
+            SigstoreStatusCommand.AppendTufMetadataFreshnessErrors(
+                freshness,
+                errors);
+        }
+        var clients = model.Parent.Resource.GetRegistrations().Clients
+            .Where(client => client.Resource.Name != downClient.Resource.Name)
+            .Select(client => NewClientStatus(client, state.Trust))
+            .ToArray();
+        return new SigstoreAggregateTrustStatus(
+            1,
+            "sigstore",
+            false,
+            "Degraded",
+            $"{errors[0].Source}: {errors[0].Message}",
+            now,
+            state.Trust,
+            NewServed(state).Trust,
+            clients,
+            required,
+            errors)
+        {
+            TufMetadata = state.Metadata,
+            TufMetadataFreshness = freshness
+        };
     }
 
     /// <summary>
@@ -3043,7 +4181,13 @@ public sealed class SigstoreOperationTests
             NewServed(diskState).Trust,
             clients,
             [],
-            errors);
+            errors)
+        {
+            TufMetadata = diskState.Metadata,
+            TufMetadataFreshness = SigstoreTufMetadataPolicy.Evaluate(
+                diskState.Metadata,
+                DateTimeOffset.UtcNow)
+        };
     }
 
     private static SigstoreClientTrustStatus NewClientStatus(
@@ -3425,6 +4569,11 @@ public sealed class SigstoreOperationTests
                     [],
                     15,
                     15));
+            var initialTuf = NewTufState();
+            Parent.Resource.SetTufMetadataFreshness(
+                SigstoreTufMetadataPolicy.Evaluate(
+                    initialTuf.Metadata,
+                    DateTimeOffset.UtcNow));
         }
 
         public string Path { get; }
@@ -3496,10 +4645,20 @@ public sealed class SigstoreOperationTests
 
         public bool LockHeld => Volatile.Read(ref _lockCount) != 0;
 
+        public int LockFailuresRemaining { get; set; }
+
+        public Exception? ReadTufStateException { get; set; }
+
         public IDisposable AcquireLock(
             string statePath,
             string operation)
         {
+            if (LockFailuresRemaining > 0)
+            {
+                LockFailuresRemaining--;
+                throw new InvalidOperationException(
+                    "Sigstore state is locked by another operation.");
+            }
             if (Interlocked.Increment(ref _lockCount) != 1)
             {
                 Interlocked.Decrement(ref _lockCount);
@@ -3515,8 +4674,14 @@ public sealed class SigstoreOperationTests
                 });
         }
 
-        public SigstoreTufStateSnapshot ReadTufState(string statePath) =>
-            TufStates.Dequeue();
+        public SigstoreTufStateSnapshot ReadTufState(string statePath)
+        {
+            if (ReadTufStateException is not null)
+            {
+                throw ReadTufStateException;
+            }
+            return TufStates.Dequeue();
+        }
 
         public string ReadTrustStateFingerprint(string statePath) =>
             TrustFingerprints.Dequeue();
@@ -3599,6 +4764,32 @@ public sealed class SigstoreOperationTests
         }
     }
 
+    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        private DateTimeOffset _now = now;
+
+        public override DateTimeOffset GetUtcNow() => _now;
+
+        public void Advance(TimeSpan duration) => _now += duration;
+    }
+
+    private sealed class FakeTufRefreshOperation(
+        params ExecuteCommandResult[] results)
+        : ISigstoreTufRefreshOperation
+    {
+        private readonly Queue<ExecuteCommandResult> _results = new(results);
+
+        public int Calls { get; private set; }
+
+        public Task<ExecuteCommandResult> ExecuteAsync(
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Calls++;
+            return Task.FromResult(_results.Dequeue());
+        }
+    }
+
     private sealed class FakeRuntime(
         ConcurrentQueue<string> events,
         Func<bool> isLockHeld) : ISigstoreOperationRuntime
@@ -3622,7 +4813,8 @@ public sealed class SigstoreOperationTests
         } = [];
 
         public Queue<SigstoreTimestampAuthorityProbeEvidence>
-            StoredTimestampProofs { get; } = [];
+            StoredTimestampProofs
+        { get; } = [];
 
         public Queue<SigstoreFulcioStatus> FulcioStatuses { get; } = [];
 
@@ -3635,20 +4827,24 @@ public sealed class SigstoreOperationTests
         public Dictionary<
             string,
             Queue<SigstoreClientArtifactVerification>>
-            ArtifactVerifications { get; } =
+            ArtifactVerifications
+        { get; } =
                 new(StringComparer.Ordinal);
 
         public Dictionary<string, SigstoreResourceInstanceSnapshot>
-            WaitResults { get; } = new(StringComparer.Ordinal);
+            WaitResults
+        { get; } = new(StringComparer.Ordinal);
 
         public Dictionary<string, Exception> WaitFailures { get; } =
             new(StringComparer.Ordinal);
 
         public Dictionary<string, SigstoreClientTrustStatus>
-            ClientStatuses { get; } = new(StringComparer.Ordinal);
+            ClientStatuses
+        { get; } = new(StringComparer.Ordinal);
 
         public Dictionary<string, Queue<SigstoreClientTrustStatus>>
-            ClientStatusSequences { get; } = new(StringComparer.Ordinal);
+            ClientStatusSequences
+        { get; } = new(StringComparer.Ordinal);
 
         public List<(string Resource, string Command)> ExecutedCommands
         {

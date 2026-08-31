@@ -360,6 +360,14 @@ func rotateTUFRootKeyWithHooks(
 	}
 	defer stateLock.release()
 
+	return rotateTUFRootKeyLocked(statePath, hooks)
+}
+
+// rotateTUFRootKeyLocked performs the root rotation while the caller holds state.lock.
+func rotateTUFRootKeyLocked(
+	statePath string,
+	hooks publicationHooks,
+) (repositoryAction, error) {
 	bootstrap, err := loadActiveTrustGeneration(statePath)
 	if err != nil {
 		return "", err

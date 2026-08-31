@@ -58,6 +58,20 @@ public sealed record SigstoreTufMetadataStatus(
     string TrustedRootSha256,
     string SigningConfigSha256);
 
+public sealed record SigstoreTufMetadataRoleFreshnessStatus(
+    string Role,
+    string State,
+    DateTimeOffset ExpiresAtUtc,
+    long RemainingSeconds);
+
+public sealed record SigstoreTufMetadataFreshnessStatus(
+    string State,
+    string? Reason,
+    DateTimeOffset RefreshAtUtc,
+    bool AutomaticRefreshRequired,
+    bool TrustMaintenanceRequired,
+    IReadOnlyList<SigstoreTufMetadataRoleFreshnessStatus> Roles);
+
 public sealed record SigstoreTufStateSnapshot(
     SigstoreDiskTrustStatus Trust,
     SigstoreTufMetadataStatus Metadata,
@@ -128,7 +142,16 @@ public sealed record SigstoreAggregateTrustStatus(
     SigstoreRecoveryStatus? Recovery = null,
     SigstoreFulcioStatus? Fulcio = null,
     SigstoreRekorStatus? Rekor = null,
-    SigstoreCtLogStatus? CtLog = null);
+    SigstoreCtLogStatus? CtLog = null)
+{
+    public SigstoreTufMetadataStatus? TufMetadata { get; init; }
+
+    public SigstoreTufMetadataFreshnessStatus? TufMetadataFreshness
+    {
+        get;
+        init;
+    }
+}
 
 internal sealed record PublishedTrustStatus(
     int SchemaVersion,
@@ -323,6 +346,7 @@ internal static class SigstoreStatusCommand
     {
         var status = await CollectAsync(
             resource,
+            TimeProvider.System,
             context.CancellationToken);
         var json = JsonSerializer.Serialize(status, JsonOptions);
         return CreateResult(status, json);
@@ -347,13 +371,25 @@ internal static class SigstoreStatusCommand
 
     internal static async Task<SigstoreAggregateTrustStatus> CollectAsync(
         SigstoreResource resource,
+        CancellationToken cancellationToken) =>
+        await CollectAsync(
+            resource,
+            TimeProvider.System,
+            cancellationToken);
+
+    internal static async Task<SigstoreAggregateTrustStatus> CollectAsync(
+        SigstoreResource resource,
+        TimeProvider timeProvider,
         CancellationToken cancellationToken)
     {
         var registrations = resource.GetRegistrations();
         var runtime = resource.GetRuntimeHealth();
         var errors = new List<SigstoreStatusError>();
+        SigstoreTufStateSnapshot? diskTuf = null;
+        SigstoreServedTufSnapshot? servedTuf = null;
         SigstoreDiskTrustStatus? disk = null;
         SigstoreServedTrustStatus? served = null;
+        SigstoreTufMetadataFreshnessStatus? tufMetadataFreshness = null;
         SigstoreTimestampAuthorityStatus? timestampAuthority = null;
         SigstoreFulcioStatus? fulcio = null;
         SigstoreRekorStatus? rekor = null;
@@ -361,7 +397,8 @@ internal static class SigstoreStatusCommand
 
         try
         {
-            disk = ReadDiskStatus(resource.StatePath);
+            diskTuf = ReadTufStateSnapshot(resource.StatePath);
+            disk = diskTuf.Trust;
         }
         catch (Exception exception)
             when (IsExpectedStatusFailure(exception))
@@ -375,9 +412,10 @@ internal static class SigstoreStatusCommand
                 cancellationToken)
                 ?? throw new SigstoreStatusException(
                     "The TUF endpoint is not allocated.");
-            served = await ReadServedStatusAsync(
+            servedTuf = await ReadServedTufSnapshotAsync(
                 new Uri(endpoint, UriKind.Absolute),
                 cancellationToken);
+            served = servedTuf.Trust;
         }
         catch (Exception exception)
             when (IsExpectedStatusFailure(exception))
@@ -431,6 +469,23 @@ internal static class SigstoreStatusCommand
                 "tuf",
                 disk,
                 served,
+                errors);
+        }
+        if (diskTuf is not null && servedTuf is not null)
+        {
+            AddTufMetadataMismatchErrors(
+                diskTuf.Metadata,
+                servedTuf.Metadata,
+                errors);
+        }
+        var metadata = diskTuf?.Metadata ?? servedTuf?.Metadata;
+        if (metadata is not null)
+        {
+            tufMetadataFreshness = SigstoreTufMetadataPolicy.Evaluate(
+                metadata,
+                timeProvider.GetUtcNow());
+            AppendTufMetadataFreshnessErrors(
+                tufMetadataFreshness,
                 errors);
         }
         if (disk is not null)
@@ -571,27 +626,7 @@ internal static class SigstoreStatusCommand
                 ctLog = await ReadCtLogStatusAsync(
                     resource,
                     cancellationToken);
-                foreach (var shard in ctLog.Shards)
-                {
-                    if (!shard.InTrustedRoot)
-                    {
-                        errors.Add(
-                            new(
-                                "ctlog",
-                                $"the {shard.Slot} certificate-transparency " +
-                                "shard is not published in TrustedRoot."));
-                    }
-                }
-                if (ctLog.FulcioCtPromotionPending)
-                {
-                    errors.Add(
-                        new(
-                            "ctlog",
-                            "certificate-transparency cutover is pending: " +
-                            "Fulcio is still bound to the " +
-                            $"{ctLog.SelectedFulcioShardSlot} shard while " +
-                            "a replacement selection is staged."));
-                }
+                AppendCtLogStatusErrors(ctLog, errors);
             }
             catch (Exception exception)
                 when (IsExpectedStatusFailure(exception))
@@ -600,17 +635,30 @@ internal static class SigstoreStatusCommand
             }
         }
 
-        if (runtime.State != "Healthy")
+        var unhealthyResource = runtime.Resources.FirstOrDefault(
+            status => status.State != KnownResourceStates.Running
+                || status.Health != "Healthy");
+        if (unhealthyResource is not null)
         {
             errors.Add(
                 new(
                     "resources",
-                    runtime.Reason
-                        ?? $"Parent resource state is {runtime.State}."));
+                    $"{unhealthyResource.Resource} is " +
+                    $"{unhealthyResource.State} " +
+                    $"(health {unhealthyResource.Health})."));
         }
+        SigstoreOperationExecutor.RefreshDurableRecoveryState(resource);
         var presentation = resource.GetPresentation();
-        if (presentation.Operation is null
-            && presentation.Recovery is not null)
+        if (presentation.Operation is not null)
+        {
+            errors.Add(
+                new(
+                    "operation",
+                    $"{presentation.Operation.Command} is active in phase " +
+                    $"{presentation.Operation.Phase}: " +
+                    presentation.Operation.Message));
+        }
+        else if (presentation.Recovery is not null)
         {
             errors.Add(
                 new(
@@ -656,7 +704,7 @@ internal static class SigstoreStatusCommand
             ready,
             ready ? "Healthy" : "Degraded",
             reason,
-            DateTimeOffset.UtcNow,
+            timeProvider.GetUtcNow(),
             disk,
             served,
             clients,
@@ -682,7 +730,152 @@ internal static class SigstoreStatusCommand
                     recovery.UpdatedAtUtc),
             fulcio,
             rekor,
-            ctLog);
+            ctLog)
+        {
+            TufMetadata = metadata,
+            TufMetadataFreshness = tufMetadataFreshness
+        };
+    }
+
+    internal static void AppendTufMetadataFreshnessErrors(
+        SigstoreTufMetadataFreshnessStatus freshness,
+        ICollection<SigstoreStatusError> errors)
+    {
+        ArgumentNullException.ThrowIfNull(freshness);
+        ArgumentNullException.ThrowIfNull(errors);
+
+        foreach (var role in freshness.Roles
+            .Where(role => role.State != "Current"))
+        {
+            var automatic = role.Role is "snapshot" or "timestamp";
+            var source = role.State == "Expired"
+                ? "tuf-expiration"
+                : automatic
+                    ? "tuf-refresh"
+                    : "tuf-maintenance";
+            var action = automatic
+                ? "refresh-tuf can renew it"
+                : "rotate-tuf-root is required before expiry";
+            errors.Add(
+                new(
+                    source,
+                    $"{role.Role} metadata is {role.State.ToLowerInvariant()} " +
+                    $"at {role.ExpiresAtUtc:O}; {action}."));
+        }
+    }
+
+    private static void AddTufMetadataMismatchErrors(
+        SigstoreTufMetadataStatus disk,
+        SigstoreTufMetadataStatus served,
+        ICollection<SigstoreStatusError> errors)
+    {
+        AddMetadataRoleMismatch("root", disk.Root, served.Root, errors);
+        AddMetadataRoleMismatch(
+            "targets",
+            disk.Targets,
+            served.Targets,
+            errors);
+        AddMetadataRoleMismatch(
+            "snapshot",
+            disk.Snapshot,
+            served.Snapshot,
+            errors);
+        AddMetadataRoleMismatch(
+            "timestamp",
+            disk.Timestamp,
+            served.Timestamp,
+            errors);
+        if (disk.TrustedRootSha256 != served.TrustedRootSha256)
+        {
+            errors.Add(
+                new(
+                    "tuf",
+                    "served trusted-root metadata does not match disk."));
+        }
+        if (disk.SigningConfigSha256 != served.SigningConfigSha256)
+        {
+            errors.Add(
+                new(
+                    "tuf",
+                    "served signing configuration does not match disk."));
+        }
+    }
+
+    private static void AddMetadataRoleMismatch(
+        string role,
+        SigstoreTufMetadataRoleStatus disk,
+        SigstoreTufMetadataRoleStatus served,
+        ICollection<SigstoreStatusError> errors)
+    {
+        if (disk != served)
+        {
+            errors.Add(
+                new(
+                    "tuf",
+                    $"served {role} metadata does not exactly match disk."));
+        }
+    }
+
+    internal static void AppendCtLogStatusErrors(
+        SigstoreCtLogStatus ctLog,
+        ICollection<SigstoreStatusError> errors)
+    {
+        ArgumentNullException.ThrowIfNull(ctLog);
+        ArgumentNullException.ThrowIfNull(errors);
+
+        foreach (var shard in ctLog.Shards)
+        {
+            if (!shard.InTrustedRoot)
+            {
+                errors.Add(
+                    new(
+                        "ctlog",
+                        $"the {shard.Slot} certificate-transparency shard is " +
+                        "not published in TrustedRoot."));
+            }
+            if (shard.ComputeRequired && shard.ComputeHealthy != true)
+            {
+                errors.Add(
+                    new(
+                        "ctlog",
+                        $"the required {shard.Slot} certificate-transparency " +
+                        "compute resource is not healthy."));
+            }
+            if (!shard.AcceptedRootsMatchRuntime)
+            {
+                errors.Add(
+                    new(
+                        "ctlog",
+                        $"the {shard.Slot} certificate-transparency shard's " +
+                        "accepted-root projection does not match its catalog."));
+            }
+        }
+        if (ctLog.TrustedRootCtlogCount != ctLog.Shards.Count)
+        {
+            errors.Add(
+                new(
+                    "ctlog",
+                    "TrustedRoot certificate-transparency entry count does " +
+                    "not match the shard catalog."));
+        }
+        if (ctLog.FulcioCtPromotionPending)
+        {
+            errors.Add(
+                new(
+                    "ctlog",
+                    "certificate-transparency cutover is pending: Fulcio is " +
+                    $"still bound to the {ctLog.SelectedFulcioShardSlot} shard " +
+                    "while a replacement selection is staged."));
+        }
+        if (ctLog.IncompleteRotationOperationId is not null)
+        {
+            errors.Add(
+                new(
+                    "ctlog",
+                    "certificate-transparency recovery is pending for operation " +
+                    $"{ctLog.IncompleteRotationOperationId} in phase " +
+                    $"{ctLog.IncompleteRotationStatus ?? "unknown"}."));
+        }
     }
 
     /// <summary>
@@ -1260,6 +1453,7 @@ internal static class SigstoreStatusCommand
         ValidateFulcioRotationMetadata(generationManifest);
         ValidateTimestampRotationMetadata(generationManifest);
         ValidateRekorRotationMetadata(generationManifest);
+        ValidateCtLogRotationMetadata(generationManifest);
         var generationManifestHash = Hash(generationManifestBytes);
 
         var transition = DeserializeRequired<TransitionJournalStatus>(
@@ -2238,9 +2432,25 @@ internal static class SigstoreStatusCommand
             == second.RekorShardId
         && first.RekorBaseUrl
             == second.RekorBaseUrl
+        && first.CtLogRotationOperationId
+            == second.CtLogRotationOperationId
+        && first.CtLogPriorGeneration
+            == second.CtLogPriorGeneration
+        && first.CtLogPriorGenerationId
+            == second.CtLogPriorGenerationId
+        && first.CtLogPriorPublicKeySha256
+            == second.CtLogPriorPublicKeySha256
+        && first.CtLogPriorShardId
+            == second.CtLogPriorShardId
+        && first.CtLogPriorBaseUrl
+            == second.CtLogPriorBaseUrl
+        && first.CtLogShardId
+            == second.CtLogShardId
+        && first.CtLogBaseUrl
+            == second.CtLogBaseUrl
         && DictionariesEqual(first.Files, second.Files);
 
-    private static void ValidateFulcioRotationMetadata(
+    internal static void ValidateFulcioRotationMetadata(
         GenerationManifestStatus generation)
     {
         if (generation.FulcioRotationOperationId is null)
@@ -2259,8 +2469,8 @@ internal static class SigstoreStatusCommand
                 "N",
                 out _)
             || generation.FulcioRotationOperationId.Any(char.IsUpper)
-            || generation.FulcioPriorGeneration
-                != generation.Generation - 1
+            || generation.FulcioPriorGeneration < 1
+            || generation.FulcioPriorGeneration >= generation.Generation
             || generation.FulcioPriorGenerationId
                 != $"generation-{generation.FulcioPriorGeneration:D8}"
             || !IsLowerHexSha256(
@@ -2312,7 +2522,7 @@ internal static class SigstoreStatusCommand
         }
     }
 
-    private static void ValidateRekorRotationMetadata(
+    internal static void ValidateRekorRotationMetadata(
         GenerationManifestStatus generation)
     {
         if (generation.RekorRotationOperationId is null)
@@ -2336,8 +2546,8 @@ internal static class SigstoreStatusCommand
                 "N",
                 out _)
             || generation.RekorRotationOperationId.Any(char.IsUpper)
-            || generation.RekorPriorGeneration
-                != generation.Generation - 1
+            || generation.RekorPriorGeneration < 1
+            || generation.RekorPriorGeneration >= generation.Generation
             || generation.RekorPriorGenerationId
                 != $"generation-{generation.RekorPriorGeneration:D8}"
             || !IsLowerHexSha256(
@@ -2355,6 +2565,54 @@ internal static class SigstoreStatusCommand
         {
             throw new SigstoreStatusException(
                 "The active generation has invalid Rekor shard rotation metadata.");
+        }
+    }
+
+    internal static void ValidateCtLogRotationMetadata(
+        GenerationManifestStatus generation)
+    {
+        if (generation.CtLogRotationOperationId is null)
+        {
+            if (generation.CtLogPriorGeneration != 0
+                || generation.CtLogPriorGenerationId is not null
+                || generation.CtLogPriorPublicKeySha256 is not null
+                || generation.CtLogPriorShardId is not null
+                || generation.CtLogPriorBaseUrl is not null
+                || generation.CtLogShardId is not null
+                || generation.CtLogBaseUrl is not null)
+            {
+                throw new SigstoreStatusException(
+                    "The active generation has partial CT log shard rotation " +
+                    "metadata.");
+            }
+            return;
+        }
+
+        if (!Guid.TryParseExact(
+                generation.CtLogRotationOperationId,
+                "N",
+                out _)
+            || generation.CtLogRotationOperationId.Any(char.IsUpper)
+            || generation.CtLogPriorGeneration < 1
+            || generation.CtLogPriorGeneration >= generation.Generation
+            || generation.CtLogPriorGenerationId
+                != $"generation-{generation.CtLogPriorGeneration:D8}"
+            || !IsLowerHexSha256(
+                generation.CtLogPriorPublicKeySha256 ?? "")
+            || generation.CtLogPriorPublicKeySha256
+                == generation.CtLogPublicKeySha256
+            || generation.CtLogPriorShardId
+                != $"sha256-{generation.CtLogPriorPublicKeySha256}"
+            || generation.CtLogPriorBaseUrl
+                != "http://tesseract-sigstore.dev.localhost:6962"
+            || generation.CtLogShardId
+                != $"sha256-{generation.CtLogPublicKeySha256}"
+            || generation.CtLogBaseUrl
+                != "http://tesseract-secondary-sigstore.dev.localhost:6963")
+        {
+            throw new SigstoreStatusException(
+                "The active generation has invalid CT log shard rotation " +
+                "metadata.");
         }
     }
 

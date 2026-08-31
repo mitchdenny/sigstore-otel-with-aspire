@@ -248,6 +248,117 @@ public sealed class TrustStateTests
     }
 
     [Fact]
+    public void TransitionRejectsMismatchedCtRotationMetadata()
+    {
+        using var state = new TemporaryDirectory();
+        _ = SigstoreStateBootstrapper.EnsureInitialized(state.Path);
+        var journal = ReadJournal(state.Path);
+        var path = System.IO.Path.Combine(
+            state.Path,
+            "transition",
+            "state.json");
+
+        File.WriteAllText(
+            path,
+            JsonSerializer.Serialize(
+                journal with
+                {
+                    CandidateManifest = journal.CandidateManifest with
+                    {
+                        CtLogBaseUrl =
+                            "http://tesseract-secondary-sigstore.dev.localhost:6963"
+                    }
+                },
+                JsonOptions));
+
+        Assert.Throws<InvalidDataException>(
+            () => SigstoreStateBootstrapper.EnsureInitialized(state.Path));
+    }
+
+    [Fact]
+    public void ActiveGenerationRejectsPartialCtRotationMetadata()
+    {
+        using var state = new TemporaryDirectory();
+        var initial = SigstoreStateBootstrapper.EnsureInitialized(state.Path);
+        var manifestPath = System.IO.Path.Combine(
+            state.Path,
+            "generations",
+            initial.Generation.GenerationId,
+            "manifest.json");
+        var generation = initial.Generation with
+        {
+            CtLogBaseUrl =
+                "http://tesseract-secondary-sigstore.dev.localhost:6963"
+        };
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                manifestPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        var manifestBytes = JsonSerializer.SerializeToUtf8Bytes(
+            generation,
+            JsonOptions);
+        File.WriteAllBytes(manifestPath, manifestBytes);
+        var journal = ReadJournal(state.Path);
+        var journalPath = System.IO.Path.Combine(
+            state.Path,
+            "transition",
+            "state.json");
+        File.WriteAllText(
+            journalPath,
+            JsonSerializer.Serialize(
+                journal with
+                {
+                    Candidate = journal.Candidate with
+                    {
+                        ManifestSha256 = Convert.ToHexString(
+                                SHA256.HashData(manifestBytes))
+                            .ToLowerInvariant()
+                    },
+                    CandidateManifest = generation
+                },
+                JsonOptions));
+
+        Assert.Throws<InvalidDataException>(
+            () => SigstoreStateBootstrapper.EnsureInitialized(state.Path));
+    }
+
+    [Fact]
+    public void AdditiveStandbyRekorMaterialSurvivesBootstrapReuse()
+    {
+        using var state = new TemporaryDirectory();
+        var initial = SigstoreStateBootstrapper.EnsureInitialized(state.Path);
+        var generation = PromoteAdditiveGeneration(
+            state.Path,
+            initial.Generation);
+
+        var reused = SigstoreStateBootstrapper.EnsureInitialized(state.Path);
+
+        Assert.Equal(2, reused.Generation.Generation);
+        Assert.Contains(
+            "public/rekor/rekor-standby.pub",
+            reused.Generation.Files.Keys);
+
+        var standbyPath = System.IO.Path.Combine(
+            state.Path,
+            "generations",
+            generation.GenerationId,
+            "public",
+            "rekor",
+            "rekor-standby.pub");
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                standbyPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        File.AppendAllText(standbyPath, "tampered");
+        Assert.Throws<InvalidDataException>(
+            () => SigstoreStateBootstrapper.EnsureInitialized(state.Path));
+    }
+
+    [Fact]
     public void LockContentionIsExplicitAndReleasedOwnersDoNotBlock()
     {
         using var state = new TemporaryDirectory();
@@ -454,6 +565,115 @@ public sealed class TrustStateTests
             source.Path,
             destination.Path);
         return destination;
+    }
+
+    private static GenerationManifest PromoteAdditiveGeneration(
+        string statePath,
+        GenerationManifest current)
+    {
+        const string generationId = "generation-00000002";
+        var generationsPath = System.IO.Path.Combine(
+            statePath,
+            "generations");
+        var source = System.IO.Path.Combine(
+            generationsPath,
+            current.GenerationId);
+        var destination = System.IO.Path.Combine(
+            generationsPath,
+            generationId);
+        CopyDirectory(source, destination);
+
+        var manifestPath = System.IO.Path.Combine(
+            destination,
+            "manifest.json");
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                manifestPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        using var standby = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var standbyPath = System.IO.Path.Combine(
+            destination,
+            "public",
+            "rekor",
+            "rekor-standby.pub");
+        File.WriteAllText(
+            standbyPath,
+            standby.ExportSubjectPublicKeyInfoPem());
+
+        var generation = current with
+        {
+            Generation = 2,
+            GenerationId = generationId,
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            Files = SnapshotTrustMaterial(destination)
+        };
+        var manifestBytes = JsonSerializer.SerializeToUtf8Bytes(
+            generation,
+            JsonOptions);
+        File.WriteAllBytes(manifestPath, manifestBytes);
+        foreach (var file in Directory.EnumerateFiles(
+            destination,
+            "*",
+            SearchOption.AllDirectories))
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(
+                    file,
+                    UnixFileMode.UserRead
+                    | UnixFileMode.GroupRead
+                    | UnixFileMode.OtherRead);
+            }
+        }
+
+        var currentManifestPath = System.IO.Path.Combine(
+            source,
+            "manifest.json");
+        var journal = ReadJournal(statePath);
+        var now = DateTimeOffset.UtcNow;
+        var candidateManifestSha256 = Convert.ToHexString(
+                SHA256.HashData(manifestBytes))
+            .ToLowerInvariant();
+        var updatedJournal = journal with
+        {
+            TransitionId = Guid.NewGuid().ToString("N"),
+            Operation = "generation-advance",
+            Status = "committed",
+            LastCheckpoint = "transition-finalized",
+            StartedAtUtc = now,
+            UpdatedAtUtc = now,
+            PriorGeneration = new GenerationReference(
+                current.Generation,
+                current.GenerationId,
+                Convert.ToHexString(
+                        SHA256.HashData(
+                            File.ReadAllBytes(currentManifestPath)))
+                    .ToLowerInvariant()),
+            Candidate = new GenerationReference(
+                generation.Generation,
+                generation.GenerationId,
+                candidateManifestSha256),
+            CandidateManifest = generation
+        };
+        File.WriteAllText(
+            System.IO.Path.Combine(
+                statePath,
+                "transition",
+                "state.json"),
+            JsonSerializer.Serialize(updatedJournal, JsonOptions));
+
+        var activeGeneration = System.IO.Path.Combine(
+            statePath,
+            "active-generation");
+        Directory.Delete(activeGeneration);
+        Directory.CreateSymbolicLink(
+            activeGeneration,
+            System.IO.Path.Combine(
+                "generations",
+                generationId));
+        return generation;
     }
 
     private static void CopyDirectory(

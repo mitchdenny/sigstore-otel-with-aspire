@@ -72,6 +72,11 @@ internal sealed partial class SigstoreOperationExecutor
         CancellationToken requestCancellationToken)
     {
         requestCancellationToken.ThrowIfCancellationRequested();
+        if (CreateRecoveryBlockResult(
+                SigstoreOperationCommand.RotateRekorShardCommand) is { } blocked)
+        {
+            return blocked;
+        }
         if (!resource.TryBeginOperation(
                 SigstoreOperationCommand.RotateRekorShardCommand,
                 "Rotating Rekor Shard",
@@ -901,7 +906,8 @@ internal sealed partial class SigstoreOperationExecutor
             CancellationToken.None);
         execution.Check(
             "aggregate-status-ready",
-            aggregate.Ready && aggregate.Clients.Count == clients.Length,
+            IsReadyForActiveOperation(aggregate)
+                && aggregate.Clients.Count == clients.Length,
             $"ready=true and {clients.Length} converged clients",
             aggregate.Reason
                 ?? $"ready={aggregate.Ready}, " +
@@ -970,19 +976,13 @@ internal sealed partial class SigstoreOperationExecutor
             resource.StatePath);
         var tlogEntries = SigstoreRekorShard.ReadTlogEntries(
             resource.StatePath);
-        if (!tlogEntries.Any(
-                entry => entry.PublicKeySha256 == active.PublicKeySha256))
-        {
-            throw new InvalidDataException(
-                "TrustedRoot does not contain the running Rekor shard.");
-        }
-        if (tlogEntries.Count != 1
-            || tlogEntries[0].BaseUrl != RekorPrimaryUrl)
-        {
-            throw new InvalidDataException(
-                "TrustedRoot Rekor routing does not match the canonical " +
-                "single-shard state.");
-        }
+        ValidatePreflightTlogEntries(
+            active.PublicKeySha256,
+            SigstoreStateBootstrapper.ValidateRekorStandbyPublicKey(
+                Path.Combine(
+                    resource.StatePath,
+                    "active-generation")),
+            tlogEntries);
 
         var fulcioStatus = await runtime.ReadFulcioStatusAsync(
             cancellationToken);
@@ -1047,6 +1047,32 @@ internal sealed partial class SigstoreOperationExecutor
             "generation or replay must complete before other trust " +
             "mutations.");
         return operation;
+    }
+
+    internal static void ValidatePreflightTlogEntries(
+        string activePublicKeySha256,
+        string? standbyPublicKeySha256,
+        IReadOnlyList<SigstoreRekorTlogEntry> entries)
+    {
+        var activeEntries = entries.Where(
+                entry => entry.PublicKeySha256 == activePublicKeySha256
+                    && entry.BaseUrl == RekorPrimaryUrl)
+            .ToArray();
+        var standbyEntries = entries.Where(
+                entry => standbyPublicKeySha256 is not null
+                    && entry.PublicKeySha256 == standbyPublicKeySha256
+                    && entry.BaseUrl == $"{RekorPrimaryUrl}/standby")
+            .ToArray();
+        var expectedStandbyCount =
+            standbyPublicKeySha256 is null ? 0 : 1;
+        if (activeEntries.Length != 1
+            || standbyEntries.Length != expectedStandbyCount
+            || entries.Count != 1 + expectedStandbyCount)
+        {
+            throw new InvalidDataException(
+                "TrustedRoot Rekor entries do not match the active shard and " +
+                "its optional additive standby verification key.");
+        }
     }
 
     /// <summary>
@@ -1737,6 +1763,7 @@ internal sealed partial class SigstoreOperationExecutor
         var result = new RekorShardRotationOperationResult(
             1,
             SigstoreOperationCommand.RotateRekorShardCommand,
+            execution.OperationId.ToString("N"),
             success,
             execution.Phase,
             message,
@@ -1902,6 +1929,7 @@ internal sealed record RekorShardRotationEvidence(
 internal sealed record RekorShardRotationOperationResult(
     int SchemaVersion,
     string Command,
+    string OperationId,
     bool Success,
     string Phase,
     string Message,

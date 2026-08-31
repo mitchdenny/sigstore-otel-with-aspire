@@ -222,6 +222,202 @@ public sealed class SigstoreStatusTests
     }
 
     [Fact]
+    public void TufMetadataExpirationDegradesStatusAndParentPresentation()
+    {
+        var now = DateTimeOffset.Parse("2026-08-31T00:00:00Z");
+        using var fixture = new TrustStatusFixture(
+            timestampExpiresAtUtc: now.AddMinutes(-1));
+        var state = SigstoreStatusCommand.ReadTufStateSnapshot(fixture.Path);
+
+        var freshness = SigstoreTufMetadataPolicy.Evaluate(
+            state.Metadata,
+            now);
+        var errors = new List<SigstoreStatusError>();
+        SigstoreStatusCommand.AppendTufMetadataFreshnessErrors(
+            freshness,
+            errors);
+
+        Assert.Equal("Expired", freshness.State);
+        Assert.True(freshness.AutomaticRefreshRequired);
+        Assert.False(freshness.TrustMaintenanceRequired);
+        Assert.Equal(
+            ["root", "targets", "snapshot", "timestamp"],
+            freshness.Roles.Select(role => role.Role));
+        Assert.Equal(
+            "Expired",
+            freshness.Roles.Single(
+                role => role.Role == "timestamp").State);
+        Assert.Contains(
+            errors,
+            error => error.Source == "tuf-expiration"
+                && error.Message.Contains(
+                    "timestamp metadata",
+                    StringComparison.Ordinal));
+
+        var parent = new SigstoreResource(
+            "sigstore",
+            fixture.Path,
+            fixture.Path);
+        parent.SetRuntimeHealth(
+            new SigstoreRuntimeHealthSnapshot(
+                "Healthy",
+                null,
+                [],
+                14,
+                14));
+        parent.SetTufMetadataFreshness(freshness);
+
+        var snapshot = SigstoreParentHealthMonitor.CreateParentSnapshot(
+            parent,
+            new CustomResourceSnapshot
+            {
+                ResourceType = "Sigstore",
+                State = new ResourceStateSnapshot(
+                    "Healthy",
+                    KnownResourceStateStyles.Success),
+                Properties = []
+            });
+
+        Assert.Equal("Degraded", snapshot.State?.Text);
+        Assert.Equal(KnownResourceStateStyles.Warn, snapshot.State?.Style);
+        Assert.Contains(
+            snapshot.Properties,
+            property => property.Name == "TUF metadata"
+                && Equals(property.Value, "Expired"));
+    }
+
+    [Fact]
+    public void TufMetadataNearExpiryDistinguishesRefreshFromMaintenance()
+    {
+        var now = DateTimeOffset.Parse("2026-08-31T00:00:00Z");
+        var current = new SigstoreTufMetadataRoleStatus(
+            1,
+            new string('a', 64),
+            now.AddDays(30));
+        var metadata = new SigstoreTufMetadataStatus(
+            current with
+            {
+                ExpiresAtUtc = now.AddDays(2)
+            },
+            current with
+            {
+                Sha256 = new string('b', 64)
+            },
+            current with
+            {
+                Sha256 = new string('c', 64),
+                ExpiresAtUtc = now.AddHours(5)
+            },
+            current with
+            {
+                Sha256 = new string('d', 64),
+                ExpiresAtUtc = now.AddHours(4)
+            },
+            new string('e', 64),
+            new string('f', 64));
+
+        var freshness = SigstoreTufMetadataPolicy.Evaluate(metadata, now);
+        var errors = new List<SigstoreStatusError>();
+        SigstoreStatusCommand.AppendTufMetadataFreshnessErrors(
+            freshness,
+            errors);
+
+        Assert.Equal("RefreshNeeded", freshness.State);
+        Assert.True(freshness.AutomaticRefreshRequired);
+        Assert.True(freshness.TrustMaintenanceRequired);
+        Assert.Contains(
+            errors,
+            error => error.Source == "tuf-refresh"
+                && error.Message.StartsWith(
+                    "snapshot metadata",
+                    StringComparison.Ordinal));
+        Assert.Contains(
+            errors,
+            error => error.Source == "tuf-maintenance"
+                && error.Message.StartsWith(
+                    "root metadata",
+                    StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void RotationProvenanceRemainsValidAfterLaterGenerations()
+    {
+        var generation = JsonSerializer.Deserialize<GenerationManifestStatus>(
+            JsonSerializer.SerializeToUtf8Bytes(
+                new
+                {
+                    schemaVersion = 5,
+                    generation = 7,
+                    generationId = "generation-00000007",
+                    trustDomainId = "sha256-" + new string('a', 64),
+                    createdAtUtc = DateTimeOffset.UtcNow,
+                    sourceSchemaVersion = 5,
+                    fulcioRootSha256 = new string('b', 64),
+                    fulcioRotationOperationId =
+                        "11111111111111111111111111111111",
+                    fulcioPriorGeneration = 4,
+                    fulcioPriorGenerationId = "generation-00000004",
+                    fulcioPriorRootSha256 = new string('c', 64),
+                    ctLogPublicKeySha256 = new string('d', 64),
+                    ctLogRotationOperationId =
+                        "33333333333333333333333333333333",
+                    ctLogPriorGeneration = 3,
+                    ctLogPriorGenerationId = "generation-00000003",
+                    ctLogPriorPublicKeySha256 = new string('4', 64),
+                    ctLogPriorShardId = "sha256-" + new string('4', 64),
+                    ctLogPriorBaseUrl =
+                        "http://tesseract-sigstore.dev.localhost:6962",
+                    ctLogShardId = "sha256-" + new string('d', 64),
+                    ctLogBaseUrl =
+                        "http://tesseract-secondary-sigstore.dev.localhost:6963",
+                    rekorPublicKeySha256 = new string('e', 64),
+                    rekorRotationOperationId =
+                        "22222222222222222222222222222222",
+                    rekorPriorGeneration = 5,
+                    rekorPriorGenerationId = "generation-00000005",
+                    rekorPriorPublicKeySha256 = new string('f', 64),
+                    rekorPriorShardId = "sha256-" + new string('f', 64),
+                    rekorPriorBaseUrl =
+                        "http://rekor-sigstore.dev.localhost:3000",
+                    rekorShardId = "sha256-" + new string('e', 64),
+                    rekorBaseUrl =
+                        "http://rekor-secondary-sigstore.dev.localhost:3000",
+                    tsaRootSha256 = new string('1', 64),
+                    tsaLeafSha256 = new string('2', 64),
+                    oidcKeyId = "test-oidc-key",
+                    files = new SortedDictionary<string, string>(
+                        StringComparer.Ordinal)
+                }),
+            JsonOptions)!;
+
+        SigstoreStatusCommand.ValidateFulcioRotationMetadata(generation);
+        SigstoreStatusCommand.ValidateRekorRotationMetadata(generation);
+        SigstoreStatusCommand.ValidateCtLogRotationMetadata(generation);
+
+        Assert.Throws<SigstoreStatusException>(
+            () => SigstoreStatusCommand.ValidateFulcioRotationMetadata(
+                generation with
+                {
+                    FulcioPriorGeneration = generation.Generation,
+                    FulcioPriorGenerationId = generation.GenerationId
+                }));
+        Assert.Throws<SigstoreStatusException>(
+            () => SigstoreStatusCommand.ValidateRekorRotationMetadata(
+                generation with
+                {
+                    RekorPriorGeneration = generation.Generation,
+                    RekorPriorGenerationId = generation.GenerationId
+                }));
+        Assert.Throws<SigstoreStatusException>(
+            () => SigstoreStatusCommand.ValidateCtLogRotationMetadata(
+                generation with
+                {
+                    CtLogPriorGeneration = generation.Generation,
+                    CtLogPriorGenerationId = generation.GenerationId
+                }));
+    }
+
+    [Fact]
     public void TufSnapshotReportsAllRolesAndTrustFingerprints()
     {
         using var fixture = new TrustStatusFixture();
@@ -309,6 +505,211 @@ public sealed class SigstoreStatusTests
             result.Data?.Value);
     }
 
+    [Fact]
+    public void CtStatusErrorsCoverComputeProjectionCountAndRecovery()
+    {
+        var shard = new SigstoreCtLogShardHealthStatus(
+            "sha256-" + new string('1', 64),
+            "primary",
+            "active",
+            SigstoreCtLogShard.PrimaryUrl,
+            SigstoreCtLogShard.PrimaryOrigin,
+            SigstoreCtLogShard.PrimaryResourceName,
+            new string('1', 64),
+            new string('1', 64),
+            "state-id",
+            1,
+            1,
+            new string('2', 64),
+            new string('3', 64),
+            true,
+            true,
+            false,
+            new string('4', 64),
+            1,
+            [new string('5', 64)],
+            false);
+        var status = new SigstoreCtLogStatus(
+            shard.ShardId,
+            "primary",
+            SigstoreCtLogShard.PrimaryOrigin,
+            shard.PublicKeySha256,
+            false,
+            null,
+            2,
+            [],
+            [shard],
+            Guid.NewGuid().ToString("N"),
+            SigstoreCtLogShard.StatusWorkerCommitted);
+        var errors = new List<SigstoreStatusError>();
+
+        SigstoreStatusCommand.AppendCtLogStatusErrors(status, errors);
+
+        Assert.Contains(
+            errors,
+            error => error.Message.Contains(
+                "compute resource is not healthy",
+                StringComparison.Ordinal));
+        Assert.Contains(
+            errors,
+            error => error.Message.Contains(
+                "accepted-root projection",
+                StringComparison.Ordinal));
+        Assert.Contains(
+            errors,
+            error => error.Message.Contains(
+                "entry count",
+                StringComparison.Ordinal));
+        Assert.Contains(
+            errors,
+            error => error.Message.Contains(
+                "recovery is pending",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void CtFinalizationIgnoresOnlyItsBoundRecoveryMarkers()
+    {
+        const string operationId = "11111111111111111111111111111111";
+        const string operationStatus = SigstoreCtLogShard.StatusNewShardProved;
+        var secondary = new SigstoreCtLogShardHealthStatus(
+            "sha256-" + new string('1', 64),
+            "secondary",
+            "active",
+            SigstoreCtLogShard.SecondaryUrl,
+            SigstoreCtLogShard.SecondaryOrigin,
+            SigstoreCtLogShard.SecondaryResourceName,
+            new string('1', 64),
+            new string('1', 64),
+            "secondary-state",
+            1,
+            1,
+            new string('2', 64),
+            new string('3', 64),
+            true,
+            true,
+            true,
+            new string('4', 64),
+            1,
+            [new string('5', 64)],
+            true);
+        var primary = secondary with
+        {
+            ShardId = "sha256-" + new string('6', 64),
+            Slot = "primary",
+            Status = "historical",
+            BaseUrl = SigstoreCtLogShard.PrimaryUrl,
+            Origin = SigstoreCtLogShard.PrimaryOrigin,
+            Resource = SigstoreCtLogShard.PrimaryResourceName,
+            PublicKeySha256 = new string('6', 64),
+            LogIdSha256 = new string('6', 64),
+            StateId = "primary-state"
+        };
+        var ctLog = new SigstoreCtLogStatus(
+            secondary.ShardId,
+            "secondary",
+            SigstoreCtLogShard.SecondaryOrigin,
+            secondary.PublicKeySha256,
+            false,
+            null,
+            2,
+            [],
+            [primary, secondary],
+            operationId,
+            operationStatus);
+        var status = new SigstoreAggregateTrustStatus(
+            1,
+            "sigstore",
+            false,
+            "Degraded",
+            "ctlog: recovery pending",
+            DateTimeOffset.UtcNow,
+            null,
+            null,
+            [],
+            [],
+            [
+                new("ctlog", "bound recovery pending"),
+                new("operation", "rotation active")
+            ],
+            Operation: new(
+                SigstoreOperationCommand.RotateCtLogShardCommand,
+                "aggregate-status",
+                25,
+                26,
+                "Finalizing CT log rotation.",
+                DateTimeOffset.UtcNow),
+            Recovery: new(
+                SigstoreOperationCommand.RotateCtLogShardCommand,
+                operationStatus,
+                "Lifecycle Recovery Pending",
+                "The durable journal is not finalized.",
+                DateTimeOffset.UtcNow),
+            CtLog: ctLog);
+
+        Assert.True(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status,
+                operationId,
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status,
+                new string('2', 32),
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status with
+                {
+                    Ready = true,
+                    Errors = [],
+                    Recovery = null,
+                    CtLog = null
+                },
+                operationId,
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status with
+                {
+                    Errors = [new("operation", "rotation active")],
+                    Recovery = null,
+                    CtLog = null
+                },
+                operationId,
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status with
+                {
+                    Errors =
+                    [
+                        .. status.Errors,
+                        new("resources", "required resource is unhealthy")
+                    ]
+                },
+                operationId,
+                operationStatus));
+        Assert.False(
+            SigstoreOperationExecutor.IsReadyForCtLogFinalization(
+                status with
+                {
+                    CtLog = ctLog with
+                    {
+                        Shards =
+                        [
+                            primary,
+                            secondary with
+                            {
+                                ComputeHealthy = false
+                            }
+                        ]
+                    }
+                },
+                operationId,
+                operationStatus));
+    }
+
     private static SigstoreClientTrustStatus NewClientStatus(
         string resource,
         string language) =>
@@ -330,7 +731,8 @@ public sealed class SigstoreStatusTests
 
     internal sealed class TrustStatusFixture : IDisposable
     {
-        public TrustStatusFixture()
+        public TrustStatusFixture(
+            DateTimeOffset? timestampExpiresAtUtc = null)
         {
             Path = System.IO.Path.Combine(
                 System.IO.Path.GetTempPath(),
@@ -546,7 +948,9 @@ public sealed class SigstoreStatusTests
                         {
                             _type = "timestamp",
                             version = 5,
-                            expires = "2030-08-27T00:00:00Z",
+                            expires = timestampExpiresAtUtc
+                                ?? DateTimeOffset.Parse(
+                                    "2030-08-27T00:00:00Z"),
                             meta = new Dictionary<string, object>
                             {
                                 ["snapshot.json"] = new

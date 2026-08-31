@@ -167,12 +167,9 @@ func main() {
 
 	rotationRequest := filepath.Join(statePath, "rotate-root.request")
 	if pathExists(rotationRequest) {
-		action, err := rotateTUFRootKey(statePath)
+		action, err := dispatchTUFRootRotation(statePath, rotationRequest, publicationHooks{})
 		if err != nil {
 			fatalf("%v", err)
-		}
-		if err := os.Remove(rotationRequest); err != nil {
-			fatalf("remove rotation request: %v", err)
 		}
 		fmt.Printf("%s Sigstore TUF repository at %s.\n", action, filepath.Join(statePath, "tuf"))
 		return
@@ -486,15 +483,19 @@ func writePublicTargets(basePath string, targets []tufTarget) error {
 }
 
 func refreshTUFRepository(tufPath string) error {
+	return refreshTUFRepositoryAt(tufPath, time.Now().UTC())
+}
+
+func refreshTUFRepositoryAt(tufPath string, now time.Time) error {
 	store := tuf.FileSystemStore(tufPath, nil)
 	repository, err := tuf.NewRepoIndent(store, "", "  ")
 	if err != nil {
 		return fmt.Errorf("open TUF repository for refresh: %w", err)
 	}
-	if err := repository.SnapshotWithExpires(time.Now().UTC().Add(30 * 24 * time.Hour)); err != nil {
+	if err := repository.SnapshotWithExpires(now.Add(30 * 24 * time.Hour)); err != nil {
 		return fmt.Errorf("refresh TUF snapshot: %w", err)
 	}
-	if err := repository.TimestampWithExpires(time.Now().UTC().Add(24 * time.Hour)); err != nil {
+	if err := repository.TimestampWithExpires(now.Add(24 * time.Hour)); err != nil {
 		return fmt.Errorf("refresh TUF timestamp: %w", err)
 	}
 	if err := repository.Commit(); err != nil {

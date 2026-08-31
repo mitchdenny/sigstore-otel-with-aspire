@@ -116,20 +116,40 @@ internal static class SigstoreParentHealthMonitor
     {
         var presentation = resource.GetPresentation();
         var health = presentation.RuntimeHealth;
+        var metadata = presentation.TufMetadataFreshness;
+        var tufCoherent = presentation.TufRepositoryCoherent;
         var operation = presentation.Operation;
         var recovery = presentation.Recovery;
         var state = operation?.DisplayState
             ?? recovery?.DisplayState
+            ?? (tufCoherent == false ? "Degraded" : null)
+            ?? (metadata is not null && metadata.State != "Current"
+                ? "Degraded"
+                : null)
             ?? health.State;
+        var healthReason = tufCoherent == false
+            ? "Disk and served TUF metadata do not match."
+            : metadata is not null && metadata.State != "Current"
+                ? metadata.Reason
+                : health.Reason;
         var properties = new List<ResourcePropertySnapshot>
         {
             new(
                 "Health reason",
-                health.Reason ?? "All required resources are healthy."),
+                healthReason ?? "All required resources are healthy."),
             new(
                 "Healthy resources",
                 $"{health.HealthyCount}/{health.RequiredCount}")
         };
+        if (metadata is not null)
+        {
+            properties.Add(
+                new("TUF metadata", metadata.State));
+            properties.Add(
+                new(
+                    "Automatic TUF refresh at",
+                    metadata.RefreshAtUtc.ToString("O")));
+        }
 
         if (operation is not null)
         {
@@ -156,12 +176,18 @@ internal static class SigstoreParentHealthMonitor
                     ? KnownResourceStateStyles.Info
                     : recovery is not null
                         ? KnownResourceStateStyles.Warn
-                    : health.State switch
-                    {
-                        "Healthy" => KnownResourceStateStyles.Success,
-                        "Degraded" => KnownResourceStateStyles.Warn,
-                        _ => KnownResourceStateStyles.Info
-                    }),
+                        : tufCoherent == false
+                           || metadata is not null
+                               && metadata.State != "Current"
+                           ? KnownResourceStateStyles.Warn
+                           : health.State switch
+                           {
+                               "Healthy" =>
+                                   KnownResourceStateStyles.Success,
+                               "Degraded" =>
+                                   KnownResourceStateStyles.Warn,
+                               _ => KnownResourceStateStyles.Info
+                           }),
             Properties = [.. properties]
         };
     }
