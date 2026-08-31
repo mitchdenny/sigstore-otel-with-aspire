@@ -222,6 +222,124 @@ public sealed class SigstoreStatusTests
     }
 
     [Fact]
+    public void TufMetadataExpirationDegradesStatusAndParentPresentation()
+    {
+        var now = DateTimeOffset.Parse("2026-08-31T00:00:00Z");
+        using var fixture = new TrustStatusFixture(
+            timestampExpiresAtUtc: now.AddMinutes(-1));
+        var state = SigstoreStatusCommand.ReadTufStateSnapshot(fixture.Path);
+
+        var freshness = SigstoreTufMetadataPolicy.Evaluate(
+            state.Metadata,
+            now);
+        var errors = new List<SigstoreStatusError>();
+        SigstoreStatusCommand.AppendTufMetadataFreshnessErrors(
+            freshness,
+            errors);
+
+        Assert.Equal("Expired", freshness.State);
+        Assert.True(freshness.AutomaticRefreshRequired);
+        Assert.False(freshness.TrustMaintenanceRequired);
+        Assert.Equal(
+            ["root", "targets", "snapshot", "timestamp"],
+            freshness.Roles.Select(role => role.Role));
+        Assert.Equal(
+            "Expired",
+            freshness.Roles.Single(
+                role => role.Role == "timestamp").State);
+        Assert.Contains(
+            errors,
+            error => error.Source == "tuf-expiration"
+                && error.Message.Contains(
+                    "timestamp metadata",
+                    StringComparison.Ordinal));
+
+        var parent = new SigstoreResource(
+            "sigstore",
+            fixture.Path,
+            fixture.Path);
+        parent.SetRuntimeHealth(
+            new SigstoreRuntimeHealthSnapshot(
+                "Healthy",
+                null,
+                [],
+                14,
+                14));
+        parent.SetTufMetadataFreshness(freshness);
+
+        var snapshot = SigstoreParentHealthMonitor.CreateParentSnapshot(
+            parent,
+            new CustomResourceSnapshot
+            {
+                ResourceType = "Sigstore",
+                State = new ResourceStateSnapshot(
+                    "Healthy",
+                    KnownResourceStateStyles.Success),
+                Properties = []
+            });
+
+        Assert.Equal("Degraded", snapshot.State?.Text);
+        Assert.Equal(KnownResourceStateStyles.Warn, snapshot.State?.Style);
+        Assert.Contains(
+            snapshot.Properties,
+            property => property.Name == "TUF metadata"
+                && Equals(property.Value, "Expired"));
+    }
+
+    [Fact]
+    public void TufMetadataNearExpiryDistinguishesRefreshFromMaintenance()
+    {
+        var now = DateTimeOffset.Parse("2026-08-31T00:00:00Z");
+        var current = new SigstoreTufMetadataRoleStatus(
+            1,
+            new string('a', 64),
+            now.AddDays(30));
+        var metadata = new SigstoreTufMetadataStatus(
+            current with
+            {
+                ExpiresAtUtc = now.AddDays(2)
+            },
+            current with
+            {
+                Sha256 = new string('b', 64)
+            },
+            current with
+            {
+                Sha256 = new string('c', 64),
+                ExpiresAtUtc = now.AddHours(5)
+            },
+            current with
+            {
+                Sha256 = new string('d', 64),
+                ExpiresAtUtc = now.AddHours(4)
+            },
+            new string('e', 64),
+            new string('f', 64));
+
+        var freshness = SigstoreTufMetadataPolicy.Evaluate(metadata, now);
+        var errors = new List<SigstoreStatusError>();
+        SigstoreStatusCommand.AppendTufMetadataFreshnessErrors(
+            freshness,
+            errors);
+
+        Assert.Equal("RefreshNeeded", freshness.State);
+        Assert.True(freshness.AutomaticRefreshRequired);
+        Assert.True(freshness.TrustMaintenanceRequired);
+        Assert.Contains(
+            errors,
+            error => error.Source == "tuf-refresh"
+                && error.Message.StartsWith(
+                    "snapshot metadata",
+                    StringComparison.Ordinal));
+        Assert.Contains(
+            errors,
+            error => error.Source == "tuf-maintenance"
+                && error.Message.StartsWith(
+                    "root metadata",
+                    StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void RotationProvenanceRemainsValidAfterLaterGenerations()
     {
         var generation = JsonSerializer.Deserialize<GenerationManifestStatus>(
@@ -613,7 +731,8 @@ public sealed class SigstoreStatusTests
 
     internal sealed class TrustStatusFixture : IDisposable
     {
-        public TrustStatusFixture()
+        public TrustStatusFixture(
+            DateTimeOffset? timestampExpiresAtUtc = null)
         {
             Path = System.IO.Path.Combine(
                 System.IO.Path.GetTempPath(),
@@ -829,7 +948,9 @@ public sealed class SigstoreStatusTests
                         {
                             _type = "timestamp",
                             version = 5,
-                            expires = "2030-08-27T00:00:00Z",
+                            expires = timestampExpiresAtUtc
+                                ?? DateTimeOffset.Parse(
+                                    "2030-08-27T00:00:00Z"),
                             meta = new Dictionary<string, object>
                             {
                                 ["snapshot.json"] = new

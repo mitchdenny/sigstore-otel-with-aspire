@@ -189,6 +189,63 @@ func TestMetadataRefreshPublishesAtomicallyAndRetainsPrevious(t *testing.T) {
 	assertCommittedLayout(t, statePath)
 }
 
+func TestMetadataRefreshRecoversExpiredSnapshotAndTimestamp(t *testing.T) {
+	repositoryPath := t.TempDir()
+	if err := createTUFRepository(
+		repositoryPath,
+		[]tufTarget{{name: "test.json", data: []byte("{}")}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	expiredSnapshot := readTestMetadata(
+		t,
+		filepath.Join(repositoryPath, "repository", "snapshot.json"),
+	)
+	expiredTimestamp := readTestMetadata(
+		t,
+		filepath.Join(repositoryPath, "repository", "timestamp.json"),
+	)
+	now := expiredSnapshot.Expires.Add(time.Hour)
+	if !expiredSnapshot.Expires.Before(now) || !expiredTimestamp.Expires.Before(now) {
+		t.Fatalf(
+			"test metadata did not expire: snapshot=%s timestamp=%s now=%s",
+			expiredSnapshot.Expires,
+			expiredTimestamp.Expires,
+			now,
+		)
+	}
+
+	if err := refreshTUFRepositoryAt(repositoryPath, now); err != nil {
+		t.Fatal(err)
+	}
+	refreshedSnapshot := readTestMetadata(
+		t,
+		filepath.Join(repositoryPath, "repository", "snapshot.json"),
+	)
+	refreshedTimestamp := readTestMetadata(
+		t,
+		filepath.Join(repositoryPath, "repository", "timestamp.json"),
+	)
+	if refreshedSnapshot.Version != expiredSnapshot.Version+1 ||
+		refreshedTimestamp.Version != expiredTimestamp.Version+1 {
+		t.Fatalf(
+			"versions after recovery = snapshot %d timestamp %d, want %d/%d",
+			refreshedSnapshot.Version,
+			refreshedTimestamp.Version,
+			expiredSnapshot.Version+1,
+			expiredTimestamp.Version+1,
+		)
+	}
+	if !refreshedSnapshot.Expires.After(now) || !refreshedTimestamp.Expires.After(now) {
+		t.Fatalf(
+			"refresh did not restore current metadata: snapshot=%s timestamp=%s",
+			refreshedSnapshot.Expires,
+			refreshedTimestamp.Expires,
+		)
+	}
+}
+
 func TestImmutableBootstrapRootIsNotReplaced(t *testing.T) {
 	statePath := newTestState(t)
 	if _, err := ensureTUFRepository(statePath); err != nil {
@@ -878,6 +935,7 @@ func TestRotationRequestSignalFileIsConsumed(t *testing.T) {
 type testMetadata struct {
 	Version int
 	Hash    string
+	Expires time.Time
 }
 
 func readTestMetadata(t *testing.T, path string) testMetadata {
@@ -885,7 +943,8 @@ func readTestMetadata(t *testing.T, path string) testMetadata {
 	data := readTestFile(t, path)
 	var envelope struct {
 		Signed struct {
-			Version int `json:"version"`
+			Version int       `json:"version"`
+			Expires time.Time `json:"expires"`
 		} `json:"signed"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
@@ -895,6 +954,7 @@ func readTestMetadata(t *testing.T, path string) testMetadata {
 	return testMetadata{
 		Version: envelope.Signed.Version,
 		Hash:    hex.EncodeToString(sum[:]),
+		Expires: envelope.Signed.Expires,
 	}
 }
 

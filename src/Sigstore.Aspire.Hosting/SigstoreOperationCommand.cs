@@ -46,7 +46,7 @@ internal static class SigstoreOperationCommand
                 "TUF server must remain unchanged.",
             IconName = "ArrowSync",
             IconVariant = IconVariant.Regular,
-            UpdateState = _ => GetMutationCommandState(resource),
+            UpdateState = _ => GetRefreshTufCommandState(resource),
             Progress = new CommandProgressOptions
             {
                 Title = "Refresh TUF metadata",
@@ -92,7 +92,7 @@ internal static class SigstoreOperationCommand
                 "and committed trust state will not be restarted or changed.",
             IconName = "ArrowCounterclockwise",
             IconVariant = IconVariant.Regular,
-            UpdateState = _ => GetMutationCommandState(resource),
+            UpdateState = _ => GetRestartClientsCommandState(resource),
             Progress = new CommandProgressOptions
             {
                 Title = "Restart Sigstore clients",
@@ -207,9 +207,66 @@ internal static class SigstoreOperationCommand
         return presentation.Operation is null
             && presentation.Recovery is null
             && presentation.RuntimeHealth.State == "Healthy"
+            && IsFreshMutationReady(presentation)
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
+
+    internal static ResourceCommandState GetRefreshTufCommandState(
+        SigstoreResource resource)
+    {
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
+        return presentation.Operation is null
+            && presentation.Recovery is null
+            && HasHealthyInfrastructure(resource)
+            && presentation.TufRepositoryCoherent == true
+            && presentation.TufMetadataFreshness is { } freshness
+            && freshness.Roles
+                .Where(role => role.Role is "root" or "targets")
+                .All(role => role.State != "Expired")
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
+    internal static ResourceCommandState GetRestartClientsCommandState(
+        SigstoreResource resource)
+    {
+        var presentation = RefreshRecoveryAndGetPresentation(resource);
+        return presentation.Operation is null
+            && presentation.Recovery is null
+            && HasHealthyInfrastructure(resource)
+            && IsTufRootMaintenanceReady(presentation)
+                ? ResourceCommandState.Enabled
+                : ResourceCommandState.Disabled;
+    }
+
+    internal static bool HasHealthyInfrastructure(SigstoreResource resource)
+    {
+        var registrations = resource.GetRegistrations();
+        var clients = registrations.Clients
+            .Select(client => client.Resource.Name)
+            .ToHashSet(StringComparer.Ordinal);
+        var health = resource.GetRuntimeHealth();
+        return health.State != "Starting"
+            && health.Resources
+            .Where(status => !clients.Contains(status.Resource))
+            .All(status => status.State == KnownResourceStates.Running
+                && status.Health == "Healthy");
+    }
+
+    private static bool IsFreshMutationReady(
+        SigstoreParentPresentationSnapshot presentation) =>
+        presentation.TufRepositoryCoherent == true
+        && presentation.TufMetadataFreshness?.State == "Current";
+
+    private static bool IsTufRootMaintenanceReady(
+        SigstoreParentPresentationSnapshot presentation) =>
+        presentation.TufRepositoryCoherent == true
+        && presentation.TufMetadataFreshness is { } freshness
+        && freshness.Roles.All(
+            role => role.Role is "root" or "targets"
+                ? role.State != "Expired"
+                : role.State == "Current");
 
     internal static ResourceCommandState
         GetTufRootRotationCommandState(
@@ -218,8 +275,9 @@ internal static class SigstoreOperationCommand
         var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
-            && (presentation.Recovery is null
-                || presentation.Recovery.Command == RotateTufRootCommand)
+            && (presentation.Recovery?.Command == RotateTufRootCommand
+                || presentation.Recovery is null
+                    && IsTufRootMaintenanceReady(presentation))
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
@@ -231,9 +289,10 @@ internal static class SigstoreOperationCommand
         var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
-            && (presentation.Recovery is null
-                || presentation.Recovery.Command
-                    == RotateOidcSigningKeyCommand)
+            && (presentation.Recovery?.Command
+                    == RotateOidcSigningKeyCommand
+                || presentation.Recovery is null
+                    && IsFreshMutationReady(presentation))
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
@@ -245,8 +304,9 @@ internal static class SigstoreOperationCommand
         var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
-            && (presentation.Recovery is null
-                || presentation.Recovery.Command == PublishTrustedRootCommand)
+            && (presentation.Recovery?.Command == PublishTrustedRootCommand
+                || presentation.Recovery is null
+                    && IsFreshMutationReady(presentation))
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
@@ -258,9 +318,10 @@ internal static class SigstoreOperationCommand
         var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
-            && (presentation.Recovery is null
-                || presentation.Recovery.Command
-                    == RotateTimestampAuthorityCommand)
+            && (presentation.Recovery?.Command
+                    == RotateTimestampAuthorityCommand
+                || presentation.Recovery is null
+                    && IsFreshMutationReady(presentation))
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
@@ -271,8 +332,9 @@ internal static class SigstoreOperationCommand
         var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
-            && (presentation.Recovery is null
-                || presentation.Recovery.Command == RotateFulcioCaCommand)
+            && (presentation.Recovery?.Command == RotateFulcioCaCommand
+                || presentation.Recovery is null
+                    && IsFreshMutationReady(presentation))
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
@@ -283,9 +345,9 @@ internal static class SigstoreOperationCommand
         var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
-            && (presentation.Recovery is null
-                || presentation.Recovery.Command
-                   == RotateRekorShardCommand)
+            && (presentation.Recovery?.Command == RotateRekorShardCommand
+                || presentation.Recovery is null
+                    && IsFreshMutationReady(presentation))
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
@@ -296,9 +358,9 @@ internal static class SigstoreOperationCommand
         var presentation = RefreshRecoveryAndGetPresentation(resource);
         return presentation.Operation is null
             && presentation.RuntimeHealth.State == "Healthy"
-            && (presentation.Recovery is null
-                || presentation.Recovery.Command
-                   == RotateCtLogShardCommand)
+            && (presentation.Recovery?.Command == RotateCtLogShardCommand
+                || presentation.Recovery is null
+                    && IsFreshMutationReady(presentation))
                 ? ResourceCommandState.Enabled
                 : ResourceCommandState.Disabled;
     }
@@ -4662,7 +4724,7 @@ internal sealed partial class SigstoreOperationExecutor(
             "dashboard-refresh-tuf-preflight"))
         {
             requestCancellationToken.ThrowIfCancellationRequested();
-            if (!await ValidatePreconditionsAsync(
+            if (!await ValidateRefreshPreconditionsAsync(
                     execution,
                     requestCancellationToken))
             {
@@ -4675,7 +4737,8 @@ internal sealed partial class SigstoreOperationExecutor(
             if (!ValidateCapture(
                     execution,
                     "preflight",
-                    before))
+                    before,
+                    allowExpiredRefreshableMetadata: true))
             {
                 return execution.Failure(
                     "The current TUF repository is not internally consistent.");
@@ -4811,8 +4874,8 @@ internal sealed partial class SigstoreOperationExecutor(
                 postconditionToken.Token);
             execution.Check(
                 "aggregate-status-ready",
-                IsReadyForActiveOperation(aggregate),
-                "ready=true with no status errors",
+                IsReadyForTufRefresh(aggregate, resource),
+                "coherent TUF and healthy infrastructure; client failures allowed",
                 aggregate.Reason ?? "ready",
                 "aggregate-status",
                 resource.Name);
@@ -4869,7 +4932,7 @@ internal sealed partial class SigstoreOperationExecutor(
                 resource.StatePath);
             if (incomplete is null)
             {
-                if (!await ValidatePreconditionsAsync(
+                if (!await ValidateTufRootRotationPreconditionsAsync(
                         execution,
                         requestCancellationToken))
                 {
@@ -5407,11 +5470,18 @@ internal sealed partial class SigstoreOperationExecutor(
         foreach (var client in clients)
         {
             var clientBefore = runtime.GetRequiredSnapshot(client.Resource);
+            var clientCommand =
+                clientBefore.State == KnownResourceStates.Running
+                ? KnownResourceCommands.RestartCommand
+                : IsTerminal(clientBefore)
+                    ? KnownResourceCommands.StartCommand
+                    : null;
             if (!execution.Check(
                     $"{client.Resource.Name}-ready",
-                    IsRunningHealthy(clientBefore)
-                        && HasContainerIdentity(clientBefore),
-                    "Running/Healthy with a container identity",
+                    clientCommand is not null
+                        && (clientCommand == KnownResourceCommands.StartCommand
+                            || HasContainerIdentity(clientBefore)),
+                    "Running with an instance for restart or terminal for start",
                     Describe(clientBefore),
                     "restart-client",
                     client.Resource.Name))
@@ -5428,7 +5498,7 @@ internal sealed partial class SigstoreOperationExecutor(
                 $"Restarting {client.Resource.Name}.");
             var restart = await runtime.ExecuteCommandAsync(
                 client.Resource,
-                KnownResourceCommands.RestartCommand,
+                clientCommand!,
                 critical.Token);
             if (!restart.Success)
             {
@@ -5449,7 +5519,9 @@ internal sealed partial class SigstoreOperationExecutor(
             {
                 clientAfter = await runtime.WaitForSnapshotAsync(
                     client.Resource,
-                    snapshot => IsNewInstance(clientBefore, snapshot)
+                    snapshot => IsReplacementInstance(
+                            clientBefore,
+                            snapshot)
                         && IsRunningHealthy(snapshot),
                     ClientTimeout,
                     critical.Token);
@@ -5487,7 +5559,7 @@ internal sealed partial class SigstoreOperationExecutor(
             execution.Resources.Add(
                 CreateLifecycleResult(
                     client.Resource.Name,
-                    KnownResourceCommands.RestartCommand,
+                    clientCommand!,
                     clientBefore,
                     clientAfter,
                     trustStatus));
@@ -5505,9 +5577,9 @@ internal sealed partial class SigstoreOperationExecutor(
         var aggregate = await runtime.CollectStatusAsync(critical.Token);
         execution.Check(
             "aggregate-status-ready",
-            IsReadyForActiveOperation(aggregate)
-                && aggregate.Clients.Count == clients.Length,
-            $"ready=true and {clients.Length} clients",
+            IsReadyForCompletedClientRestart(aggregate, resource),
+            $"{clients.Length} current clients with only the active operation " +
+                "and unexpired TUF maintenance warnings",
             aggregate.Reason
                 ?? $"ready={aggregate.Ready}, clients={aggregate.Clients.Count}",
             "aggregate-status",
@@ -5605,13 +5677,33 @@ internal sealed partial class SigstoreOperationExecutor(
             resource.Name);
     }
 
-    /// <summary>
-    /// Validates preconditions for restart-clients. Accepts stale
-    /// tufRootVersion/tufTargetsVersion on clients (valid after root
-    /// rotation - clients will catch up on restart). Rejects all other
-    /// trust mismatches (domain, generation, trusted-root, signing-config).
-    /// </summary>
-    private async Task<bool> ValidateRestartPreconditionsAsync(
+    private async Task<bool> ValidateRefreshPreconditionsAsync(
+        OperationExecution execution,
+        CancellationToken cancellationToken)
+    {
+        var infrastructureHealthy = execution.Check(
+            "parent-infrastructure-healthy",
+            SigstoreOperationCommand.HasHealthyInfrastructure(resource),
+            "all required non-client resources Running/Healthy",
+            resource.GetRuntimeHealth().Reason ?? "Healthy",
+            "preflight",
+            resource.Name);
+        if (!infrastructureHealthy)
+        {
+            return false;
+        }
+
+        var status = await runtime.CollectStatusAsync(cancellationToken);
+        return execution.Check(
+            "tuf-refresh-status-safe",
+            IsReadyForTufRefresh(status, resource),
+            "coherent TUF and healthy infrastructure; client failures allowed",
+            status.Reason ?? "ready",
+            "preflight",
+            resource.Name);
+    }
+
+    private async Task<bool> ValidateTufRootRotationPreconditionsAsync(
         OperationExecution execution,
         CancellationToken cancellationToken)
     {
@@ -5629,50 +5721,70 @@ internal sealed partial class SigstoreOperationExecutor(
         }
 
         var status = await runtime.CollectStatusAsync(cancellationToken);
-        if (IsReadyForActiveOperation(status))
+        var maintenanceSafe = status.Disk is not null
+            && status.Served is not null
+            && status.TufMetadataFreshness is { } freshness
+            && MatchesServed(status.Disk, status.Served)
+            && freshness.Roles.All(
+                role => role.Role is "root" or "targets"
+                    ? role.State != "Expired"
+                    : role.State == "Current")
+            && status.Errors.All(
+                error => error.Source == "tuf-maintenance"
+                    || error.Source == "operation"
+                        && (status.Operation is null
+                            || status.Operation.Command
+                                == SigstoreOperationCommand
+                                    .RotateTufRootCommand));
+        return execution.Check(
+            "tuf-root-maintenance-status-safe",
+            maintenanceSafe,
+            "coherent, unexpired root/targets with current clients and " +
+                "snapshot/timestamp metadata",
+            status.Reason ?? "ready",
+            "preflight",
+            resource.Name);
+    }
+
+    /// <summary>
+    /// Validates preconditions for restart-clients. Accepts stale
+    /// tufRootVersion/tufTargetsVersion on clients (valid after root
+    /// rotation - clients will catch up on restart). Rejects all other
+    /// trust mismatches (domain, generation, trusted-root, signing-config).
+    /// </summary>
+    private async Task<bool> ValidateRestartPreconditionsAsync(
+        OperationExecution execution,
+        CancellationToken cancellationToken)
+    {
+        var infrastructureHealthy = execution.Check(
+            "parent-infrastructure-healthy",
+            SigstoreOperationCommand.HasHealthyInfrastructure(resource),
+            "all required non-client resources Running/Healthy",
+            resource.GetRuntimeHealth().Reason ?? "Healthy",
+            "preflight",
+            resource.Name);
+        if (!infrastructureHealthy)
+        {
+            return false;
+        }
+
+        var status = await runtime.CollectStatusAsync(cancellationToken);
+        if (IsReadyForClientRestart(status, resource))
         {
             return execution.Check(
                 "trust-status-ready",
                 true,
-                "ready=true with no status errors",
-                "ready",
+                "coherent current TUF with only recoverable client errors",
+                status.Reason ?? "ready",
                 "preflight",
                 resource.Name);
         }
 
-        // After root rotation, clients may report stale tufRootVersion
-        // and/or tufTargetsVersion until restarted. This is the valid
-        // state that restart-clients is designed to resolve. Reject any
-        // errors about domain, generation, trusted-root, or signing-config.
-        var unsafeErrors = status.Errors
-            .Where(error =>
-                error.Source != "operation"
-                && !error.Message.StartsWith(
-                    "tufRootVersion",
-                    StringComparison.Ordinal)
-                && !error.Message.StartsWith(
-                    "tufTargetsVersion",
-                    StringComparison.Ordinal))
-            .ToArray();
-
-        if (unsafeErrors.Length != 0)
-        {
-            return execution.Check(
-                "trust-status-ready",
-                false,
-                "only stale root/targets version errors (post-rotation)",
-                $"{unsafeErrors[0].Source}: {unsafeErrors[0].Message}",
-                "preflight",
-                resource.Name);
-        }
-
-        // All errors are stale root/targets versions - acceptable for
-        // restart-clients as it will resolve them.
         return execution.Check(
-            "trust-status-stale-root-acceptable",
-            true,
-            "clients have stale root/targets version (will converge on restart)",
-            status.Reason ?? "stale root version",
+            "trust-status-ready",
+            false,
+            "coherent current TUF with only recoverable client errors",
+            status.Reason ?? "unsafe client restart state",
             "preflight",
             resource.Name);
     }
@@ -5727,7 +5839,8 @@ internal sealed partial class SigstoreOperationExecutor(
     private static bool ValidateCapture(
         OperationExecution execution,
         string phase,
-        SigstoreOperationSnapshot snapshot)
+        SigstoreOperationSnapshot snapshot,
+        bool allowExpiredRefreshableMetadata = false)
     {
         var consistent = execution.Check(
             $"{phase}-disk-served",
@@ -5749,11 +5862,14 @@ internal sealed partial class SigstoreOperationExecutor(
             snapshot.Tuf.Metadata.Root.ExpiresAtUtc > DateTimeOffset.UtcNow
                 && snapshot.Tuf.Metadata.Targets.ExpiresAtUtc
                     > DateTimeOffset.UtcNow
-                && snapshot.Tuf.Metadata.Snapshot.ExpiresAtUtc
-                    > DateTimeOffset.UtcNow
-                && snapshot.Tuf.Metadata.Timestamp.ExpiresAtUtc
-                    > DateTimeOffset.UtcNow,
-            "all four metadata roles unexpired",
+                && (allowExpiredRefreshableMetadata
+                    || snapshot.Tuf.Metadata.Snapshot.ExpiresAtUtc
+                        > DateTimeOffset.UtcNow
+                    && snapshot.Tuf.Metadata.Timestamp.ExpiresAtUtc
+                        > DateTimeOffset.UtcNow),
+            allowExpiredRefreshableMetadata
+                ? "root and targets metadata unexpired; snapshot/timestamp may be renewed"
+                : "all four metadata roles unexpired",
             Describe(snapshot.Tuf.Metadata),
             phase,
             snapshot.TufServer.Resource);
@@ -6212,6 +6328,158 @@ internal sealed partial class SigstoreOperationExecutor(
             && status.Errors.Count == 1
             && status.Errors[0].Source == "operation";
 
+    internal static bool IsReadyForTufRefresh(
+        SigstoreAggregateTrustStatus status,
+        SigstoreResource resource)
+    {
+        if (status.Disk is null
+            || status.Served is null
+            || status.TufMetadata is null
+            || status.TufMetadataFreshness is not { } freshness
+            || freshness.Roles
+                .Where(role => role.Role is "root" or "targets")
+                .Any(role => role.State == "Expired")
+            || !MatchesServed(status.Disk, status.Served))
+        {
+            return false;
+        }
+
+        var clients = resource.GetRegistrations().Clients
+            .Select(client => client.Resource.Name)
+            .ToHashSet(StringComparer.Ordinal);
+        var infrastructureFailure = status.RequiredResources.Any(
+            required => !clients.Contains(required.Resource)
+                && (required.State != KnownResourceStates.Running
+                    || required.Health != "Healthy"));
+        if (infrastructureFailure)
+        {
+            return false;
+        }
+
+        return status.Errors.All(
+            error => clients.Contains(error.Source)
+                || error.Source is
+                    "tuf-expiration" or "tuf-refresh" or "tuf-maintenance"
+                || error.Source == "resources"
+                    && status.RequiredResources
+                        .Where(
+                            required =>
+                                required.State != KnownResourceStates.Running
+                                || required.Health != "Healthy")
+                        .All(
+                            required => clients.Contains(required.Resource))
+                || error.Source == "operation"
+                    && (status.Operation is null
+                        || status.Operation.Command
+                            == SigstoreOperationCommand.RefreshTufCommand));
+    }
+
+    internal static bool IsReadyForClientRestart(
+        SigstoreAggregateTrustStatus status,
+        SigstoreResource resource)
+    {
+        if (status.Disk is null
+            || status.Served is null
+            || status.TufMetadata is null
+            || status.TufMetadataFreshness is not { } freshness
+            || freshness.Roles.Any(
+                role => role.Role is "root" or "targets"
+                    ? role.State == "Expired"
+                    : role.State != "Current")
+            || !MatchesServed(status.Disk, status.Served))
+        {
+            return false;
+        }
+
+        var clients = resource.GetRegistrations().Clients
+            .Select(client => client.Resource.Name)
+            .ToHashSet(StringComparer.Ordinal);
+        if (status.RequiredResources.Any(
+                required => !clients.Contains(required.Resource)
+                    && (required.State != KnownResourceStates.Running
+                        || required.Health != "Healthy")))
+        {
+            return false;
+        }
+
+        return status.Errors.All(
+            error =>
+            {
+                if (error.Source == "operation")
+                {
+                    return status.Operation is null
+                        || status.Operation.Command
+                            == SigstoreOperationCommand.RestartClientsCommand;
+                }
+                if (error.Source == "resources")
+                {
+                    return status.RequiredResources
+                        .Where(
+                            required =>
+                                required.State != KnownResourceStates.Running
+                                || required.Health != "Healthy")
+                        .All(
+                            required => clients.Contains(required.Resource));
+                }
+                if (error.Source == "tuf-maintenance")
+                {
+                    return true;
+                }
+                if (!clients.Contains(error.Source))
+                {
+                    return false;
+                }
+
+                var reported = status.Clients.Any(
+                    client => client.Resource == error.Source);
+                return !reported
+                    || error.Message.StartsWith(
+                        "tufRootVersion",
+                        StringComparison.Ordinal)
+                    || error.Message.StartsWith(
+                        "tufTargetsVersion",
+                        StringComparison.Ordinal);
+            });
+    }
+
+    private static bool IsReadyForCompletedClientRestart(
+        SigstoreAggregateTrustStatus status,
+        SigstoreResource resource)
+    {
+        var registrations = resource.GetRegistrations().Clients;
+        return status.Disk is { } disk
+            && status.Served is { } served
+            && MatchesServed(disk, served)
+            && status.TufMetadataFreshness is { } freshness
+            && freshness.Roles.All(
+                role => role.Role is "root" or "targets"
+                    ? role.State != "Expired"
+                    : role.State == "Current")
+            && status.RequiredResources.All(
+                required => required.State == KnownResourceStates.Running
+                    && required.Health == "Healthy")
+            && status.Clients.Count == registrations.Count
+            && status.Clients.All(client => MatchesDisk(disk, client))
+            && status.Errors.All(
+                error => error.Source == "tuf-maintenance"
+                    || error.Source == "operation"
+                        && status.Operation?.Command
+                            == SigstoreOperationCommand.RestartClientsCommand);
+    }
+
+    private static bool MatchesServed(
+        SigstoreDiskTrustStatus disk,
+        SigstoreServedTrustStatus served) =>
+        disk.TrustDomainId == served.TrustDomainId
+        && disk.Generation == served.Generation
+        && disk.GenerationId == served.GenerationId
+        && disk.GenerationManifestSha256
+            == served.GenerationManifestSha256
+        && disk.TufRootVersion == served.TufRootVersion
+        && disk.TufTargetsVersion == served.TufTargetsVersion
+        && disk.TrustedRootSha256 == served.TrustedRootSha256
+        && disk.SigningConfigSha256 == served.SigningConfigSha256;
+
     internal static bool HasContainerIdentity(
         SigstoreResourceInstanceSnapshot snapshot) =>
         !string.IsNullOrWhiteSpace(snapshot.ContainerId);
@@ -6222,6 +6490,15 @@ internal sealed partial class SigstoreOperationExecutor(
         HasContainerIdentity(before)
         && HasContainerIdentity(after)
         && before.ContainerId != after.ContainerId
+        && (before.StartTimeUtc is null
+            || after.StartTimeUtc > before.StartTimeUtc);
+
+    internal static bool IsReplacementInstance(
+        SigstoreResourceInstanceSnapshot before,
+        SigstoreResourceInstanceSnapshot after) =>
+        HasContainerIdentity(after)
+        && (string.IsNullOrWhiteSpace(before.ContainerId)
+            || before.ContainerId != after.ContainerId)
         && (before.StartTimeUtc is null
             || after.StartTimeUtc > before.StartTimeUtc);
 

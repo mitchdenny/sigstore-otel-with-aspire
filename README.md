@@ -411,10 +411,12 @@ and tile reads through nginx are the retention contract if it is stopped.
 The historical primary certificate-transparency shard is deliberately
 different: it has no separate static route, so its compute stays running and
 health-required after a CT shard rotation and stopping it degrades the parent.
-The parent shows **Healthy** only when
-every active required resource is running and healthy, **Starting** while
-initial readiness is pending, and **Degraded** with the first definitive
-reason when an active required resource stops or becomes unhealthy.
+The parent shows **Healthy** only when every active required resource is
+running and healthy and disk and served TUF metadata agree and are current.
+It shows **Starting** while initial readiness is pending, and **Degraded** with
+the first definitive reason when an active required resource stops or becomes
+unhealthy, required TUF metadata expires or approaches its refresh boundary,
+or disk and served TUF metadata diverge.
 
 ## Dashboard operations
 
@@ -435,16 +437,39 @@ aspire resource sigstore rotate-ct-log-shard | jq
 
 `refresh-tuf` starts a new instance of the existing `tuf-bootstrap` one-shot
 through Aspire's `ResourceCommandService`. It refreshes only signed snapshot and
-timestamp metadata, waits for the worker to exit successfully, and validates the
-publication journal, active manifest, one-entry history, served bytes, all client
-status contracts, and the unchanged TUF nginx container before succeeding. Its
-JSON result includes exact before/after versions and SHA-256 values for root,
-targets, snapshot, and timestamp metadata, plus publication and manifest IDs.
-Root, targets, TUF keys, public trust targets, the active trust generation, and
-the immutable bootstrap root must remain unchanged.
+timestamp metadata, waits for an exact exit code of zero, and validates the
+publication journal, active manifest, one-entry history, served bytes, and the
+unchanged TUF nginx container before succeeding. Its JSON result includes exact
+before/after versions and SHA-256 values for root, targets, snapshot, and
+timestamp metadata, plus publication and manifest IDs. Root, targets, TUF keys,
+public trust targets, the active trust generation, and the immutable bootstrap
+root must remain unchanged.
 
-`restart-clients` uses `ResourceCommandService` to restart the six client
-containers in deterministic resource-name order. It waits for every replacement
+The parent also performs this same transactional operation automatically: once
+after a five-minute startup stabilization period for an untouched version-1
+repository, then whenever snapshot or timestamp metadata enters its six-hour
+refresh window. It uses the normal command gate, shared `state.lock`,
+operation-bound request/completion files, and one-shot worker; it never edits
+served metadata directly. Another operation, durable recovery, lock contention,
+unhealthy required infrastructure, or a disk/served mismatch defers the attempt
+and retries. Root and targets approaching expiration are reported as maintenance, not
+silently rotated. Use `rotate-tuf-root` before either expires; that command
+accepts the maintenance warning while still requiring current
+snapshot/timestamp metadata, coherent disk/served state, and healthy clients.
+If snapshot/timestamp refresh overlaps that maintenance window, `refresh-tuf`
+remains safe while root and targets are unexpired; refresh first, then rotate
+the root. `restart-clients` also remains available in that window if a client
+must be recovered between those operations.
+
+`refresh-tuf` remains available when one or more clients are Exited or cannot
+start because snapshot or timestamp metadata expired. Its recovery preconditions
+still require coherent trusted state, current root and targets, and healthy
+non-client infrastructure. After a successful refresh, use `restart-clients` or
+start an individual terminal client. Other trust mutations remain fail-closed
+until metadata and clients are current.
+
+`restart-clients` uses `ResourceCommandService` to restart running clients and
+start terminal clients in deterministic resource-name order. It waits for every replacement
 container to become **Running** and **Healthy**, then requires a valid current
 `/trust/status` response that agrees with disk and served trust state. Sigstore
 services are not restarted, and the complete committed trust/TUF state must be
@@ -979,6 +1004,23 @@ artifact zero, rewrites a bundle, or uses public Sigstore. When it occurs,
 the affected Python sequential worker reports it and the same retained bundle
 is submitted only to the existing generation-pinned targeted Python verifier.
 Its real success or parser failure is disclosed in the evidence.
+
+### Unattended operation
+
+Client retry loops tolerate clock jumps across suspend. In particular, the
+Python producer catches only sigstore-python's `ExpiredCertificate` and
+`ExpiredIdentity` signing-attempt failures, abandons that attempt, and obtains a
+new identity token and signer on the next attempt. Signer-local certificate
+caching remains enabled; bundle serialization is unchanged.
+
+The regression was found after a 954-second host sleep crossed the Python
+signer's ten-minute leaf lifetime, and again after the served timestamp expired
+while the AppHost remained unattended. Deterministic tests inject both Python
+expiry exceptions and prove the producer survives and succeeds on its next
+attempt. Hosting tests advance a test clock through TUF expiry, prove automatic
+transactional refresh and contention/recovery deferral, verify an exit-code-zero
+one-shot is accepted, keep `refresh-tuf` available with an Exited client, and
+restore aggregate Healthy status after refresh plus client restart.
 
 ### Complete-run evidence
 

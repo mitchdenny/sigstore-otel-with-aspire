@@ -1,4 +1,5 @@
 using Aspire.Hosting.ApplicationModel;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Aspire.Hosting;
 
@@ -193,6 +194,27 @@ public static class SigstoreResourceBuilderExtensions
                    _ = Task.Run(
                        () => SigstoreParentHealthMonitor.RunAsync(
                            resource,
+                           context.Notifications,
+                           cancellationToken),
+                       cancellationToken);
+                   var runtime = new AspireSigstoreOperationRuntime(
+                       resource,
+                       context.Services);
+                   var refreshMonitor = new SigstoreTufRefreshMonitor(
+                       resource,
+                       new SigstoreFileStateInspector(),
+                       new SigstoreTufRefreshOperation(
+                           new SigstoreOperationExecutor(
+                               resource,
+                               runtime,
+                               new SigstoreFileStateInspector(),
+                               context.Logger)),
+                       runtime.ReadServedTufStateAsync,
+                       context.Services.GetService<TimeProvider>()
+                           ?? TimeProvider.System,
+                       context.Logger);
+                   _ = Task.Run(
+                       () => refreshMonitor.RunAsync(
                            context.Notifications,
                            cancellationToken),
                        cancellationToken);

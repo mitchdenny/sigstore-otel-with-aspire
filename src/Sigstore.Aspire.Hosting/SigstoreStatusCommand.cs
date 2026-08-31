@@ -58,6 +58,20 @@ public sealed record SigstoreTufMetadataStatus(
     string TrustedRootSha256,
     string SigningConfigSha256);
 
+public sealed record SigstoreTufMetadataRoleFreshnessStatus(
+    string Role,
+    string State,
+    DateTimeOffset ExpiresAtUtc,
+    long RemainingSeconds);
+
+public sealed record SigstoreTufMetadataFreshnessStatus(
+    string State,
+    string? Reason,
+    DateTimeOffset RefreshAtUtc,
+    bool AutomaticRefreshRequired,
+    bool TrustMaintenanceRequired,
+    IReadOnlyList<SigstoreTufMetadataRoleFreshnessStatus> Roles);
+
 public sealed record SigstoreTufStateSnapshot(
     SigstoreDiskTrustStatus Trust,
     SigstoreTufMetadataStatus Metadata,
@@ -128,7 +142,16 @@ public sealed record SigstoreAggregateTrustStatus(
     SigstoreRecoveryStatus? Recovery = null,
     SigstoreFulcioStatus? Fulcio = null,
     SigstoreRekorStatus? Rekor = null,
-    SigstoreCtLogStatus? CtLog = null);
+    SigstoreCtLogStatus? CtLog = null)
+{
+    public SigstoreTufMetadataStatus? TufMetadata { get; init; }
+
+    public SigstoreTufMetadataFreshnessStatus? TufMetadataFreshness
+    {
+        get;
+        init;
+    }
+}
 
 internal sealed record PublishedTrustStatus(
     int SchemaVersion,
@@ -323,6 +346,7 @@ internal static class SigstoreStatusCommand
     {
         var status = await CollectAsync(
             resource,
+            TimeProvider.System,
             context.CancellationToken);
         var json = JsonSerializer.Serialize(status, JsonOptions);
         return CreateResult(status, json);
@@ -347,13 +371,25 @@ internal static class SigstoreStatusCommand
 
     internal static async Task<SigstoreAggregateTrustStatus> CollectAsync(
         SigstoreResource resource,
+        CancellationToken cancellationToken) =>
+        await CollectAsync(
+            resource,
+            TimeProvider.System,
+            cancellationToken);
+
+    internal static async Task<SigstoreAggregateTrustStatus> CollectAsync(
+        SigstoreResource resource,
+        TimeProvider timeProvider,
         CancellationToken cancellationToken)
     {
         var registrations = resource.GetRegistrations();
         var runtime = resource.GetRuntimeHealth();
         var errors = new List<SigstoreStatusError>();
+        SigstoreTufStateSnapshot? diskTuf = null;
+        SigstoreServedTufSnapshot? servedTuf = null;
         SigstoreDiskTrustStatus? disk = null;
         SigstoreServedTrustStatus? served = null;
+        SigstoreTufMetadataFreshnessStatus? tufMetadataFreshness = null;
         SigstoreTimestampAuthorityStatus? timestampAuthority = null;
         SigstoreFulcioStatus? fulcio = null;
         SigstoreRekorStatus? rekor = null;
@@ -361,7 +397,8 @@ internal static class SigstoreStatusCommand
 
         try
         {
-            disk = ReadDiskStatus(resource.StatePath);
+            diskTuf = ReadTufStateSnapshot(resource.StatePath);
+            disk = diskTuf.Trust;
         }
         catch (Exception exception)
             when (IsExpectedStatusFailure(exception))
@@ -375,9 +412,10 @@ internal static class SigstoreStatusCommand
                 cancellationToken)
                 ?? throw new SigstoreStatusException(
                     "The TUF endpoint is not allocated.");
-            served = await ReadServedStatusAsync(
+            servedTuf = await ReadServedTufSnapshotAsync(
                 new Uri(endpoint, UriKind.Absolute),
                 cancellationToken);
+            served = servedTuf.Trust;
         }
         catch (Exception exception)
             when (IsExpectedStatusFailure(exception))
@@ -431,6 +469,23 @@ internal static class SigstoreStatusCommand
                 "tuf",
                 disk,
                 served,
+                errors);
+        }
+        if (diskTuf is not null && servedTuf is not null)
+        {
+            AddTufMetadataMismatchErrors(
+                diskTuf.Metadata,
+                servedTuf.Metadata,
+                errors);
+        }
+        var metadata = diskTuf?.Metadata ?? servedTuf?.Metadata;
+        if (metadata is not null)
+        {
+            tufMetadataFreshness = SigstoreTufMetadataPolicy.Evaluate(
+                metadata,
+                timeProvider.GetUtcNow());
+            AppendTufMetadataFreshnessErrors(
+                tufMetadataFreshness,
                 errors);
         }
         if (disk is not null)
@@ -580,13 +635,17 @@ internal static class SigstoreStatusCommand
             }
         }
 
-        if (runtime.State != "Healthy")
+        var unhealthyResource = runtime.Resources.FirstOrDefault(
+            status => status.State != KnownResourceStates.Running
+                || status.Health != "Healthy");
+        if (unhealthyResource is not null)
         {
             errors.Add(
                 new(
                     "resources",
-                    runtime.Reason
-                        ?? $"Parent resource state is {runtime.State}."));
+                    $"{unhealthyResource.Resource} is " +
+                    $"{unhealthyResource.State} " +
+                    $"(health {unhealthyResource.Health})."));
         }
         SigstoreOperationExecutor.RefreshDurableRecoveryState(resource);
         var presentation = resource.GetPresentation();
@@ -645,7 +704,7 @@ internal static class SigstoreStatusCommand
             ready,
             ready ? "Healthy" : "Degraded",
             reason,
-            DateTimeOffset.UtcNow,
+            timeProvider.GetUtcNow(),
             disk,
             served,
             clients,
@@ -671,7 +730,90 @@ internal static class SigstoreStatusCommand
                     recovery.UpdatedAtUtc),
             fulcio,
             rekor,
-            ctLog);
+            ctLog)
+        {
+            TufMetadata = metadata,
+            TufMetadataFreshness = tufMetadataFreshness
+        };
+    }
+
+    internal static void AppendTufMetadataFreshnessErrors(
+        SigstoreTufMetadataFreshnessStatus freshness,
+        ICollection<SigstoreStatusError> errors)
+    {
+        ArgumentNullException.ThrowIfNull(freshness);
+        ArgumentNullException.ThrowIfNull(errors);
+
+        foreach (var role in freshness.Roles
+            .Where(role => role.State != "Current"))
+        {
+            var automatic = role.Role is "snapshot" or "timestamp";
+            var source = role.State == "Expired"
+                ? "tuf-expiration"
+                : automatic
+                    ? "tuf-refresh"
+                    : "tuf-maintenance";
+            var action = automatic
+                ? "refresh-tuf can renew it"
+                : "rotate-tuf-root is required before expiry";
+            errors.Add(
+                new(
+                    source,
+                    $"{role.Role} metadata is {role.State.ToLowerInvariant()} " +
+                    $"at {role.ExpiresAtUtc:O}; {action}."));
+        }
+    }
+
+    private static void AddTufMetadataMismatchErrors(
+        SigstoreTufMetadataStatus disk,
+        SigstoreTufMetadataStatus served,
+        ICollection<SigstoreStatusError> errors)
+    {
+        AddMetadataRoleMismatch("root", disk.Root, served.Root, errors);
+        AddMetadataRoleMismatch(
+            "targets",
+            disk.Targets,
+            served.Targets,
+            errors);
+        AddMetadataRoleMismatch(
+            "snapshot",
+            disk.Snapshot,
+            served.Snapshot,
+            errors);
+        AddMetadataRoleMismatch(
+            "timestamp",
+            disk.Timestamp,
+            served.Timestamp,
+            errors);
+        if (disk.TrustedRootSha256 != served.TrustedRootSha256)
+        {
+            errors.Add(
+                new(
+                    "tuf",
+                    "served trusted-root metadata does not match disk."));
+        }
+        if (disk.SigningConfigSha256 != served.SigningConfigSha256)
+        {
+            errors.Add(
+                new(
+                    "tuf",
+                    "served signing configuration does not match disk."));
+        }
+    }
+
+    private static void AddMetadataRoleMismatch(
+        string role,
+        SigstoreTufMetadataRoleStatus disk,
+        SigstoreTufMetadataRoleStatus served,
+        ICollection<SigstoreStatusError> errors)
+    {
+        if (disk != served)
+        {
+            errors.Add(
+                new(
+                    "tuf",
+                    $"served {role} metadata does not exactly match disk."));
+        }
     }
 
     internal static void AppendCtLogStatusErrors(

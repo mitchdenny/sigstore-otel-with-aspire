@@ -36,13 +36,16 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import SpanKind
-from sigstore._internal.fulcio.client import FulcioClientError
+from sigstore._internal.fulcio.client import (
+    ExpiredCertificate,
+    FulcioClientError,
+)
 from sigstore._internal.rekor import RekorClientError
 from sigstore._internal.timestamp import TimestampError
 from sigstore._internal.tuf import TrustUpdater
 from sigstore.errors import Error as SigstoreError
 from sigstore.models import Bundle, ClientTrustConfig
-from sigstore.oidc import IdentityToken
+from sigstore.oidc import ExpiredIdentity, IdentityToken
 from sigstore.sign import SigningContext
 from sigstore.verify import Verifier
 from sigstore.verify.policy import Identity
@@ -385,6 +388,8 @@ class ArtifactProducer:
                 ArtifactProtocolError,
                 OSError,
                 requests.RequestException,
+                ExpiredCertificate,
+                ExpiredIdentity,
                 FulcioClientError,
                 RekorClientError,
                 SigstoreError,

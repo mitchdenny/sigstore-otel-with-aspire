@@ -1641,7 +1641,12 @@ evidence, or cleaned before a new pre-activation attempt.
 
 Public `status` never reports ready while an operation is active, recovery is
 pending, a client is stale, a signer or route has not activated, CT projection
-is incomplete, or any required historical shard compute is unavailable.
+is incomplete, any required historical shard compute is unavailable, or
+required TUF metadata is expired, near its policy boundary, or differs between
+disk and the served repository. Status parses and compares root, targets,
+snapshot, and timestamp version, hash, and expiration. Snapshot/timestamp
+refresh needs are distinct from root/targets maintenance and from trust
+corruption.
 Internal postcondition checks ignore only the status error for the operation
 that currently owns the lease; all other errors still fail the command. A
 successful replay clears recovery and re-enables commands without retaining a
@@ -1667,6 +1672,31 @@ targeted verification route.
 
 ### Operator policy
 
+- **Continuous metadata:** after a five-minute startup stabilization period, an
+  untouched version-1 repository is refreshed once automatically. Snapshot and
+  timestamp are then refreshed transactionally when they enter a six-hour
+  expiration window. The monitor invokes the same operation executor,
+  `state.lock`, one-shot worker, request/completion protocol, and postconditions
+  as the public command; it never writes repository metadata directly.
+- **Deferred refresh:** another operation, durable recovery, `state.lock`
+  contention, unhealthy non-client infrastructure, or disk/served disagreement
+  defers automatic refresh and retries. Root/targets nearing expiration require
+  `rotate-tuf-root` before expiry. That command accepts only the maintenance
+  warning with current snapshot/timestamp metadata, coherent disk/served state,
+  healthy clients, and no other status error; expired root/targets remain
+  fail-closed. If snapshot/timestamp also need refresh, `refresh-tuf` remains
+  enabled while root and targets are unexpired; refresh metadata first, recover
+  any terminal client with `restart-clients`, then rotate the root.
+- **Client-down recovery:** `refresh-tuf` remains available with Exited or
+  unstartable clients when trusted state and non-client infrastructure are
+  coherent. It may recover expired snapshot/timestamp metadata but not expired
+  root/targets. After refresh, use `restart-clients` (which starts terminal
+  clients and restarts running clients) or start the affected client.
+- **Suspend recovery:** Python treats only `ExpiredCertificate` and
+  `ExpiredIdentity` as transient signing-attempt failures. The next attempt
+  obtains a fresh token and signer while preserving signer-local
+  certificate caching. Broad exception handling and bundle rewriting are not
+  used.
 - **Automatic recovery:** replay the one matching command when status names a
   valid incomplete operation. Before activation, replay may discard only its
   uncommitted candidate. After activation, it resumes forward from the
@@ -1700,7 +1730,9 @@ targeted verification route.
    AppHost and .NET client builds, and Go, JavaScript, Java, Python-container,
    and Rust client tests.
 2. Run the full-sequence composition, contention, termination, tamper, partial
-   convergence, and replay tests; then run `bash -n
+   convergence, replay, clock-jump signer expiry, TUF-expiration, automatic
+   refresh/deferral, client-down refresh, and terminal-client recovery tests;
+   then run `bash -n
    eng/validate-sigstore-lifecycle.sh` and `git diff --check`.
 3. Run the public lifecycle driver on the exact implementation HEAD and retain
    its redacted report. Verify representative artifacts at the initial,
@@ -1757,6 +1789,27 @@ trust domain
 `sha256-26be5e8fd5c0bb4b7d46a44a751792ac051c03368f5712e6fd2f29c2be0c8de4`,
 generation 1, initial TUF topology, and one generation directory. Artifact
 `173` was absent, and fresh artifact `9` passed all six targeted verifiers.
+
+### Unattended-runtime regression
+
+Retained-run validation exposed two composition defects after the complete
+lifecycle evidence above. A 954-second macOS sleep crossed the cached Python
+signer's ten-minute leaf-certificate lifetime; sigstore-python raises
+`ExpiredCertificate` (and analogously `ExpiredIdentity`) directly from
+`Exception`, outside its normal error hierarchy, so the producer thread exited.
+Later, the 24-hour timestamp expired while the AppHost remained unattended. A
+Python restart correctly rejected it, but client-health-based command
+availability hid `refresh-tuf` and deadlocked public recovery. Aggregate status
+also did not independently parse metadata expiration.
+
+The regression coverage now injects each Python expiry type and proves a
+subsequent signing attempt succeeds without disabling signer-local caching.
+Clock-controlled Hosting and TUF tests prove proactive refresh before expiration,
+expired snapshot/timestamp recovery with a client down, operation/recovery/OS
+lock deferral and retry, exact worker exit-code-zero handling, expiration-aware
+Degraded status, and recovery to Healthy after starting the terminal client.
+Automatic refresh uses only the existing transactional public-operation path;
+no production fault backdoor or direct metadata mutation was added.
 
 ## Rotation safety rules
 
